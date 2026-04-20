@@ -335,3 +335,271 @@ CREATE TABLE IF NOT EXISTS admin_settings (
   value_json TEXT    NOT NULL,
   updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ===========================================================================
+-- Administrative: tuition (학원비 수납) + payroll (급여)
+--                + recurring subscriptions (정기 결제)
+--                + corporate cards (법인 카드)
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Students — extend with monthly tuition fee (recurring 월별 정기 청구 기본값).
+-- Existing installs are upgraded at boot via migration statements in db.ts.
+-- ---------------------------------------------------------------------------
+-- NOTE: additive columns for existing `students` table (see db.ts migrations):
+--   ALTER TABLE students ADD COLUMN monthly_fee INTEGER NOT NULL DEFAULT 0;
+--   ALTER TABLE students ADD COLUMN billing_day INTEGER NOT NULL DEFAULT 5;
+--   ALTER TABLE students ADD COLUMN billing_active INTEGER NOT NULL DEFAULT 1;
+
+-- ---------------------------------------------------------------------------
+-- Tuition invoices (학원비 고지서) — one row per student per yyyymm.
+-- Rows are created by the admin "월 청구서 생성" action (bulk) or inline.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS tuition_invoices (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id     INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  student_code   TEXT    NOT NULL,               -- 학생 코드 미러 (검색/내보내기용)
+  period_yyyymm  TEXT    NOT NULL,               -- e.g. '2026-04'
+  due_date       TEXT,                           -- YYYY-MM-DD (선택)
+  base_amount    INTEGER NOT NULL DEFAULT 0,     -- 기본 수강료 (원)
+  discount       INTEGER NOT NULL DEFAULT 0,     -- 할인 (원, 양수)
+  adjustment     INTEGER NOT NULL DEFAULT 0,     -- 가산/조정 (원, 양수=추가 청구)
+  total_amount   INTEGER NOT NULL DEFAULT 0,     -- 실제 청구 합계 (base - discount + adjustment)
+  paid_amount    INTEGER NOT NULL DEFAULT 0,     -- 누적 수납 (여러 번 분할 가능)
+  status         TEXT    NOT NULL DEFAULT 'unpaid' CHECK (status IN (
+                   'unpaid','partial','paid','waived','cancelled'
+                 )),
+  memo           TEXT,
+  created_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (student_id, period_yyyymm)
+);
+CREATE INDEX IF NOT EXISTS idx_tuition_invoices_period ON tuition_invoices(period_yyyymm);
+CREATE INDEX IF NOT EXISTS idx_tuition_invoices_status ON tuition_invoices(status);
+CREATE INDEX IF NOT EXISTS idx_tuition_invoices_student ON tuition_invoices(student_id);
+
+-- ---------------------------------------------------------------------------
+-- Tuition payments — actual collections against an invoice.
+-- Split into a separate table so partial payments / refunds are auditable.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS tuition_payments (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id   INTEGER NOT NULL REFERENCES tuition_invoices(id) ON DELETE CASCADE,
+  amount       INTEGER NOT NULL,                -- 원 단위. 음수면 환불.
+  method       TEXT    NOT NULL CHECK (method IN ('cash','card','transfer','other')),
+  paid_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+  receipt_no   TEXT,                            -- 영수증 번호 (선택)
+  note         TEXT,
+  actor_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tuition_payments_invoice ON tuition_payments(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_tuition_payments_paid    ON tuition_payments(paid_at);
+
+-- ---------------------------------------------------------------------------
+-- Employee payroll profile — per-user baseline used to generate payslips.
+-- Kept separate from `users` so payroll data can be edited by HR_ADMIN
+-- without touching identity/auth columns.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS employee_payroll_profiles (
+  user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  employment_type      TEXT    NOT NULL DEFAULT 'regular' CHECK (employment_type IN (
+                         'regular','freelancer','parttime'
+                       )),
+  base_salary          INTEGER NOT NULL DEFAULT 0,   -- 월 기본급
+  position_allowance   INTEGER NOT NULL DEFAULT 0,   -- 직책수당
+  meal_allowance       INTEGER NOT NULL DEFAULT 0,   -- 식대 (200,000 원까지 비과세)
+  transport_allowance  INTEGER NOT NULL DEFAULT 0,   -- 차량유지비 (200,000 원까지 비과세)
+  other_allowance      INTEGER NOT NULL DEFAULT 0,   -- 기타수당 (과세)
+  dependents_count     INTEGER NOT NULL DEFAULT 1,   -- 부양가족 수 (본인 포함)
+  kids_under_20        INTEGER NOT NULL DEFAULT 0,   -- 20세 이하 자녀 수
+  bank_name            TEXT,                         -- 입금 은행
+  bank_account         TEXT,                         -- 계좌번호 (표시용, 평문)
+  updated_at           TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------------
+-- Payroll periods — one row per YYYY-MM cycle.
+-- draft → closed (잠금, 개별 명세서 수정 불가) → paid (지급 완료)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS payroll_periods (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_yyyymm  TEXT    NOT NULL UNIQUE,       -- '2026-04'
+  pay_date       TEXT,                           -- YYYY-MM-DD
+  status         TEXT    NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','closed','paid')),
+  note           TEXT,
+  closed_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  closed_at      TEXT,
+  paid_at        TEXT,
+  created_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------------
+-- Payslips — one row per (period, employee).
+-- Stored as pre-computed amounts so past periods don't shift if tax rules change.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS payslips (
+  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id               INTEGER NOT NULL REFERENCES payroll_periods(id) ON DELETE CASCADE,
+  user_id                 INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  employment_type         TEXT    NOT NULL CHECK (employment_type IN ('regular','freelancer','parttime')),
+  -- Earnings (원)
+  base_salary             INTEGER NOT NULL DEFAULT 0,
+  overtime_pay            INTEGER NOT NULL DEFAULT 0,
+  position_allowance      INTEGER NOT NULL DEFAULT 0,
+  meal_allowance          INTEGER NOT NULL DEFAULT 0,
+  transport_allowance     INTEGER NOT NULL DEFAULT 0,
+  bonus                   INTEGER NOT NULL DEFAULT 0,
+  other_taxable           INTEGER NOT NULL DEFAULT 0,   -- 기타과세
+  other_nontaxable        INTEGER NOT NULL DEFAULT 0,   -- 기타비과세
+  gross_pay               INTEGER NOT NULL DEFAULT 0,   -- 지급합계
+  taxable_base            INTEGER NOT NULL DEFAULT 0,   -- 과세 대상
+  -- Deductions (원)
+  income_tax              INTEGER NOT NULL DEFAULT 0,   -- 갑근세
+  local_income_tax        INTEGER NOT NULL DEFAULT 0,   -- 지방소득세 = income_tax * 10%
+  national_pension        INTEGER NOT NULL DEFAULT 0,   -- 국민연금
+  health_insurance        INTEGER NOT NULL DEFAULT 0,   -- 건강보험
+  long_term_care          INTEGER NOT NULL DEFAULT 0,   -- 장기요양
+  employment_insurance    INTEGER NOT NULL DEFAULT 0,   -- 고용보험
+  freelancer_withholding  INTEGER NOT NULL DEFAULT 0,   -- 프리랜서 3.3%
+  other_deduction         INTEGER NOT NULL DEFAULT 0,
+  total_deduction         INTEGER NOT NULL DEFAULT 0,
+  net_pay                 INTEGER NOT NULL DEFAULT 0,   -- 실수령액
+  status                  TEXT    NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','closed','paid')),
+  memo                    TEXT,
+  calc_version            INTEGER NOT NULL DEFAULT 1,
+  created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (period_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_payslips_user ON payslips(user_id);
+CREATE INDEX IF NOT EXISTS idx_payslips_period ON payslips(period_id);
+
+-- ---------------------------------------------------------------------------
+-- Corporate cards (법인 카드) — card inventory + holders + monthly statements.
+-- Defined BEFORE subscriptions so recurring_subscriptions.card_id FK resolves
+-- in strict-enforcement environments (sqlite is lenient but be explicit).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS corporate_cards (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  alias         TEXT    NOT NULL UNIQUE,        -- e.g. '법인1 · 마케팅'
+  brand         TEXT,                            -- 'Visa' / 'MasterCard' / '국내전용'
+  issuer        TEXT,                            -- 발급사 (예: 신한카드)
+  last4         TEXT    NOT NULL,                -- 끝 4자리 (전체 번호는 보관 X)
+  holder_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, -- 실소지자
+  owner_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL, -- 회계 담당
+  monthly_limit  INTEGER NOT NULL DEFAULT 0,
+  statement_day  INTEGER NOT NULL DEFAULT 1,    -- 결제일 (매월)
+  status         TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','frozen','retired')),
+  memo           TEXT,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------------
+-- Recurring subscriptions (정기 결제) — SaaS / 구독 서비스 / 월간 리테이너 등
+-- Defined BEFORE corporate_card_transactions to resolve the subscription_id FK.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS recurring_subscriptions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  vendor         TEXT    NOT NULL,                -- 'Notion', '네이버 광고', ...
+  plan           TEXT,                            -- 'Team (20 seats)'
+  category       TEXT,                            -- 'SaaS','광고','유지보수',...
+  amount         INTEGER NOT NULL DEFAULT 0,      -- 1회 결제 금액 (원, 원화 기준)
+  currency       TEXT    NOT NULL DEFAULT 'KRW',
+  cadence        TEXT    NOT NULL DEFAULT 'monthly' CHECK (cadence IN (
+                   'monthly','yearly','quarterly','weekly','custom'
+                 )),
+  cadence_days   INTEGER,                         -- cadence = 'custom' 일 때 일수
+  next_charge_at TEXT,                            -- 다음 결제 예정일 (YYYY-MM-DD)
+  card_id        INTEGER REFERENCES corporate_cards(id) ON DELETE SET NULL,
+  owner_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  status         TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','cancelled')),
+  started_at     TEXT,
+  cancelled_at   TEXT,
+  memo           TEXT,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_subs_status ON recurring_subscriptions(status);
+CREATE INDEX IF NOT EXISTS idx_subs_next   ON recurring_subscriptions(next_charge_at);
+
+CREATE TABLE IF NOT EXISTS corporate_card_transactions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id       INTEGER NOT NULL REFERENCES corporate_cards(id) ON DELETE CASCADE,
+  spent_at      TEXT    NOT NULL,                -- ISO datetime
+  merchant      TEXT    NOT NULL,                -- 가맹점
+  category      TEXT,                            -- '식비','교통','소프트웨어','광고',...
+  amount        INTEGER NOT NULL,                -- 원 (환불이면 음수)
+  currency      TEXT    NOT NULL DEFAULT 'KRW',
+  note          TEXT,
+  subscription_id INTEGER REFERENCES recurring_subscriptions(id) ON DELETE SET NULL,
+  receipt_path  TEXT,                            -- 영수증 첨부 경로 (선택)
+  reconciled    INTEGER NOT NULL DEFAULT 0,      -- 대사 완료 여부
+  actor_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_corp_card_tx_card   ON corporate_card_transactions(card_id);
+CREATE INDEX IF NOT EXISTS idx_corp_card_tx_spent  ON corporate_card_transactions(spent_at);
+CREATE INDEX IF NOT EXISTS idx_corp_card_tx_sub    ON corporate_card_transactions(subscription_id);
+
+-- ===========================================================================
+-- Student information archive (학생 정보 보관함)
+--   - 노션에서 따온 파싱 결과는 기존 parsing_results 테이블을 재활용해서 조회만 함.
+--   - 보고서 주제(어떤 학생이 어떤 보고서/수행평가 주제를 진행해왔는지)와
+--     관련 파일(업로드된 보고서 원본/최종본)은 별도 테이블로 보관.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS student_report_topics (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  title         TEXT    NOT NULL,                -- 수행평가/보고서 제목
+  subject       TEXT,                             -- 과목
+  topic         TEXT,                             -- 구체 주제
+  status        TEXT    NOT NULL DEFAULT 'planned' CHECK (status IN (
+                  'planned','in_progress','submitted','graded','archived','cancelled'
+                )),
+  assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL, -- 연결된 과제 (있으면)
+  due_at        TEXT,
+  submitted_at  TEXT,
+  score         TEXT,                             -- 자유 텍스트 (A+, 95/100 등)
+  memo          TEXT,
+  created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_student_report_topics_student ON student_report_topics(student_id);
+CREATE INDEX IF NOT EXISTS idx_student_report_topics_status  ON student_report_topics(status);
+
+CREATE TABLE IF NOT EXISTS student_archive_files (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  topic_id      INTEGER REFERENCES student_report_topics(id) ON DELETE SET NULL,
+  category      TEXT    NOT NULL DEFAULT 'report' CHECK (category IN (
+                  'report','draft','reference','feedback','other'
+                )),
+  original_name TEXT    NOT NULL,
+  stored_path   TEXT    NOT NULL,                 -- userData 내부 상대 경로 or 'local://<filename>'
+  mime_type     TEXT,
+  size_bytes    INTEGER,
+  description   TEXT,
+  -- 최종 승인(승인완료) 과제에서 자동 보관된 레코드일 경우, 원본 과제 id.
+  -- 승인이 반려로 번복되면 이 값으로 찾아 자동 삭제한다.
+  source_assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL,
+  auto_generated       INTEGER NOT NULL DEFAULT 0, -- 1 = 시스템이 자동 생성한 레코드 (수동 편집 금지)
+  uploaded_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  uploaded_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_student_archive_files_student ON student_archive_files(student_id);
+CREATE INDEX IF NOT EXISTS idx_student_archive_files_topic   ON student_archive_files(topic_id);
+CREATE INDEX IF NOT EXISTS idx_student_archive_files_source  ON student_archive_files(source_assignment_id);

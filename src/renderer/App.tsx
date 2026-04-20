@@ -21,6 +21,12 @@ import { DocumentsPage } from '@/pages/DocumentsPage';
 import { MyWorkPage } from '@/pages/MyWorkPage';
 import { WorkLogsPage } from '@/pages/WorkLogsPage';
 import { SettingsPage } from '@/pages/SettingsPage';
+import { TuitionPage } from '@/pages/TuitionPage';
+import { PayrollAdminPage } from '@/pages/PayrollAdminPage';
+import { MyPayslipsPage } from '@/pages/MyPayslipsPage';
+import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
+import { CorporateCardsPage } from '@/pages/CorporateCardsPage';
+import { StudentArchivePage } from '@/pages/StudentArchivePage';
 import { useSession } from '@/stores/session';
 
 function RequireAuth({ children }: { children: ReactElement }) {
@@ -61,6 +67,7 @@ export default function App() {
 
         <Route path="home" element={<HomePage />} />
         <Route path="my-work" element={<MyWorkPage />} />
+        <Route path="my-payslips" element={<MyPayslipsPage />} />
 
         <Route path="assignments" element={<AssignmentsPage />} />
         <Route path="instruction-parser" element={<ParsingCenterPage />} />
@@ -74,6 +81,12 @@ export default function App() {
         <Route path="leave" element={<LeavePage />} />
         <Route path="approvals" element={<ApprovalsPage />} />
         <Route path="employees" element={<EmployeesPage />} />
+
+        <Route path="admin/tuition" element={<TuitionPage />} />
+        <Route path="admin/payroll" element={<PayrollAdminPage />} />
+        <Route path="admin/subscriptions" element={<SubscriptionsPage />} />
+        <Route path="admin/cards" element={<CorporateCardsPage />} />
+        <Route path="students/archive" element={<StudentArchivePage />} />
 
         <Route path="announcements" element={<AnnouncementsPage />} />
         <Route path="manuals" element={<ManualsPage />} />

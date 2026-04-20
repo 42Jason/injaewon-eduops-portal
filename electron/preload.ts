@@ -382,6 +382,324 @@ const api = {
         error?: string;
       }>,
   },
+  tuition: {
+    listStudents: (filter?: { active?: boolean; search?: string }) =>
+      ipcRenderer.invoke('tuition:listStudents', filter) as Promise<Array<Record<string, unknown>>>,
+    updateStudentBilling: (payload: {
+      studentId: number;
+      monthlyFee?: number;
+      billingDay?: number;
+      billingActive?: boolean;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('tuition:updateStudentBilling', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    listInvoices: (filter?: { period?: string; status?: string; studentId?: number }) =>
+      ipcRenderer.invoke('tuition:listInvoices', filter) as Promise<Array<Record<string, unknown>>>,
+    generateMonthly: (payload: {
+      period: string;
+      dueDate?: string;
+      actorId: number;
+      overwrite?: boolean;
+    }) =>
+      ipcRenderer.invoke('tuition:generateMonthly', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        created?: number;
+        skipped?: number;
+      }>,
+    updateInvoice: (payload: {
+      id: number;
+      baseAmount?: number;
+      discount?: number;
+      adjustment?: number;
+      dueDate?: string | null;
+      memo?: string | null;
+      status?: 'unpaid' | 'partial' | 'paid' | 'waived' | 'cancelled';
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('tuition:updateInvoice', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    recordPayment: (payload: {
+      invoiceId: number;
+      amount: number;
+      method: 'cash' | 'card' | 'transfer' | 'other';
+      paidAt?: string;
+      receiptNo?: string;
+      note?: string;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('tuition:recordPayment', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        paidAmount?: number;
+        status?: string;
+      }>,
+    listPayments: (invoiceId: number) =>
+      ipcRenderer.invoke('tuition:listPayments', invoiceId) as Promise<Array<Record<string, unknown>>>,
+    periodSummary: (period: string) =>
+      ipcRenderer.invoke('tuition:periodSummary', period) as Promise<Record<string, number> | null>,
+  },
+  payroll: {
+    listProfiles: () =>
+      ipcRenderer.invoke('payroll:listProfiles') as Promise<Array<Record<string, unknown>>>,
+    getProfile: (userId: number) =>
+      ipcRenderer.invoke('payroll:getProfile', userId) as Promise<Record<string, unknown> | null>,
+    upsertProfile: (payload: {
+      userId: number;
+      employmentType: 'regular' | 'freelancer' | 'parttime';
+      baseSalary: number;
+      positionAllowance: number;
+      mealAllowance: number;
+      transportAllowance: number;
+      otherAllowance: number;
+      dependentsCount: number;
+      kidsUnder20: number;
+      bankName?: string | null;
+      bankAccount?: string | null;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('payroll:upsertProfile', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    listPeriods: () =>
+      ipcRenderer.invoke('payroll:listPeriods') as Promise<Array<Record<string, unknown>>>,
+    ensurePeriod: (payload: { period: string; payDate?: string | null; actorId: number }) =>
+      ipcRenderer.invoke('payroll:ensurePeriod', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+        created?: boolean;
+      }>,
+    generatePayslips: (payload: {
+      periodId: number;
+      overwriteDraft?: boolean;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('payroll:generatePayslips', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        created?: number;
+        updated?: number;
+        skipped?: number;
+      }>,
+    listPayslips: (periodId: number) =>
+      ipcRenderer.invoke('payroll:listPayslips', periodId) as Promise<Array<Record<string, unknown>>>,
+    getMyPayslips: (userId: number) =>
+      ipcRenderer.invoke('payroll:getMyPayslips', userId) as Promise<Array<Record<string, unknown>>>,
+    updatePayslip: (payload: {
+      id: number;
+      patch: Partial<{
+        overtimePay: number;
+        bonus: number;
+        otherTaxable: number;
+        otherNontaxable: number;
+        otherDeduction: number;
+        memo: string | null;
+      }>;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('payroll:updatePayslip', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    closePeriod: (payload: { periodId: number; actorId: number }) =>
+      ipcRenderer.invoke('payroll:closePeriod', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    markPaid: (payload: { periodId: number; paidAt?: string; actorId: number }) =>
+      ipcRenderer.invoke('payroll:markPaid', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+  },
+  subscriptions: {
+    list: (filter?: { status?: string; cardId?: number }) =>
+      ipcRenderer.invoke('subscriptions:list', filter) as Promise<Array<Record<string, unknown>>>,
+    upsert: (payload: {
+      id?: number;
+      vendor: string;
+      plan?: string | null;
+      category?: string | null;
+      amount: number;
+      currency?: string;
+      cadence: 'monthly' | 'yearly' | 'quarterly' | 'weekly' | 'custom';
+      cadenceDays?: number | null;
+      nextChargeAt?: string | null;
+      cardId?: number | null;
+      ownerUserId?: number | null;
+      status?: 'active' | 'paused' | 'cancelled';
+      startedAt?: string | null;
+      memo?: string | null;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('subscriptions:upsert', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    setStatus: (payload: {
+      id: number;
+      status: 'active' | 'paused' | 'cancelled';
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('subscriptions:setStatus', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    monthlyForecast: () =>
+      ipcRenderer.invoke('subscriptions:monthlyForecast') as Promise<{
+        activeCount: number;
+        monthlyTotal: number;
+      }>,
+    delete: (payload: { id: number; actorId: number }) =>
+      ipcRenderer.invoke('subscriptions:delete', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+  },
+  corpCards: {
+    list: (filter?: { status?: string }) =>
+      ipcRenderer.invoke('corpCards:list', filter) as Promise<Array<Record<string, unknown>>>,
+    upsert: (payload: {
+      id?: number;
+      alias: string;
+      brand?: string | null;
+      issuer?: string | null;
+      last4: string;
+      holderUserId?: number | null;
+      ownerUserId?: number | null;
+      monthlyLimit: number;
+      statementDay: number;
+      status?: 'active' | 'frozen' | 'retired';
+      memo?: string | null;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('corpCards:upsert', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    setStatus: (payload: {
+      id: number;
+      status: 'active' | 'frozen' | 'retired';
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('corpCards:setStatus', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    listTransactions: (filter?: {
+      cardId?: number;
+      period?: string;
+      reconciled?: boolean;
+      limit?: number;
+    }) =>
+      ipcRenderer.invoke('corpCards:listTransactions', filter) as Promise<Array<Record<string, unknown>>>,
+    addTransaction: (payload: {
+      cardId: number;
+      spentAt: string;
+      merchant: string;
+      category?: string | null;
+      amount: number;
+      currency?: string;
+      note?: string | null;
+      subscriptionId?: number | null;
+      receiptPath?: string | null;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('corpCards:addTransaction', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    setReconciled: (payload: { id: number; reconciled: boolean; actorId: number }) =>
+      ipcRenderer.invoke('corpCards:setReconciled', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    deleteTransaction: (payload: { id: number; actorId: number }) =>
+      ipcRenderer.invoke('corpCards:deleteTransaction', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    monthlySummary: (period: string) =>
+      ipcRenderer.invoke('corpCards:monthlySummary', period) as Promise<Array<Record<string, unknown>>>,
+  },
+  students: {
+    list: (filter?: { q?: string; limit?: number }) =>
+      ipcRenderer.invoke('students:list', filter) as Promise<Array<Record<string, unknown>>>,
+    get: (studentId: number) =>
+      ipcRenderer.invoke('students:get', studentId) as Promise<Record<string, unknown> | null>,
+    history: (studentId: number) =>
+      ipcRenderer.invoke('students:history', studentId) as Promise<{
+        assignments: Array<Record<string, unknown>>;
+        parsings: Array<Record<string, unknown>>;
+      }>,
+    getParsingDetail: (parsingId: number) =>
+      ipcRenderer.invoke('students:getParsingDetail', parsingId) as Promise<
+        Record<string, unknown> | null
+      >,
+    listReportTopics: (studentId: number) =>
+      ipcRenderer.invoke('students:listReportTopics', studentId) as Promise<
+        Array<Record<string, unknown>>
+      >,
+    upsertReportTopic: (payload: {
+      id?: number;
+      studentId: number;
+      title: string;
+      subject?: string | null;
+      topic?: string | null;
+      status?: 'planned' | 'in_progress' | 'submitted' | 'graded' | 'archived' | 'cancelled';
+      assignmentId?: number | null;
+      dueAt?: string | null;
+      submittedAt?: string | null;
+      score?: string | null;
+      memo?: string | null;
+      actorId: number;
+    }) =>
+      ipcRenderer.invoke('students:upsertReportTopic', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    deleteReportTopic: (payload: { id: number; actorId: number }) =>
+      ipcRenderer.invoke('students:deleteReportTopic', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    listArchiveFiles: (filter: { studentId: number; topicId?: number | null }) =>
+      ipcRenderer.invoke('students:listArchiveFiles', filter) as Promise<
+        Array<Record<string, unknown>>
+      >,
+    addArchiveFile: (payload: {
+      studentId: number;
+      topicId?: number | null;
+      category?: 'report' | 'draft' | 'reference' | 'feedback' | 'other';
+      originalName: string;
+      storedPath?: string;
+      mimeType?: string;
+      sizeBytes?: number;
+      description?: string | null;
+      uploaderId: number;
+    }) =>
+      ipcRenderer.invoke('students:addArchiveFile', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    deleteArchiveFile: (payload: { id: number; actorId: number }) =>
+      ipcRenderer.invoke('students:deleteArchiveFile', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+  },
   updater: {
     status: () =>
       ipcRenderer.invoke('updater:status') as Promise<UpdaterStatusPayload>,

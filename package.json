@@ -1,6 +1,6 @@
 {
   "name": "eduops-portal",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "private": true,
   "description": "EduOps Employee Portal — 직원 포털 + 운영 ERP + 안내문 파싱 + QA 생산관리",
   "main": "dist-electron/main.js",

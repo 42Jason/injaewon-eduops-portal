@@ -21,6 +21,11 @@ import {
   Bot,
   Settings,
   LogOut,
+  Wallet,
+  Banknote,
+  Repeat,
+  CreditCard,
+  Archive,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useSession } from '@/stores/session';
@@ -37,6 +42,7 @@ interface MenuItem {
 const MENU: MenuItem[] = [
   { to: '/home', label: '홈', icon: LayoutDashboard, group: '내 공간' },
   { to: '/my-work', label: '내 업무', icon: CheckSquare, group: '내 공간' },
+  { to: '/my-payslips', label: '내 급여 명세서', icon: Wallet, group: '내 공간' },
 
   { to: '/assignments', label: '과제 관리', icon: ClipboardList, group: '업무' },
   { to: '/instruction-parser', label: '안내문 파싱 센터', icon: FileInput, group: '업무' },
@@ -51,9 +57,15 @@ const MENU: MenuItem[] = [
   { to: '/approvals', label: '전자 결재', icon: FileSignature, group: '조직' },
   { to: '/employees', label: '직원 관리', icon: Users, group: '조직' },
 
+  { to: '/admin/tuition', label: '학원비 수납', icon: Wallet, group: '행정' },
+  { to: '/admin/payroll', label: '급여 관리', icon: Banknote, group: '행정' },
+  { to: '/admin/subscriptions', label: '정기 결제', icon: Repeat, group: '행정' },
+  { to: '/admin/cards', label: '법인 카드', icon: CreditCard, group: '행정' },
+
   { to: '/announcements', label: '공지사항', icon: Megaphone, group: '지식' },
   { to: '/manuals', label: '노션 매뉴얼', icon: BookOpenText, group: '지식' },
   { to: '/documents', label: '자료실', icon: FolderOpen, group: '지식' },
+  { to: '/students/archive', label: '학생 보관함', icon: Archive, group: '지식' },
 
   { to: '/reports', label: '리포트', icon: BarChart3, group: '운영' },
   { to: '/automation', label: 'CTO 자동화', icon: Bot, group: '운영' },

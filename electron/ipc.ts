@@ -2,6 +2,12 @@ import { ipcMain } from 'electron';
 import { getDb, getDbPath } from './db';
 import { login } from './auth';
 import { parseInstructionExcel, type ParsedRow } from './parseExcel';
+import {
+  calcRegularPayroll,
+  calcFreelancerPayroll,
+  type RegularPayrollProfile,
+  type RegularPayrollInputs,
+} from './payroll-calc';
 
 /**
  * Register every IPC handler on the main process.
@@ -84,16 +90,22 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
     (_e, payload: { id: number; state: string; actorId: number; note?: string }) => {
       const db = getDb();
       const now = new Date().toISOString();
-      const res = db
-        .prepare(
-          `UPDATE assignments
-              SET state = ?,
-                  updated_at = ?,
-                  completed_at = CASE WHEN ? IN ('완료','승인완료') THEN ? ELSE completed_at END
-            WHERE id = ?`,
-        )
-        .run(payload.state, now, payload.state, now, payload.id);
-      return { ok: res.changes > 0 };
+      const tx = db.transaction(() => {
+        const res = db
+          .prepare(
+            `UPDATE assignments
+                SET state = ?,
+                    updated_at = ?,
+                    completed_at = CASE WHEN ? IN ('완료','승인완료') THEN ? ELSE completed_at END
+              WHERE id = ?`,
+          )
+          .run(payload.state, now, payload.state, now, payload.id);
+        if (res.changes > 0) {
+          syncAssignmentArchive(db, payload.id, payload.state, payload.actorId);
+        }
+        return res.changes > 0;
+      });
+      return { ok: tx() };
     },
   );
 
@@ -1130,6 +1142,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
                     completed_at = CASE WHEN ? = '승인완료' THEN ? ELSE completed_at END
               WHERE id = ?`,
           ).run(nextState, nowIso, nextState, nowIso, payload.assignmentId);
+          // 최종 승인 → 보관함에 자동 추가 / 그 외 상태로 바뀌면 자동 레코드 제거
+          syncAssignmentArchive(db, payload.assignmentId, nextState, payload.reviewerId);
         });
         tx();
         logActivity(db, payload.reviewerId, 'qa.submit', `assignment:${payload.assignmentId}`, {
@@ -1714,6 +1728,1713 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
       }
     },
   );
+
+  registerAdminIpc();
+  registerStudentArchiveIpc();
+}
+
+// ===========================================================================
+// Administrative IPC — tuition / payroll / subscriptions / corporate cards
+// Broken into its own function so the file stays navigable.
+// ===========================================================================
+function registerAdminIpc() {
+  // -------------------------------------------------------------------------
+  // Tuition billing
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    'tuition:listStudents',
+    (_e, filter?: { active?: boolean; search?: string }) => {
+      const db = getDb();
+      const where: string[] = ['s.deleted_at IS NULL'];
+      const params: unknown[] = [];
+      if (filter?.active === true) {
+        where.push('s.billing_active = 1');
+      } else if (filter?.active === false) {
+        where.push('s.billing_active = 0');
+      }
+      if (filter?.search) {
+        where.push('(s.name LIKE ? OR s.student_code LIKE ?)');
+        const q = `%${filter.search}%`;
+        params.push(q, q);
+      }
+      const rows = db
+        .prepare(
+          `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.guardian,
+                  s.monthly_fee, s.billing_day, s.billing_active, s.memo
+             FROM students s
+            WHERE ${where.join(' AND ')}
+            ORDER BY s.student_code ASC
+            LIMIT 500`,
+        )
+        .all(...params);
+      return rows;
+    },
+  );
+
+  ipcMain.handle(
+    'tuition:updateStudentBilling',
+    (
+      _e,
+      payload: {
+        studentId: number;
+        monthlyFee?: number;
+        billingDay?: number;
+        billingActive?: boolean;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const sets: string[] = [];
+        const params: unknown[] = [];
+        if (typeof payload.monthlyFee === 'number') {
+          sets.push('monthly_fee = ?');
+          params.push(Math.max(0, Math.floor(payload.monthlyFee)));
+        }
+        if (typeof payload.billingDay === 'number') {
+          const d = Math.min(28, Math.max(1, Math.floor(payload.billingDay)));
+          sets.push('billing_day = ?');
+          params.push(d);
+        }
+        if (typeof payload.billingActive === 'boolean') {
+          sets.push('billing_active = ?');
+          params.push(payload.billingActive ? 1 : 0);
+        }
+        if (sets.length === 0) return { ok: false, error: 'nothing_to_update' };
+        params.push(payload.studentId);
+        const res = db
+          .prepare(`UPDATE students SET ${sets.join(', ')} WHERE id = ?`)
+          .run(...params);
+        logActivity(db, payload.actorId, 'tuition.updateStudentBilling', `student:${payload.studentId}`, {
+          monthlyFee: payload.monthlyFee,
+          billingDay: payload.billingDay,
+          billingActive: payload.billingActive,
+        });
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'update_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'tuition:listInvoices',
+    (_e, filter?: { period?: string; status?: string; studentId?: number }) => {
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (filter?.period) {
+        where.push('i.period_yyyymm = ?');
+        params.push(filter.period);
+      }
+      if (filter?.status) {
+        where.push('i.status = ?');
+        params.push(filter.status);
+      }
+      if (typeof filter?.studentId === 'number') {
+        where.push('i.student_id = ?');
+        params.push(filter.studentId);
+      }
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const rows = db
+        .prepare(
+          `SELECT i.id, i.student_id, i.student_code, i.period_yyyymm, i.due_date,
+                  i.base_amount, i.discount, i.adjustment, i.total_amount, i.paid_amount,
+                  i.status, i.memo, i.created_at, i.updated_at,
+                  s.name AS student_name, s.grade AS student_grade
+             FROM tuition_invoices i
+             LEFT JOIN students s ON s.id = i.student_id
+             ${whereSql}
+            ORDER BY i.period_yyyymm DESC, i.student_code ASC
+            LIMIT 1000`,
+        )
+        .all(...params);
+      return rows;
+    },
+  );
+
+  ipcMain.handle(
+    'tuition:generateMonthly',
+    (
+      _e,
+      payload: { period: string; dueDate?: string; actorId: number; overwrite?: boolean },
+    ) => {
+      const db = getDb();
+      try {
+        const students = db
+          .prepare(
+            `SELECT id, student_code, monthly_fee, billing_day
+               FROM students
+              WHERE deleted_at IS NULL AND billing_active = 1 AND monthly_fee > 0`,
+          )
+          .all() as {
+          id: number;
+          student_code: string;
+          monthly_fee: number;
+          billing_day: number;
+        }[];
+
+        let created = 0;
+        let skipped = 0;
+        const [yy, mm] = payload.period.split('-');
+        const periodYY = Number(yy);
+        const periodMM = Number(mm);
+
+        const insertStmt = db.prepare(
+          `INSERT INTO tuition_invoices (
+             student_id, student_code, period_yyyymm, due_date,
+             base_amount, discount, adjustment, total_amount, paid_amount, status, created_by
+           ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, 'unpaid', ?)`,
+        );
+        const existsStmt = db.prepare(
+          `SELECT id FROM tuition_invoices WHERE student_id = ? AND period_yyyymm = ?`,
+        );
+        const deleteStmt = db.prepare(
+          `DELETE FROM tuition_invoices WHERE student_id = ? AND period_yyyymm = ? AND paid_amount = 0`,
+        );
+
+        const tx = db.transaction(() => {
+          for (const s of students) {
+            const exists = existsStmt.get(s.id, payload.period);
+            if (exists && !payload.overwrite) {
+              skipped += 1;
+              continue;
+            }
+            if (exists && payload.overwrite) {
+              const removed = deleteStmt.run(s.id, payload.period);
+              if (removed.changes === 0) {
+                // Already had paid amounts — don't blow it away.
+                skipped += 1;
+                continue;
+              }
+            }
+            const due =
+              payload.dueDate ??
+              (Number.isFinite(periodYY) && Number.isFinite(periodMM)
+                ? `${payload.period}-${String(
+                    Math.min(28, Math.max(1, s.billing_day || 5)),
+                  ).padStart(2, '0')}`
+                : null);
+            insertStmt.run(
+              s.id,
+              s.student_code,
+              payload.period,
+              due,
+              s.monthly_fee,
+              s.monthly_fee,
+              payload.actorId,
+            );
+            created += 1;
+          }
+        });
+        tx();
+
+        logActivity(db, payload.actorId, 'tuition.generateMonthly', `period:${payload.period}`, {
+          created,
+          skipped,
+          overwrite: !!payload.overwrite,
+        });
+        return { ok: true, created, skipped };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'generate_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'tuition:updateInvoice',
+    (
+      _e,
+      payload: {
+        id: number;
+        baseAmount?: number;
+        discount?: number;
+        adjustment?: number;
+        dueDate?: string | null;
+        memo?: string | null;
+        status?: 'unpaid' | 'partial' | 'paid' | 'waived' | 'cancelled';
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const cur = db
+          .prepare(
+            `SELECT id, base_amount, discount, adjustment, total_amount, paid_amount, status
+               FROM tuition_invoices WHERE id = ?`,
+          )
+          .get(payload.id) as
+          | {
+              id: number;
+              base_amount: number;
+              discount: number;
+              adjustment: number;
+              total_amount: number;
+              paid_amount: number;
+              status: string;
+            }
+          | undefined;
+        if (!cur) return { ok: false, error: 'not_found' };
+
+        const base = Math.max(0, Math.floor(payload.baseAmount ?? cur.base_amount));
+        const discount = Math.max(0, Math.floor(payload.discount ?? cur.discount));
+        const adjustment = Math.floor(payload.adjustment ?? cur.adjustment);
+        const total = Math.max(0, base - discount + adjustment);
+
+        // Status auto-derivation if not explicitly set
+        let status = payload.status ?? cur.status;
+        if (!payload.status) {
+          if (cur.paid_amount >= total && total > 0) status = 'paid';
+          else if (cur.paid_amount > 0 && cur.paid_amount < total) status = 'partial';
+          else status = 'unpaid';
+        }
+
+        db.prepare(
+          `UPDATE tuition_invoices
+              SET base_amount = ?, discount = ?, adjustment = ?,
+                  total_amount = ?, due_date = COALESCE(?, due_date),
+                  memo = COALESCE(?, memo), status = ?,
+                  updated_at = datetime('now')
+            WHERE id = ?`,
+        ).run(base, discount, adjustment, total, payload.dueDate ?? null, payload.memo ?? null, status, payload.id);
+
+        logActivity(db, payload.actorId, 'tuition.updateInvoice', `invoice:${payload.id}`, {
+          base,
+          discount,
+          adjustment,
+          status,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'update_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'tuition:recordPayment',
+    (
+      _e,
+      payload: {
+        invoiceId: number;
+        amount: number;
+        method: 'cash' | 'card' | 'transfer' | 'other';
+        paidAt?: string;
+        receiptNo?: string;
+        note?: string;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const result = db.transaction(() => {
+          const inv = db
+            .prepare(
+              `SELECT id, total_amount, paid_amount, status FROM tuition_invoices WHERE id = ?`,
+            )
+            .get(payload.invoiceId) as
+            | { id: number; total_amount: number; paid_amount: number; status: string }
+            | undefined;
+          if (!inv) throw new Error('invoice_not_found');
+
+          const amt = Math.floor(payload.amount);
+          db.prepare(
+            `INSERT INTO tuition_payments (invoice_id, amount, method, paid_at, receipt_no, note, actor_id)
+             VALUES (?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)`,
+          ).run(
+            payload.invoiceId,
+            amt,
+            payload.method,
+            payload.paidAt ?? null,
+            payload.receiptNo ?? null,
+            payload.note ?? null,
+            payload.actorId,
+          );
+
+          const newPaid = inv.paid_amount + amt;
+          let newStatus = inv.status;
+          if (newPaid <= 0) newStatus = 'unpaid';
+          else if (newPaid < inv.total_amount) newStatus = 'partial';
+          else newStatus = 'paid';
+
+          db.prepare(
+            `UPDATE tuition_invoices
+                SET paid_amount = ?, status = ?, updated_at = datetime('now')
+              WHERE id = ?`,
+          ).run(newPaid, newStatus, payload.invoiceId);
+
+          return { newPaid, newStatus };
+        })();
+
+        logActivity(db, payload.actorId, 'tuition.recordPayment', `invoice:${payload.invoiceId}`, {
+          amount: payload.amount,
+          method: payload.method,
+          newStatus: result.newStatus,
+        });
+        return { ok: true, paidAmount: result.newPaid, status: result.newStatus };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'record_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('tuition:listPayments', (_e, invoiceId: number) => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT p.id, p.invoice_id, p.amount, p.method, p.paid_at, p.receipt_no,
+                p.note, p.actor_id, u.name AS actor_name
+           FROM tuition_payments p
+           LEFT JOIN users u ON u.id = p.actor_id
+          WHERE p.invoice_id = ?
+          ORDER BY p.paid_at DESC`,
+      )
+      .all(invoiceId);
+    return rows;
+  });
+
+  ipcMain.handle('tuition:periodSummary', (_e, period: string) => {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT
+            COUNT(*)                         AS invoice_count,
+            COALESCE(SUM(total_amount), 0)   AS total_billed,
+            COALESCE(SUM(paid_amount), 0)    AS total_paid,
+            COALESCE(SUM(CASE WHEN status IN ('unpaid','partial') THEN total_amount - paid_amount ELSE 0 END), 0) AS total_outstanding,
+            COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0) AS paid_count,
+            COALESCE(SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END), 0) AS partial_count,
+            COALESCE(SUM(CASE WHEN status = 'unpaid' THEN 1 ELSE 0 END), 0) AS unpaid_count,
+            COALESCE(SUM(CASE WHEN status = 'waived' THEN 1 ELSE 0 END), 0) AS waived_count
+           FROM tuition_invoices
+          WHERE period_yyyymm = ?`,
+      )
+      .get(period);
+    return row ?? null;
+  });
+
+  // -------------------------------------------------------------------------
+  // Payroll
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle('payroll:listProfiles', () => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT u.id AS user_id, u.name, u.email, u.role, u.department_id, u.active,
+                d.name AS department_name,
+                COALESCE(p.employment_type, 'regular') AS employment_type,
+                COALESCE(p.base_salary, 0) AS base_salary,
+                COALESCE(p.position_allowance, 0) AS position_allowance,
+                COALESCE(p.meal_allowance, 0) AS meal_allowance,
+                COALESCE(p.transport_allowance, 0) AS transport_allowance,
+                COALESCE(p.other_allowance, 0) AS other_allowance,
+                COALESCE(p.dependents_count, 1) AS dependents_count,
+                COALESCE(p.kids_under_20, 0) AS kids_under_20,
+                p.bank_name, p.bank_account, p.updated_at
+           FROM users u
+           LEFT JOIN departments d ON d.id = u.department_id
+           LEFT JOIN employee_payroll_profiles p ON p.user_id = u.id
+          WHERE u.active = 1
+          ORDER BY d.name ASC, u.name ASC`,
+      )
+      .all();
+    return rows;
+  });
+
+  ipcMain.handle('payroll:getProfile', (_e, userId: number) => {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT u.id AS user_id, u.name,
+                COALESCE(p.employment_type, 'regular') AS employment_type,
+                COALESCE(p.base_salary, 0) AS base_salary,
+                COALESCE(p.position_allowance, 0) AS position_allowance,
+                COALESCE(p.meal_allowance, 0) AS meal_allowance,
+                COALESCE(p.transport_allowance, 0) AS transport_allowance,
+                COALESCE(p.other_allowance, 0) AS other_allowance,
+                COALESCE(p.dependents_count, 1) AS dependents_count,
+                COALESCE(p.kids_under_20, 0) AS kids_under_20,
+                p.bank_name, p.bank_account, p.updated_at
+           FROM users u
+           LEFT JOIN employee_payroll_profiles p ON p.user_id = u.id
+          WHERE u.id = ?`,
+      )
+      .get(userId);
+    return row ?? null;
+  });
+
+  ipcMain.handle(
+    'payroll:upsertProfile',
+    (
+      _e,
+      payload: {
+        userId: number;
+        employmentType: 'regular' | 'freelancer' | 'parttime';
+        baseSalary: number;
+        positionAllowance: number;
+        mealAllowance: number;
+        transportAllowance: number;
+        otherAllowance: number;
+        dependentsCount: number;
+        kidsUnder20: number;
+        bankName?: string | null;
+        bankAccount?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        db.prepare(
+          `INSERT INTO employee_payroll_profiles (
+             user_id, employment_type, base_salary, position_allowance, meal_allowance,
+             transport_allowance, other_allowance, dependents_count, kids_under_20,
+             bank_name, bank_account, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             employment_type = excluded.employment_type,
+             base_salary = excluded.base_salary,
+             position_allowance = excluded.position_allowance,
+             meal_allowance = excluded.meal_allowance,
+             transport_allowance = excluded.transport_allowance,
+             other_allowance = excluded.other_allowance,
+             dependents_count = excluded.dependents_count,
+             kids_under_20 = excluded.kids_under_20,
+             bank_name = excluded.bank_name,
+             bank_account = excluded.bank_account,
+             updated_at = datetime('now')`,
+        ).run(
+          payload.userId,
+          payload.employmentType,
+          Math.max(0, Math.floor(payload.baseSalary)),
+          Math.max(0, Math.floor(payload.positionAllowance)),
+          Math.max(0, Math.floor(payload.mealAllowance)),
+          Math.max(0, Math.floor(payload.transportAllowance)),
+          Math.max(0, Math.floor(payload.otherAllowance)),
+          Math.max(1, Math.floor(payload.dependentsCount)),
+          Math.max(0, Math.floor(payload.kidsUnder20)),
+          payload.bankName ?? null,
+          payload.bankAccount ?? null,
+        );
+        logActivity(db, payload.actorId, 'payroll.upsertProfile', `user:${payload.userId}`, {
+          employmentType: payload.employmentType,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'upsert_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('payroll:listPeriods', () => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT p.id, p.period_yyyymm, p.pay_date, p.status, p.note,
+                p.closed_by, uc.name AS closed_by_name, p.closed_at, p.paid_at,
+                p.created_by, u.name AS created_by_name, p.created_at,
+                (SELECT COUNT(*) FROM payslips s WHERE s.period_id = p.id) AS payslip_count,
+                (SELECT COALESCE(SUM(net_pay), 0) FROM payslips s WHERE s.period_id = p.id) AS total_net_pay
+           FROM payroll_periods p
+           LEFT JOIN users u  ON u.id = p.created_by
+           LEFT JOIN users uc ON uc.id = p.closed_by
+          ORDER BY p.period_yyyymm DESC
+          LIMIT 60`,
+      )
+      .all();
+    return rows;
+  });
+
+  ipcMain.handle(
+    'payroll:ensurePeriod',
+    (_e, payload: { period: string; payDate?: string | null; actorId: number }) => {
+      const db = getDb();
+      try {
+        const existing = db
+          .prepare(`SELECT id FROM payroll_periods WHERE period_yyyymm = ?`)
+          .get(payload.period) as { id: number } | undefined;
+        if (existing) return { ok: true, id: existing.id, created: false };
+        const res = db
+          .prepare(
+            `INSERT INTO payroll_periods (period_yyyymm, pay_date, status, created_by)
+             VALUES (?, ?, 'draft', ?)`,
+          )
+          .run(payload.period, payload.payDate ?? null, payload.actorId);
+        logActivity(db, payload.actorId, 'payroll.ensurePeriod', `period:${payload.period}`, {});
+        return { ok: true, id: Number(res.lastInsertRowid), created: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'ensure_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'payroll:generatePayslips',
+    (_e, payload: { periodId: number; overwriteDraft?: boolean; actorId: number }) => {
+      const db = getDb();
+      try {
+        const period = db
+          .prepare(`SELECT id, period_yyyymm, status FROM payroll_periods WHERE id = ?`)
+          .get(payload.periodId) as
+          | { id: number; period_yyyymm: string; status: string }
+          | undefined;
+        if (!period) return { ok: false, error: 'period_not_found' };
+        if (period.status !== 'draft') return { ok: false, error: 'period_locked' };
+
+        const profiles = db
+          .prepare(
+            `SELECT p.user_id, p.employment_type, p.base_salary, p.position_allowance,
+                    p.meal_allowance, p.transport_allowance, p.other_allowance,
+                    p.dependents_count, u.name AS user_name
+               FROM employee_payroll_profiles p
+               JOIN users u ON u.id = p.user_id
+              WHERE u.active = 1`,
+          )
+          .all() as {
+          user_id: number;
+          employment_type: 'regular' | 'freelancer' | 'parttime';
+          base_salary: number;
+          position_allowance: number;
+          meal_allowance: number;
+          transport_allowance: number;
+          other_allowance: number;
+          dependents_count: number;
+          user_name: string;
+        }[];
+
+        let created = 0;
+        let skipped = 0;
+        let updated = 0;
+
+        const existsStmt = db.prepare(
+          `SELECT id, status FROM payslips WHERE period_id = ? AND user_id = ?`,
+        );
+        const insertStmt = db.prepare(
+          `INSERT INTO payslips (
+             period_id, user_id, employment_type,
+             base_salary, overtime_pay, position_allowance, meal_allowance, transport_allowance,
+             bonus, other_taxable, other_nontaxable, gross_pay, taxable_base,
+             income_tax, local_income_tax, national_pension, health_insurance, long_term_care,
+             employment_insurance, freelancer_withholding, other_deduction, total_deduction, net_pay,
+             status, calc_version
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1)`,
+        );
+        const updateStmt = db.prepare(
+          `UPDATE payslips SET
+             employment_type = ?,
+             base_salary = ?, overtime_pay = ?, position_allowance = ?, meal_allowance = ?, transport_allowance = ?,
+             bonus = ?, other_taxable = ?, other_nontaxable = ?, gross_pay = ?, taxable_base = ?,
+             income_tax = ?, local_income_tax = ?, national_pension = ?, health_insurance = ?, long_term_care = ?,
+             employment_insurance = ?, freelancer_withholding = ?, other_deduction = ?, total_deduction = ?, net_pay = ?,
+             updated_at = datetime('now')
+           WHERE id = ?`,
+        );
+
+        const tx = db.transaction(() => {
+          for (const p of profiles) {
+            const existing = existsStmt.get(payload.periodId, p.user_id) as
+              | { id: number; status: string }
+              | undefined;
+            if (existing && existing.status !== 'draft') {
+              skipped += 1;
+              continue;
+            }
+            if (existing && !payload.overwriteDraft) {
+              skipped += 1;
+              continue;
+            }
+
+            if (p.employment_type === 'regular' || p.employment_type === 'parttime') {
+              const profile: RegularPayrollProfile = {
+                baseSalary: p.base_salary,
+                positionAllowance: p.position_allowance,
+                mealAllowance: p.meal_allowance,
+                transportAllowance: p.transport_allowance,
+                dependents: p.dependents_count,
+              };
+              const inputs: RegularPayrollInputs = {
+                otherTaxable: p.other_allowance,
+              };
+              const r = calcRegularPayroll(profile, inputs);
+              if (existing) {
+                updateStmt.run(
+                  p.employment_type,
+                  r.baseSalary, r.overtimePay, r.positionAllowance, r.mealAllowance, r.transportAllowance,
+                  r.bonus, r.otherTaxable, r.otherNontaxable, r.grossPay, r.taxableBase,
+                  r.incomeTax, r.localIncomeTax, r.nationalPension, r.healthInsurance, r.longTermCare,
+                  r.employmentInsurance, 0, r.otherDeduction, r.totalDeduction, r.netPay,
+                  existing.id,
+                );
+                updated += 1;
+              } else {
+                insertStmt.run(
+                  payload.periodId, p.user_id, p.employment_type,
+                  r.baseSalary, r.overtimePay, r.positionAllowance, r.mealAllowance, r.transportAllowance,
+                  r.bonus, r.otherTaxable, r.otherNontaxable, r.grossPay, r.taxableBase,
+                  r.incomeTax, r.localIncomeTax, r.nationalPension, r.healthInsurance, r.longTermCare,
+                  r.employmentInsurance, 0, 0, r.totalDeduction, r.netPay,
+                );
+                created += 1;
+              }
+            } else {
+              // freelancer — gross = base_salary (treated as contract fee)
+              const r = calcFreelancerPayroll(p.base_salary);
+              if (existing) {
+                updateStmt.run(
+                  'freelancer',
+                  0, 0, 0, 0, 0,
+                  0, 0, 0, r.grossPay, r.grossPay,
+                  r.incomeTax, r.localIncomeTax, 0, 0, 0,
+                  0, r.totalWithholding, 0, r.totalWithholding, r.netPay,
+                  existing.id,
+                );
+                updated += 1;
+              } else {
+                insertStmt.run(
+                  payload.periodId, p.user_id, 'freelancer',
+                  0, 0, 0, 0, 0,
+                  0, 0, 0, r.grossPay, r.grossPay,
+                  r.incomeTax, r.localIncomeTax, 0, 0, 0,
+                  0, r.totalWithholding, 0, r.totalWithholding, r.netPay,
+                );
+                created += 1;
+              }
+            }
+          }
+        });
+        tx();
+
+        logActivity(db, payload.actorId, 'payroll.generatePayslips', `period:${period.period_yyyymm}`, {
+          created,
+          updated,
+          skipped,
+        });
+        return { ok: true, created, updated, skipped };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'generate_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('payroll:listPayslips', (_e, periodId: number) => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT s.id, s.period_id, s.user_id, s.employment_type,
+                s.base_salary, s.overtime_pay, s.position_allowance, s.meal_allowance, s.transport_allowance,
+                s.bonus, s.other_taxable, s.other_nontaxable, s.gross_pay, s.taxable_base,
+                s.income_tax, s.local_income_tax, s.national_pension, s.health_insurance, s.long_term_care,
+                s.employment_insurance, s.freelancer_withholding, s.other_deduction, s.total_deduction, s.net_pay,
+                s.status, s.memo, s.calc_version, s.created_at, s.updated_at,
+                u.name AS user_name, u.email, u.role, d.name AS department_name
+           FROM payslips s
+           JOIN users u ON u.id = s.user_id
+           LEFT JOIN departments d ON d.id = u.department_id
+          WHERE s.period_id = ?
+          ORDER BY d.name ASC, u.name ASC`,
+      )
+      .all(periodId);
+    return rows;
+  });
+
+  ipcMain.handle('payroll:getMyPayslips', (_e, userId: number) => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT s.id, s.period_id, s.user_id, s.employment_type,
+                s.base_salary, s.overtime_pay, s.position_allowance, s.meal_allowance, s.transport_allowance,
+                s.bonus, s.other_taxable, s.other_nontaxable, s.gross_pay, s.taxable_base,
+                s.income_tax, s.local_income_tax, s.national_pension, s.health_insurance, s.long_term_care,
+                s.employment_insurance, s.freelancer_withholding, s.other_deduction, s.total_deduction, s.net_pay,
+                s.status, s.memo, s.created_at, s.updated_at,
+                p.period_yyyymm, p.pay_date, p.status AS period_status
+           FROM payslips s
+           JOIN payroll_periods p ON p.id = s.period_id
+          WHERE s.user_id = ? AND p.status IN ('closed','paid')
+          ORDER BY p.period_yyyymm DESC
+          LIMIT 24`,
+      )
+      .all(userId);
+    return rows;
+  });
+
+  ipcMain.handle(
+    'payroll:updatePayslip',
+    (
+      _e,
+      payload: {
+        id: number;
+        patch: Partial<{
+          overtimePay: number;
+          bonus: number;
+          otherTaxable: number;
+          otherNontaxable: number;
+          otherDeduction: number;
+          memo: string | null;
+        }>;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const cur = db
+          .prepare(
+            `SELECT s.*, p.status AS period_status FROM payslips s
+               JOIN payroll_periods p ON p.id = s.period_id
+              WHERE s.id = ?`,
+          )
+          .get(payload.id) as
+          | ({
+              period_status: string;
+              employment_type: 'regular' | 'freelancer' | 'parttime';
+              base_salary: number;
+              position_allowance: number;
+              meal_allowance: number;
+              transport_allowance: number;
+              overtime_pay: number;
+              bonus: number;
+              other_taxable: number;
+              other_nontaxable: number;
+              other_deduction: number;
+              status: string;
+            } & Record<string, unknown>)
+          | undefined;
+        if (!cur) return { ok: false, error: 'not_found' };
+        if (cur.period_status !== 'draft') return { ok: false, error: 'period_locked' };
+        if (cur.status !== 'draft') return { ok: false, error: 'payslip_locked' };
+
+        const nextOvertime = Math.max(0, Math.floor(payload.patch.overtimePay ?? cur.overtime_pay));
+        const nextBonus = Math.max(0, Math.floor(payload.patch.bonus ?? cur.bonus));
+        const nextOtherTaxable = Math.max(0, Math.floor(payload.patch.otherTaxable ?? cur.other_taxable));
+        const nextOtherNontaxable = Math.max(0, Math.floor(payload.patch.otherNontaxable ?? cur.other_nontaxable));
+        const nextOtherDeduction = Math.max(0, Math.floor(payload.patch.otherDeduction ?? cur.other_deduction));
+        const memo = payload.patch.memo ?? null;
+
+        if (cur.employment_type === 'freelancer') {
+          // Freelancer fee can still be adjusted via overtime/bonus fields — treat as additional fee.
+          const gross = cur.base_salary + nextBonus + nextOtherTaxable + nextOvertime;
+          const r = calcFreelancerPayroll(gross);
+          db.prepare(
+            `UPDATE payslips SET
+               overtime_pay = ?, bonus = ?, other_taxable = ?, other_nontaxable = ?, other_deduction = ?, memo = COALESCE(?, memo),
+               gross_pay = ?, taxable_base = ?, income_tax = ?, local_income_tax = ?, freelancer_withholding = ?,
+               total_deduction = ?, net_pay = ?, updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(
+            nextOvertime, nextBonus, nextOtherTaxable, nextOtherNontaxable, nextOtherDeduction, memo,
+            r.grossPay, r.grossPay, r.incomeTax, r.localIncomeTax, r.totalWithholding,
+            r.totalWithholding + nextOtherDeduction, r.netPay - nextOtherDeduction,
+            payload.id,
+          );
+        } else {
+          const profile: RegularPayrollProfile = {
+            baseSalary: cur.base_salary,
+            positionAllowance: cur.position_allowance,
+            mealAllowance: cur.meal_allowance,
+            transportAllowance: cur.transport_allowance,
+          };
+          const inputs: RegularPayrollInputs = {
+            overtimePay: nextOvertime,
+            bonus: nextBonus,
+            otherTaxable: nextOtherTaxable,
+            otherNontaxable: nextOtherNontaxable,
+            otherDeduction: nextOtherDeduction,
+          };
+          const r = calcRegularPayroll(profile, inputs);
+          db.prepare(
+            `UPDATE payslips SET
+               overtime_pay = ?, bonus = ?, other_taxable = ?, other_nontaxable = ?, other_deduction = ?, memo = COALESCE(?, memo),
+               gross_pay = ?, taxable_base = ?,
+               income_tax = ?, local_income_tax = ?, national_pension = ?, health_insurance = ?, long_term_care = ?,
+               employment_insurance = ?, total_deduction = ?, net_pay = ?, updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(
+            nextOvertime, nextBonus, nextOtherTaxable, nextOtherNontaxable, nextOtherDeduction, memo,
+            r.grossPay, r.taxableBase,
+            r.incomeTax, r.localIncomeTax, r.nationalPension, r.healthInsurance, r.longTermCare,
+            r.employmentInsurance, r.totalDeduction, r.netPay,
+            payload.id,
+          );
+        }
+
+        logActivity(db, payload.actorId, 'payroll.updatePayslip', `payslip:${payload.id}`, payload.patch);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'update_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'payroll:closePeriod',
+    (_e, payload: { periodId: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        const res = db
+          .prepare(
+            `UPDATE payroll_periods
+                SET status = 'closed', closed_by = ?, closed_at = datetime('now'), updated_at = datetime('now')
+              WHERE id = ? AND status = 'draft'`,
+          )
+          .run(payload.actorId, payload.periodId);
+        if (res.changes === 0) return { ok: false, error: 'not_in_draft' };
+        db.prepare(
+          `UPDATE payslips SET status = 'closed', updated_at = datetime('now') WHERE period_id = ? AND status = 'draft'`,
+        ).run(payload.periodId);
+        logActivity(db, payload.actorId, 'payroll.closePeriod', `period:${payload.periodId}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'close_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'payroll:markPaid',
+    (_e, payload: { periodId: number; paidAt?: string; actorId: number }) => {
+      const db = getDb();
+      try {
+        const res = db
+          .prepare(
+            `UPDATE payroll_periods
+                SET status = 'paid', paid_at = COALESCE(?, datetime('now')), updated_at = datetime('now')
+              WHERE id = ? AND status IN ('draft','closed')`,
+          )
+          .run(payload.paidAt ?? null, payload.periodId);
+        if (res.changes === 0) return { ok: false, error: 'invalid_state' };
+        db.prepare(
+          `UPDATE payslips SET status = 'paid', updated_at = datetime('now') WHERE period_id = ?`,
+        ).run(payload.periodId);
+        logActivity(db, payload.actorId, 'payroll.markPaid', `period:${payload.periodId}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'mark_paid_failed' };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Recurring subscriptions (정기 결제)
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    'subscriptions:list',
+    (_e, filter?: { status?: string; cardId?: number }) => {
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (filter?.status) {
+        where.push('s.status = ?');
+        params.push(filter.status);
+      }
+      if (typeof filter?.cardId === 'number') {
+        where.push('s.card_id = ?');
+        params.push(filter.cardId);
+      }
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const rows = db
+        .prepare(
+          `SELECT s.id, s.vendor, s.plan, s.category, s.amount, s.currency, s.cadence, s.cadence_days,
+                  s.next_charge_at, s.card_id, s.owner_user_id, s.status, s.started_at, s.cancelled_at, s.memo,
+                  s.created_at, s.updated_at,
+                  c.alias AS card_alias, c.last4 AS card_last4,
+                  u.name AS owner_name
+             FROM recurring_subscriptions s
+             LEFT JOIN corporate_cards c ON c.id = s.card_id
+             LEFT JOIN users u ON u.id = s.owner_user_id
+             ${whereSql}
+            ORDER BY s.status ASC, s.next_charge_at ASC, s.vendor ASC`,
+        )
+        .all(...params);
+      return rows;
+    },
+  );
+
+  ipcMain.handle(
+    'subscriptions:upsert',
+    (
+      _e,
+      payload: {
+        id?: number;
+        vendor: string;
+        plan?: string | null;
+        category?: string | null;
+        amount: number;
+        currency?: string;
+        cadence: 'monthly' | 'yearly' | 'quarterly' | 'weekly' | 'custom';
+        cadenceDays?: number | null;
+        nextChargeAt?: string | null;
+        cardId?: number | null;
+        ownerUserId?: number | null;
+        status?: 'active' | 'paused' | 'cancelled';
+        startedAt?: string | null;
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        if (!payload.vendor.trim()) return { ok: false, error: 'vendor_required' };
+        if (payload.id) {
+          db.prepare(
+            `UPDATE recurring_subscriptions SET
+               vendor = ?, plan = ?, category = ?, amount = ?, currency = COALESCE(?, currency),
+               cadence = ?, cadence_days = ?, next_charge_at = ?, card_id = ?, owner_user_id = ?,
+               status = COALESCE(?, status), started_at = ?, memo = ?, updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(
+            payload.vendor.trim(),
+            payload.plan ?? null,
+            payload.category ?? null,
+            Math.max(0, Math.floor(payload.amount)),
+            payload.currency ?? null,
+            payload.cadence,
+            payload.cadenceDays ?? null,
+            payload.nextChargeAt ?? null,
+            payload.cardId ?? null,
+            payload.ownerUserId ?? null,
+            payload.status ?? null,
+            payload.startedAt ?? null,
+            payload.memo ?? null,
+            payload.id,
+          );
+          logActivity(db, payload.actorId, 'subscriptions.update', `sub:${payload.id}`, {
+            vendor: payload.vendor,
+          });
+          return { ok: true, id: payload.id };
+        }
+        const res = db
+          .prepare(
+            `INSERT INTO recurring_subscriptions (
+               vendor, plan, category, amount, currency, cadence, cadence_days, next_charge_at,
+               card_id, owner_user_id, status, started_at, memo
+             ) VALUES (?, ?, ?, ?, COALESCE(?, 'KRW'), ?, ?, ?, ?, ?, COALESCE(?, 'active'), ?, ?)`,
+          )
+          .run(
+            payload.vendor.trim(),
+            payload.plan ?? null,
+            payload.category ?? null,
+            Math.max(0, Math.floor(payload.amount)),
+            payload.currency ?? null,
+            payload.cadence,
+            payload.cadenceDays ?? null,
+            payload.nextChargeAt ?? null,
+            payload.cardId ?? null,
+            payload.ownerUserId ?? null,
+            payload.status ?? null,
+            payload.startedAt ?? null,
+            payload.memo ?? null,
+          );
+        const id = Number(res.lastInsertRowid);
+        logActivity(db, payload.actorId, 'subscriptions.create', `sub:${id}`, {
+          vendor: payload.vendor,
+        });
+        return { ok: true, id };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'upsert_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'subscriptions:setStatus',
+    (
+      _e,
+      payload: { id: number; status: 'active' | 'paused' | 'cancelled'; actorId: number },
+    ) => {
+      const db = getDb();
+      try {
+        const cancelledAt =
+          payload.status === 'cancelled' ? new Date().toISOString() : null;
+        db.prepare(
+          `UPDATE recurring_subscriptions
+              SET status = ?,
+                  cancelled_at = CASE WHEN ? = 'cancelled' THEN COALESCE(cancelled_at, datetime('now')) ELSE cancelled_at END,
+                  updated_at = datetime('now')
+            WHERE id = ?`,
+        ).run(payload.status, payload.status, payload.id);
+        logActivity(db, payload.actorId, 'subscriptions.setStatus', `sub:${payload.id}`, {
+          status: payload.status,
+          cancelledAt,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'status_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('subscriptions:monthlyForecast', () => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT vendor, cadence, amount FROM recurring_subscriptions WHERE status = 'active'`,
+      )
+      .all() as { vendor: string; cadence: string; amount: number }[];
+    let monthlyTotal = 0;
+    for (const r of rows) {
+      switch (r.cadence) {
+        case 'monthly':
+          monthlyTotal += r.amount;
+          break;
+        case 'yearly':
+          monthlyTotal += Math.round(r.amount / 12);
+          break;
+        case 'quarterly':
+          monthlyTotal += Math.round(r.amount / 3);
+          break;
+        case 'weekly':
+          monthlyTotal += Math.round(r.amount * (52 / 12));
+          break;
+        default:
+          monthlyTotal += r.amount; // conservative
+      }
+    }
+    return { activeCount: rows.length, monthlyTotal };
+  });
+
+  ipcMain.handle(
+    'subscriptions:delete',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        db.prepare(`DELETE FROM recurring_subscriptions WHERE id = ?`).run(payload.id);
+        logActivity(db, payload.actorId, 'subscriptions.delete', `sub:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'delete_failed' };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Corporate cards
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle('corpCards:list', (_e, filter?: { status?: string }) => {
+    const db = getDb();
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter?.status) {
+      where.push('c.status = ?');
+      params.push(filter.status);
+    }
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    const rows = db
+      .prepare(
+        `SELECT c.id, c.alias, c.brand, c.issuer, c.last4, c.holder_user_id, c.owner_user_id,
+                c.monthly_limit, c.statement_day, c.status, c.memo, c.created_at, c.updated_at,
+                uh.name AS holder_name, uo.name AS owner_name,
+                (SELECT COUNT(*) FROM recurring_subscriptions s WHERE s.card_id = c.id AND s.status = 'active') AS active_sub_count,
+                (SELECT COALESCE(SUM(amount), 0)
+                   FROM corporate_card_transactions t
+                  WHERE t.card_id = c.id
+                    AND strftime('%Y-%m', t.spent_at) = strftime('%Y-%m', 'now')) AS mtd_spend
+           FROM corporate_cards c
+           LEFT JOIN users uh ON uh.id = c.holder_user_id
+           LEFT JOIN users uo ON uo.id = c.owner_user_id
+           ${whereSql}
+          ORDER BY c.status ASC, c.alias ASC`,
+      )
+      .all(...params);
+    return rows;
+  });
+
+  ipcMain.handle(
+    'corpCards:upsert',
+    (
+      _e,
+      payload: {
+        id?: number;
+        alias: string;
+        brand?: string | null;
+        issuer?: string | null;
+        last4: string;
+        holderUserId?: number | null;
+        ownerUserId?: number | null;
+        monthlyLimit: number;
+        statementDay: number;
+        status?: 'active' | 'frozen' | 'retired';
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        if (!/^\d{4}$/.test(payload.last4)) return { ok: false, error: 'last4_format' };
+        if (!payload.alias.trim()) return { ok: false, error: 'alias_required' };
+        const limit = Math.max(0, Math.floor(payload.monthlyLimit));
+        const statementDay = Math.min(28, Math.max(1, Math.floor(payload.statementDay || 1)));
+        if (payload.id) {
+          db.prepare(
+            `UPDATE corporate_cards SET
+               alias = ?, brand = ?, issuer = ?, last4 = ?, holder_user_id = ?, owner_user_id = ?,
+               monthly_limit = ?, statement_day = ?, status = COALESCE(?, status), memo = ?,
+               updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(
+            payload.alias.trim(),
+            payload.brand ?? null,
+            payload.issuer ?? null,
+            payload.last4,
+            payload.holderUserId ?? null,
+            payload.ownerUserId ?? null,
+            limit,
+            statementDay,
+            payload.status ?? null,
+            payload.memo ?? null,
+            payload.id,
+          );
+          logActivity(db, payload.actorId, 'corpCards.update', `card:${payload.id}`, {});
+          return { ok: true, id: payload.id };
+        }
+        const res = db
+          .prepare(
+            `INSERT INTO corporate_cards (
+               alias, brand, issuer, last4, holder_user_id, owner_user_id,
+               monthly_limit, statement_day, status, memo
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'active'), ?)`,
+          )
+          .run(
+            payload.alias.trim(),
+            payload.brand ?? null,
+            payload.issuer ?? null,
+            payload.last4,
+            payload.holderUserId ?? null,
+            payload.ownerUserId ?? null,
+            limit,
+            statementDay,
+            payload.status ?? null,
+            payload.memo ?? null,
+          );
+        const id = Number(res.lastInsertRowid);
+        logActivity(db, payload.actorId, 'corpCards.create', `card:${id}`, {});
+        return { ok: true, id };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'upsert_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'corpCards:setStatus',
+    (
+      _e,
+      payload: { id: number; status: 'active' | 'frozen' | 'retired'; actorId: number },
+    ) => {
+      const db = getDb();
+      try {
+        db.prepare(
+          `UPDATE corporate_cards SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+        ).run(payload.status, payload.id);
+        logActivity(db, payload.actorId, 'corpCards.setStatus', `card:${payload.id}`, {
+          status: payload.status,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'status_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'corpCards:listTransactions',
+    (
+      _e,
+      filter?: { cardId?: number; period?: string; reconciled?: boolean; limit?: number },
+    ) => {
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (typeof filter?.cardId === 'number') {
+        where.push('t.card_id = ?');
+        params.push(filter.cardId);
+      }
+      if (filter?.period) {
+        where.push("strftime('%Y-%m', t.spent_at) = ?");
+        params.push(filter.period);
+      }
+      if (typeof filter?.reconciled === 'boolean') {
+        where.push('t.reconciled = ?');
+        params.push(filter.reconciled ? 1 : 0);
+      }
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const limit = Math.min(1000, Math.max(1, filter?.limit ?? 200));
+      const rows = db
+        .prepare(
+          `SELECT t.id, t.card_id, t.spent_at, t.merchant, t.category, t.amount, t.currency,
+                  t.note, t.subscription_id, t.receipt_path, t.reconciled, t.actor_id, t.created_at,
+                  c.alias AS card_alias, c.last4 AS card_last4,
+                  s.vendor AS subscription_vendor,
+                  u.name  AS actor_name
+             FROM corporate_card_transactions t
+             LEFT JOIN corporate_cards c ON c.id = t.card_id
+             LEFT JOIN recurring_subscriptions s ON s.id = t.subscription_id
+             LEFT JOIN users u ON u.id = t.actor_id
+             ${whereSql}
+            ORDER BY t.spent_at DESC, t.id DESC
+            LIMIT ${limit}`,
+        )
+        .all(...params);
+      return rows;
+    },
+  );
+
+  ipcMain.handle(
+    'corpCards:addTransaction',
+    (
+      _e,
+      payload: {
+        cardId: number;
+        spentAt: string;
+        merchant: string;
+        category?: string | null;
+        amount: number;
+        currency?: string;
+        note?: string | null;
+        subscriptionId?: number | null;
+        receiptPath?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        if (!payload.merchant.trim()) return { ok: false, error: 'merchant_required' };
+        const res = db
+          .prepare(
+            `INSERT INTO corporate_card_transactions (
+               card_id, spent_at, merchant, category, amount, currency, note,
+               subscription_id, receipt_path, reconciled, actor_id
+             ) VALUES (?, ?, ?, ?, ?, COALESCE(?, 'KRW'), ?, ?, ?, 0, ?)`,
+          )
+          .run(
+            payload.cardId,
+            payload.spentAt,
+            payload.merchant.trim(),
+            payload.category ?? null,
+            Math.floor(payload.amount),
+            payload.currency ?? null,
+            payload.note ?? null,
+            payload.subscriptionId ?? null,
+            payload.receiptPath ?? null,
+            payload.actorId,
+          );
+        const id = Number(res.lastInsertRowid);
+        logActivity(db, payload.actorId, 'corpCards.addTransaction', `tx:${id}`, {
+          cardId: payload.cardId,
+          amount: payload.amount,
+        });
+        return { ok: true, id };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'add_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'corpCards:setReconciled',
+    (_e, payload: { id: number; reconciled: boolean; actorId: number }) => {
+      const db = getDb();
+      try {
+        db.prepare(
+          `UPDATE corporate_card_transactions SET reconciled = ? WHERE id = ?`,
+        ).run(payload.reconciled ? 1 : 0, payload.id);
+        logActivity(db, payload.actorId, 'corpCards.setReconciled', `tx:${payload.id}`, {
+          reconciled: payload.reconciled,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'reconcile_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'corpCards:deleteTransaction',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        db.prepare(`DELETE FROM corporate_card_transactions WHERE id = ?`).run(payload.id);
+        logActivity(db, payload.actorId, 'corpCards.deleteTransaction', `tx:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'delete_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('corpCards:monthlySummary', (_e, period: string) => {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT c.id AS card_id, c.alias, c.last4, c.monthly_limit,
+                COALESCE(SUM(t.amount), 0) AS total_spend,
+                COUNT(t.id) AS tx_count,
+                COALESCE(SUM(CASE WHEN t.reconciled = 0 THEN 1 ELSE 0 END), 0) AS unreconciled_count
+           FROM corporate_cards c
+           LEFT JOIN corporate_card_transactions t
+             ON t.card_id = c.id AND strftime('%Y-%m', t.spent_at) = ?
+          GROUP BY c.id
+          ORDER BY c.alias ASC`,
+      )
+      .all(period);
+    return rows;
+  });
+}
+
+// ===========================================================================
+// Student information archive (학생 정보 보관함)
+//  - list / get students + full activity history (assignments + parsing_results)
+//  - report topics CRUD
+//  - archive files CRUD (metadata only — file bytes live elsewhere for now)
+// ===========================================================================
+function registerStudentArchiveIpc() {
+  // ---- students listing --------------------------------------------------
+  ipcMain.handle(
+    'students:list',
+    (_e, filter?: { q?: string; limit?: number }) => {
+      const db = getDb();
+      const where: string[] = ['s.deleted_at IS NULL'];
+      const params: unknown[] = [];
+      if (filter?.q && filter.q.trim()) {
+        where.push('(s.name LIKE ? OR s.student_code LIKE ? OR s.school LIKE ? OR s.guardian LIKE ?)');
+        const like = `%${filter.q.trim()}%`;
+        params.push(like, like, like, like);
+      }
+      const lim = Math.min(Math.max(filter?.limit ?? 500, 1), 2000);
+      return db
+        .prepare(
+          `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.guardian, s.memo,
+                  s.created_at,
+                  (SELECT COUNT(*) FROM assignments a WHERE a.student_id = s.id) AS assignment_count,
+                  (SELECT COUNT(*) FROM student_report_topics t WHERE t.student_id = s.id) AS topic_count,
+                  (SELECT COUNT(*) FROM student_archive_files f WHERE f.student_id = s.id) AS file_count
+             FROM students s
+            WHERE ${where.join(' AND ')}
+            ORDER BY s.name ASC, s.student_code ASC
+            LIMIT ${lim}`,
+        )
+        .all(...params);
+    },
+  );
+
+  ipcMain.handle('students:get', (_e, studentId: number) => {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.guardian, s.memo,
+                s.monthly_fee, s.billing_day, s.billing_active, s.created_at
+           FROM students s
+          WHERE s.id = ? AND s.deleted_at IS NULL`,
+      )
+      .get(studentId);
+    return row ?? null;
+  });
+
+  // ---- combined history: assignments + parsing_results ------------------
+  ipcMain.handle('students:history', (_e, studentId: number) => {
+    const db = getDb();
+    const assignments = db
+      .prepare(
+        `SELECT a.id, a.code, a.title, a.subject, a.publisher, a.scope, a.length_req,
+                a.state, a.risk, a.due_at, a.received_at, a.completed_at,
+                a.parser_id, a.qa1_id, a.qa_final_id,
+                up.name AS parser_name,
+                u1.name AS qa1_name,
+                u2.name AS qa_final_name,
+                (SELECT COUNT(*) FROM parsing_results p WHERE p.assignment_id = a.id) AS parsing_count
+           FROM assignments a
+           LEFT JOIN users up ON up.id = a.parser_id
+           LEFT JOIN users u1 ON u1.id = a.qa1_id
+           LEFT JOIN users u2 ON u2.id = a.qa_final_id
+          WHERE a.student_id = ?
+          ORDER BY COALESCE(a.received_at, a.created_at) DESC
+          LIMIT 300`,
+      )
+      .all(studentId);
+
+    const parsings = db
+      .prepare(
+        `SELECT p.id, p.assignment_id, p.version, p.ai_summary, p.confidence,
+                p.parsed_at, p.parsed_by,
+                u.name AS parser_name,
+                a.code AS assignment_code,
+                a.title AS assignment_title,
+                a.subject AS assignment_subject
+           FROM parsing_results p
+           JOIN assignments a ON a.id = p.assignment_id
+           LEFT JOIN users u ON u.id = p.parsed_by
+          WHERE a.student_id = ?
+          ORDER BY p.parsed_at DESC
+          LIMIT 300`,
+      )
+      .all(studentId);
+
+    return { assignments, parsings };
+  });
+
+  // ---- parsing result detail (for modal view) ----------------------------
+  ipcMain.handle('students:getParsingDetail', (_e, parsingId: number) => {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT p.id, p.assignment_id, p.version, p.content_json, p.ai_summary,
+                p.confidence, p.parsed_at, p.parsed_by,
+                u.name AS parser_name,
+                a.code AS assignment_code,
+                a.title AS assignment_title,
+                a.subject AS assignment_subject,
+                a.publisher AS assignment_publisher
+           FROM parsing_results p
+           JOIN assignments a ON a.id = p.assignment_id
+           LEFT JOIN users u ON u.id = p.parsed_by
+          WHERE p.id = ?`,
+      )
+      .get(parsingId);
+    return row ?? null;
+  });
+
+  // ---- report topics -----------------------------------------------------
+  ipcMain.handle('students:listReportTopics', (_e, studentId: number) => {
+    const db = getDb();
+    return db
+      .prepare(
+        `SELECT t.id, t.student_id, t.title, t.subject, t.topic, t.status,
+                t.assignment_id, t.due_at, t.submitted_at, t.score, t.memo,
+                t.created_by, t.created_at, t.updated_at,
+                a.code AS assignment_code,
+                u.name AS created_by_name,
+                (SELECT COUNT(*) FROM student_archive_files f WHERE f.topic_id = t.id) AS file_count
+           FROM student_report_topics t
+           LEFT JOIN assignments a ON a.id = t.assignment_id
+           LEFT JOIN users u ON u.id = t.created_by
+          WHERE t.student_id = ?
+          ORDER BY COALESCE(t.due_at, t.created_at) DESC, t.id DESC
+          LIMIT 500`,
+      )
+      .all(studentId);
+  });
+
+  ipcMain.handle(
+    'students:upsertReportTopic',
+    (
+      _e,
+      payload: {
+        id?: number;
+        studentId: number;
+        title: string;
+        subject?: string;
+        topic?: string;
+        status?: string;
+        assignmentId?: number | null;
+        dueAt?: string | null;
+        submittedAt?: string | null;
+        score?: string | null;
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const title = payload.title?.trim();
+        if (!title) return { ok: false, error: 'title_required' };
+        const status = payload.status ?? 'planned';
+        if (payload.id) {
+          const res = db
+            .prepare(
+              `UPDATE student_report_topics
+                  SET title = ?, subject = ?, topic = ?, status = ?,
+                      assignment_id = ?, due_at = ?, submitted_at = ?,
+                      score = ?, memo = ?,
+                      updated_at = datetime('now')
+                WHERE id = ?`,
+            )
+            .run(
+              title,
+              payload.subject ?? null,
+              payload.topic ?? null,
+              status,
+              payload.assignmentId ?? null,
+              payload.dueAt ?? null,
+              payload.submittedAt ?? null,
+              payload.score ?? null,
+              payload.memo ?? null,
+              payload.id,
+            );
+          logActivity(db, payload.actorId, 'students.updateReportTopic', `topic:${payload.id}`, {
+            studentId: payload.studentId,
+            title,
+          });
+          return { ok: res.changes > 0, id: payload.id };
+        }
+        const info = db
+          .prepare(
+            `INSERT INTO student_report_topics (
+                student_id, title, subject, topic, status,
+                assignment_id, due_at, submitted_at, score, memo, created_by
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            payload.studentId,
+            title,
+            payload.subject ?? null,
+            payload.topic ?? null,
+            status,
+            payload.assignmentId ?? null,
+            payload.dueAt ?? null,
+            payload.submittedAt ?? null,
+            payload.score ?? null,
+            payload.memo ?? null,
+            payload.actorId,
+          );
+        logActivity(
+          db,
+          payload.actorId,
+          'students.createReportTopic',
+          `topic:${info.lastInsertRowid}`,
+          { studentId: payload.studentId, title },
+        );
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'upsert_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:deleteReportTopic',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        const res = db
+          .prepare(`DELETE FROM student_report_topics WHERE id = ?`)
+          .run(payload.id);
+        logActivity(db, payload.actorId, 'students.deleteReportTopic', `topic:${payload.id}`, {});
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'delete_failed' };
+      }
+    },
+  );
+
+  // ---- archive files -----------------------------------------------------
+  ipcMain.handle(
+    'students:listArchiveFiles',
+    (_e, filter: { studentId: number; topicId?: number | null }) => {
+      const db = getDb();
+      const where: string[] = ['f.student_id = ?'];
+      const params: unknown[] = [filter.studentId];
+      if (typeof filter.topicId === 'number') {
+        where.push('f.topic_id = ?');
+        params.push(filter.topicId);
+      }
+      return db
+        .prepare(
+          `SELECT f.id, f.student_id, f.topic_id, f.category,
+                  f.original_name, f.stored_path, f.mime_type, f.size_bytes,
+                  f.description, f.uploaded_at, f.uploaded_by,
+                  f.source_assignment_id, f.auto_generated,
+                  u.name AS uploader_name,
+                  t.title AS topic_title,
+                  a.code AS source_assignment_code,
+                  a.title AS source_assignment_title,
+                  a.state AS source_assignment_state
+             FROM student_archive_files f
+             LEFT JOIN users u ON u.id = f.uploaded_by
+             LEFT JOIN student_report_topics t ON t.id = f.topic_id
+             LEFT JOIN assignments a ON a.id = f.source_assignment_id
+            WHERE ${where.join(' AND ')}
+            ORDER BY f.uploaded_at DESC
+            LIMIT 500`,
+        )
+        .all(...params);
+    },
+  );
+
+  ipcMain.handle(
+    'students:addArchiveFile',
+    (
+      _e,
+      payload: {
+        studentId: number;
+        topicId?: number | null;
+        category?: string;
+        originalName: string;
+        storedPath?: string;
+        mimeType?: string;
+        sizeBytes?: number;
+        description?: string | null;
+        uploaderId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const name = payload.originalName?.trim();
+        if (!name) return { ok: false, error: 'name_required' };
+        const category = payload.category ?? 'report';
+        const storedPath = payload.storedPath ?? `local://${name}`;
+        const info = db
+          .prepare(
+            `INSERT INTO student_archive_files (
+                student_id, topic_id, category, original_name, stored_path,
+                mime_type, size_bytes, description,
+                source_assignment_id, auto_generated,
+                uploaded_by
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)`,
+          )
+          .run(
+            payload.studentId,
+            payload.topicId ?? null,
+            category,
+            name,
+            storedPath,
+            payload.mimeType ?? null,
+            payload.sizeBytes ?? null,
+            payload.description ?? null,
+            payload.uploaderId,
+          );
+        logActivity(
+          db,
+          payload.uploaderId,
+          'students.addArchiveFile',
+          `archiveFile:${info.lastInsertRowid}`,
+          { studentId: payload.studentId, name, category },
+        );
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'add_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:deleteArchiveFile',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        // Auto-generated rows are managed by syncAssignmentArchive — don't let
+        // manual deletes orphan them. If the user truly wants to remove such a
+        // row, they should revert the underlying assignment state instead.
+        const existing = db
+          .prepare(
+            `SELECT auto_generated FROM student_archive_files WHERE id = ?`,
+          )
+          .get(payload.id) as { auto_generated: number } | undefined;
+        if (!existing) return { ok: false, error: 'not_found' };
+        if (existing.auto_generated) {
+          return { ok: false, error: 'auto_generated_readonly' };
+        }
+        const res = db
+          .prepare(`DELETE FROM student_archive_files WHERE id = ?`)
+          .run(payload.id);
+        logActivity(db, payload.actorId, 'students.deleteArchiveFile', `archiveFile:${payload.id}`, {});
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'delete_failed' };
+      }
+    },
+  );
 }
 
 /**
@@ -1734,5 +3455,118 @@ function logActivity(
     ).run(actorId, action, target, JSON.stringify(meta));
   } catch (err) {
     console.warn('[ipc] logActivity failed', err);
+  }
+}
+
+/**
+ * Sync the student archive with an assignment's current state.
+ *
+ * - `승인완료` (final approval) → ensure one auto-generated archive row exists
+ *   for this assignment. Re-approvals are idempotent (no duplicate rows).
+ * - Any other state → remove any auto-generated archive rows for this
+ *   assignment. This covers the rejection flow: an assignment that was
+ *   briefly 승인완료 then flipped back (e.g. 최종QA반려, 수정요청) gets pulled
+ *   out of the archive automatically.
+ *
+ * Manually uploaded rows (`auto_generated = 0`) are never touched — if a
+ * teacher hand-archived a file, we don't revoke it.
+ *
+ * Safe to call inside the caller's transaction — every statement here is
+ * narrow and idempotent.
+ */
+function syncAssignmentArchive(
+  db: ReturnType<typeof getDb>,
+  assignmentId: number,
+  newState: string,
+  actorId: number | null,
+) {
+  try {
+    interface AssignmentRow {
+      id: number;
+      code: string;
+      title: string;
+      subject: string | null;
+      publisher: string | null;
+      student_id: number | null;
+    }
+    const row = db
+      .prepare(
+        `SELECT id, code, title, subject, publisher, student_id
+           FROM assignments
+          WHERE id = ?`,
+      )
+      .get(assignmentId) as AssignmentRow | undefined;
+    if (!row) return;
+
+    if (newState === '승인완료') {
+      // No student linkage → can't archive to a specific student.
+      if (!row.student_id) return;
+
+      const existing = db
+        .prepare(
+          `SELECT id FROM student_archive_files
+            WHERE source_assignment_id = ? AND auto_generated = 1
+            LIMIT 1`,
+        )
+        .get(assignmentId) as { id: number } | undefined;
+      if (existing) return; // already archived
+
+      const descParts: string[] = [];
+      if (row.subject) descParts.push(row.subject);
+      if (row.publisher) descParts.push(row.publisher);
+      descParts.push(`과제코드 ${row.code}`);
+      const description = `[자동] 최종 승인된 과제 · ${descParts.join(' · ')}`;
+      const originalName = `${row.code} ${row.title}`.slice(0, 240);
+
+      const info = db
+        .prepare(
+          `INSERT INTO student_archive_files (
+              student_id, topic_id, category, original_name, stored_path,
+              mime_type, size_bytes, description,
+              source_assignment_id, auto_generated,
+              uploaded_by
+           ) VALUES (?, NULL, 'report', ?, ?, NULL, NULL, ?, ?, 1, ?)`,
+        )
+        .run(
+          row.student_id,
+          originalName,
+          `assignment://${row.id}`,
+          description,
+          assignmentId,
+          actorId,
+        );
+
+      logActivity(db, actorId, 'students.autoArchive', `archiveFile:${info.lastInsertRowid}`, {
+        assignmentId,
+        studentId: row.student_id,
+        code: row.code,
+      });
+    } else {
+      // Rolling back an earlier final approval — yank any auto-archived rows.
+      const removedRows = db
+        .prepare(
+          `SELECT id FROM student_archive_files
+            WHERE source_assignment_id = ? AND auto_generated = 1`,
+        )
+        .all(assignmentId) as Array<{ id: number }>;
+      if (removedRows.length === 0) return;
+
+      const res = db
+        .prepare(
+          `DELETE FROM student_archive_files
+            WHERE source_assignment_id = ? AND auto_generated = 1`,
+        )
+        .run(assignmentId);
+
+      if (res.changes > 0) {
+        logActivity(db, actorId, 'students.autoUnarchive', `assignment:${assignmentId}`, {
+          assignmentId,
+          newState,
+          removed: removedRows.map((r) => r.id),
+        });
+      }
+    }
+  } catch (err) {
+    console.warn('[ipc] syncAssignmentArchive failed', err);
   }
 }
