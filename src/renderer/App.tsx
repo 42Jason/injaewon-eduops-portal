@@ -18,7 +18,9 @@ import { AutomationPage } from '@/pages/AutomationPage';
 import { EmployeesPage } from '@/pages/EmployeesPage';
 import { AnnouncementsPage } from '@/pages/AnnouncementsPage';
 import { DocumentsPage } from '@/pages/DocumentsPage';
-import { Placeholder } from '@/pages/Placeholder';
+import { MyWorkPage } from '@/pages/MyWorkPage';
+import { WorkLogsPage } from '@/pages/WorkLogsPage';
+import { SettingsPage } from '@/pages/SettingsPage';
 import { useSession } from '@/stores/session';
 
 function RequireAuth({ children }: { children: ReactElement }) {
@@ -58,7 +60,7 @@ export default function App() {
         <Route index element={<Navigate to="/home" replace />} />
 
         <Route path="home" element={<HomePage />} />
-        <Route path="my-work" element={<Placeholder title="내 업무" />} />
+        <Route path="my-work" element={<MyWorkPage />} />
 
         <Route path="assignments" element={<AssignmentsPage />} />
         <Route path="instruction-parser" element={<ParsingCenterPage />} />
@@ -68,7 +70,7 @@ export default function App() {
         <Route path="cs" element={<CSPage />} />
 
         <Route path="attendance" element={<AttendancePage />} />
-        <Route path="work-logs" element={<Placeholder title="업무 일지" subtitle="일간 업무 로그 (추후)" />} />
+        <Route path="work-logs" element={<WorkLogsPage />} />
         <Route path="leave" element={<LeavePage />} />
         <Route path="approvals" element={<ApprovalsPage />} />
         <Route path="employees" element={<EmployeesPage />} />
@@ -79,7 +81,7 @@ export default function App() {
 
         <Route path="reports" element={<ReportsPage />} />
         <Route path="automation" element={<AutomationPage />} />
-        <Route path="settings" element={<Placeholder title="설정" subtitle="자동화 페이지 > 시스템 설정 탭을 사용하세요." />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/home" replace />} />

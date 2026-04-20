@@ -350,6 +350,38 @@ const api = {
         id?: number;
       }>,
   },
+  workLogs: {
+    list: (filter?: { userId?: number; from?: string; to?: string; limit?: number }) =>
+      ipcRenderer.invoke('workLogs:list', filter) as Promise<Array<Record<string, unknown>>>,
+    create: (payload: {
+      userId: number;
+      logDate: string;
+      summary: string;
+      details?: string;
+      tags?: string;
+    }) =>
+      ipcRenderer.invoke('workLogs:create', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+      }>,
+    update: (payload: {
+      id: number;
+      userId: number;
+      summary?: string;
+      details?: string;
+      tags?: string;
+    }) =>
+      ipcRenderer.invoke('workLogs:update', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    delete: (payload: { id: number; userId: number }) =>
+      ipcRenderer.invoke('workLogs:delete', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+  },
   updater: {
     status: () =>
       ipcRenderer.invoke('updater:status') as Promise<UpdaterStatusPayload>,

@@ -111,7 +111,34 @@ export function initAutoUpdater() {
 
   autoUpdater.on('error', (err) => {
     console.error('[updater] error:', err);
-    broadcast({ state: 'error', message: err?.message ?? String(err) });
+    const msg = err?.message ?? String(err);
+    // Silently downgrade expected "no release yet / transient network" errors
+    // to `not-available` so a fresh repo without published releases doesn't
+    // spam the sidebar with a scary red banner every 6 hours.
+    //
+    // Keep this list generous: the update banner is non-critical UI — the user
+    // can always click "업데이트 확인" in Settings. An opaque red banner is
+    // worse than a silently deferred check.
+    const isSuppressible =
+      // GitHub response errors that almost always mean "no release yet" or
+      // "rate limit" — neither is actionable by the user.
+      /HttpError:\s*(?:401|403|404|409|5\d\d)/i.test(msg) ||
+      /Cannot find (?:latest-[a-z-]+\.yml|latest\.yml)/i.test(msg) ||
+      // Transient DNS / network / TLS / proxy failures.
+      /ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|EPIPE|net::ERR_|getaddrinfo/i.test(msg) ||
+      /CERT_|SELF_SIGNED_CERT|UNABLE_TO_GET_ISSUER_CERT|DEPTH_ZERO_SELF_SIGNED_CERT/i.test(msg) ||
+      // Common "no published release" / "empty feed" variants from electron-updater.
+      /No (?:published|valid) versions? on/i.test(msg) ||
+      /cannot download|Unable to find latest version/i.test(msg) ||
+      // Checksum / signature glitches during partial download — the next poll
+      // usually succeeds, so downgrading avoids a sticky red banner.
+      /sha\d+ checksum mismatch|Integrity check|Signature is invalid/i.test(msg);
+    if (isSuppressible) {
+      console.warn('[updater] suppressing transient/no-release error:', msg);
+      broadcast({ state: 'not-available', version: app.getVersion() });
+      return;
+    }
+    broadcast({ state: 'error', message: msg });
   });
 
   // First check after a short delay so we don't race the initial window load.

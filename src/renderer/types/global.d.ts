@@ -44,7 +44,7 @@ interface EduOpsApi {
       state: string;
       actorId: number;
       note?: string;
-    }): Promise<{ ok: boolean }>;
+    }): Promise<{ ok: boolean; error?: string }>;
     parsingResult(assignmentId: number): Promise<Record<string, unknown> | null>;
     qaReviews(assignmentId: number): Promise<Array<Record<string, unknown>>>;
   };
@@ -272,6 +272,32 @@ interface EduOpsApi {
       uploaderId: number;
     }): Promise<{ ok: boolean; error?: string; id?: number }>;
   };
+  workLogs: {
+    list(filter?: {
+      userId?: number;
+      from?: string;
+      to?: string;
+      limit?: number;
+    }): Promise<Array<Record<string, unknown>>>;
+    create(payload: {
+      userId: number;
+      logDate: string;
+      summary: string;
+      details?: string;
+      tags?: string;
+    }): Promise<{ ok: boolean; error?: string; id?: number }>;
+    update(payload: {
+      id: number;
+      userId: number;
+      summary?: string;
+      details?: string;
+      tags?: string;
+    }): Promise<{ ok: boolean; error?: string }>;
+    delete(payload: {
+      id: number;
+      userId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
+  };
   updater: {
     status(): Promise<UpdaterStatus>;
     check(): Promise<{ ok: boolean; error?: string }>;
@@ -280,15 +306,6 @@ interface EduOpsApi {
     onStatus(cb: (s: UpdaterStatus) => void): () => void;
   };
 }
-
-type UpdaterStatus =
-  | { state: 'idle' }
-  | { state: 'checking' }
-  | { state: 'available'; version: string; releaseNotes?: string; releaseDate?: string }
-  | { state: 'not-available'; version: string }
-  | { state: 'downloading'; percent: number; transferred: number; total: number; bytesPerSecond: number }
-  | { state: 'ready'; version: string }
-  | { state: 'error'; message: string };
 
 interface ParsingPreviewRow {
   rowNumber: number;
@@ -311,6 +328,36 @@ declare global {
     /** Available only inside Electron — undefined if running in a plain browser preview. */
     api?: EduOpsApi;
   }
+  /** Re-declared globally so modules can reference `ParsingPreviewRow` without importing. */
+  interface ParsingPreviewRow {
+    rowNumber: number;
+    subject: string;
+    publisher: string;
+    studentCode: string;
+    assignmentTitle: string;
+    assignmentScope: string;
+    lengthRequirement: string;
+    outline: string;
+    rubric: string;
+    teacherRequirements: string;
+    studentRequests: string;
+    valid: boolean;
+    errors: string[];
+  }
+  type UpdaterStatus =
+    | { state: 'idle' }
+    | { state: 'checking' }
+    | { state: 'available'; version: string; releaseNotes?: string; releaseDate?: string }
+    | { state: 'not-available'; version: string }
+    | {
+        state: 'downloading';
+        percent: number;
+        transferred: number;
+        total: number;
+        bytesPerSecond: number;
+      }
+    | { state: 'ready'; version: string }
+    | { state: 'error'; message: string };
 }
 
 export {};

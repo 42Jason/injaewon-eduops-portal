@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   LayoutGrid, AlertTriangle, Clock, User as UserIcon, Filter, RefreshCcw,
 } from 'lucide-react';
@@ -13,6 +13,11 @@ import {
   formatDueLabel,
 } from '@/lib/assignment';
 import { cn } from '@/lib/cn';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { useToast } from '@/stores/toast';
+import { useConfirm } from '@/components/ui/ConfirmDialog';
+import { LoadingPanel, Spinner } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
 
 interface BoardRow {
   id: number;
@@ -70,6 +75,7 @@ const ALL_STATES: AssignmentState[] = [
 ];
 
 const TERMINAL: AssignmentState[] = ['승인완료', '완료', '보류'];
+const DESTRUCTIVE: AssignmentState[] = ['1차QA반려', '최종QA반려', '보류', '수정요청'];
 
 function isOverdue(row: BoardRow): boolean {
   if (!row.due_at) return false;
@@ -90,6 +96,8 @@ export function OperationsBoardPage() {
   const api = getApi();
   const live = !!api && !!user;
   const qc = useQueryClient();
+  const toast = useToast();
+  const confirm = useConfirm();
 
   const [riskFilter, setRiskFilter] = useState<Risk | 'ALL'>('ALL');
   const [mineOnly, setMineOnly] = useState(false);
@@ -133,8 +141,12 @@ export function OperationsBoardPage() {
     return m;
   }, [rows]);
 
-  const setStateMut = useMutation({
-    mutationFn: (payload: { id: number; state: AssignmentState }) => {
+  const setStateMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    { id: number; state: AssignmentState }
+  >({
+    mutationFn: (payload) => {
       if (!live || !user) return Promise.resolve({ ok: false });
       return api!.assignments.setState({
         id: payload.id,
@@ -142,13 +154,32 @@ export function OperationsBoardPage() {
         actorId: user.id,
       });
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['board.list'] });
-      qc.invalidateQueries({ queryKey: ['board.summary'] });
-      qc.invalidateQueries({ queryKey: ['assignments.list'] });
-      qc.invalidateQueries({ queryKey: ['home.stats'] });
+    successMessage: false,
+    errorMessage: '상태 변경에 실패했습니다',
+    invalidates: [
+      ['board.list'],
+      ['board.summary'],
+      ['assignments.list'],
+      ['home.stats'],
+    ],
+    onSuccess: (res, vars) => {
+      if (res.ok) toast.ok(`상태가 "${vars.state}" (으)로 변경되었습니다`);
     },
   });
+
+  /** Gate destructive transitions behind a confirm dialog. */
+  async function requestTransition(id: number, next: AssignmentState) {
+    if (DESTRUCTIVE.includes(next)) {
+      const ok = await confirm({
+        title: `"${next}" 상태로 전환하시겠어요?`,
+        description: '이 상태 변경은 팀원들에게 알림으로 전달될 수 있습니다.',
+        confirmLabel: '변경',
+        tone: 'danger',
+      });
+      if (!ok) return;
+    }
+    setStateMut.mutate({ id, state: next });
+  }
 
   const overdueCount = useMemo(() => rows.filter(isOverdue).length, [rows]);
   const riskHighCount = useMemo(() => rows.filter((r) => r.risk === 'high').length, [rows]);
@@ -164,6 +195,9 @@ export function OperationsBoardPage() {
       </div>
     );
   }
+
+  const boardLoading = listQuery.isLoading || (listQuery.isFetching && !listQuery.data);
+  const boardError = listQuery.isError;
 
   return (
     <div className="p-6 space-y-4">
@@ -183,9 +217,12 @@ export function OperationsBoardPage() {
             qc.invalidateQueries({ queryKey: ['board.list'] });
             qc.invalidateQueries({ queryKey: ['board.summary'] });
           }}
-          className="btn-outline text-sm flex items-center gap-1.5"
+          disabled={listQuery.isFetching}
+          aria-label="새로고침"
+          className="btn-outline text-sm flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent/40 disabled:opacity-60"
         >
-          <RefreshCcw size={14} /> 새로고침
+          {listQuery.isFetching ? <Spinner size={14} /> : <RefreshCcw size={14} />}
+          새로고침
         </button>
       </div>
 
@@ -205,6 +242,7 @@ export function OperationsBoardPage() {
           accent="text-rose-300"
           onClick={() => setOverdueOnly((v) => !v)}
           active={overdueOnly}
+          ariaLabel={overdueOnly ? '지연 필터 해제' : '지연 과제만 보기'}
         />
         <SummaryCard
           label="고위험 과제"
@@ -214,6 +252,7 @@ export function OperationsBoardPage() {
           accent="text-amber-300"
           onClick={() => setRiskFilter((r) => (r === 'high' ? 'ALL' : 'high'))}
           active={riskFilter === 'high'}
+          ariaLabel={riskFilter === 'high' ? '고위험 필터 해제' : '고위험 과제만 보기'}
         />
         <SummaryCard
           label="완료 (승인+완료)"
@@ -225,7 +264,11 @@ export function OperationsBoardPage() {
       </div>
 
       {/* Filters */}
-      <div className="card p-3 flex items-center gap-3 flex-wrap">
+      <div
+        className="card p-3 flex items-center gap-3 flex-wrap"
+        role="toolbar"
+        aria-label="보드 필터"
+      >
         <span className="text-xs text-fg-subtle flex items-center gap-1">
           <Filter size={14} /> 필터
         </span>
@@ -241,45 +284,112 @@ export function OperationsBoardPage() {
         <Chip active={riskFilter === 'low'} onClick={() => setRiskFilter('low')}>
           낮음
         </Chip>
-        <div className="mx-2 h-4 w-px bg-border" />
+        <div className="mx-2 h-4 w-px bg-border" aria-hidden="true" />
         <Chip active={mineOnly} onClick={() => setMineOnly((v) => !v)}>
           내 담당
         </Chip>
         <Chip active={overdueOnly} onClick={() => setOverdueOnly((v) => !v)}>
           지연만
         </Chip>
+        {(riskFilter !== 'ALL' || mineOnly || overdueOnly) && (
+          <button
+            type="button"
+            onClick={() => {
+              setRiskFilter('ALL');
+              setMineOnly(false);
+              setOverdueOnly(false);
+            }}
+            className="ml-auto text-xs text-fg-subtle hover:text-fg underline underline-offset-2"
+          >
+            필터 초기화
+          </button>
+        )}
       </div>
 
-      {/* Kanban Board */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3">
-        {COLUMNS.map((col) => {
-          const colRows = col.states.flatMap((s) => byState.get(s) ?? []);
-          return (
-            <div
-              key={col.label}
-              className={cn('rounded-lg border-t-2 bg-bg-soft/40 flex flex-col', col.tone)}
+      {/* Board state */}
+      {boardError ? (
+        <EmptyState
+          icon={AlertTriangle}
+          tone="error"
+          title="보드를 불러오지 못했습니다"
+          hint="네트워크 또는 DB 연결 상태를 확인한 뒤 다시 시도하세요."
+          action={
+            <button
+              type="button"
+              onClick={() => listQuery.refetch()}
+              className="btn-outline text-sm flex items-center gap-1.5"
             >
-              <div className="px-3 py-2 border-b border-border flex items-center justify-between">
-                <span className="text-sm font-semibold text-fg">{col.label}</span>
-                <span className="text-xs text-fg-subtle">{colRows.length}</span>
-              </div>
-              <div className="p-2 space-y-2 min-h-[200px] max-h-[70vh] overflow-y-auto">
-                {colRows.length === 0 && (
-                  <div className="text-xs text-fg-subtle text-center py-6">비어있음</div>
-                )}
-                {colRows.map((r) => (
-                  <BoardCard
-                    key={r.id}
-                    row={r}
-                    onChangeState={(next) => setStateMut.mutate({ id: r.id, state: next })}
-                    pending={setStateMut.isPending}
-                  />
-                ))}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+              <RefreshCcw size={12} /> 다시 시도
+            </button>
+          }
+        />
+      ) : boardLoading ? (
+        <LoadingPanel label="보드를 불러오는 중…" />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          icon={LayoutGrid}
+          title={
+            riskFilter !== 'ALL' || mineOnly || overdueOnly
+              ? '필터와 일치하는 과제가 없습니다'
+              : '표시할 과제가 없습니다'
+          }
+          hint={
+            riskFilter !== 'ALL' || mineOnly || overdueOnly
+              ? '필터를 초기화하면 더 많은 과제를 볼 수 있어요.'
+              : '새 과제가 등록되면 여기에 표시됩니다.'
+          }
+          action={
+            (riskFilter !== 'ALL' || mineOnly || overdueOnly) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setRiskFilter('ALL');
+                  setMineOnly(false);
+                  setOverdueOnly(false);
+                }}
+                className="btn-outline text-sm"
+              >
+                필터 초기화
+              </button>
+            )
+          }
+        />
+      ) : (
+        /* Kanban Board */
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3">
+          {COLUMNS.map((col) => {
+            const colRows = col.states.flatMap((s) => byState.get(s) ?? []);
+            return (
+              <section
+                key={col.label}
+                aria-label={`${col.label} 컬럼 (${colRows.length}건)`}
+                className={cn('rounded-lg border-t-2 bg-bg-soft/40 flex flex-col', col.tone)}
+              >
+                <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+                  <span className="text-sm font-semibold text-fg">{col.label}</span>
+                  <span className="text-xs text-fg-subtle tabular-nums">{colRows.length}</span>
+                </div>
+                <div className="p-2 space-y-2 min-h-[200px] max-h-[70vh] overflow-y-auto">
+                  {colRows.length === 0 ? (
+                    <div className="text-xs text-fg-subtle text-center py-6" role="status">
+                      비어있음
+                    </div>
+                  ) : (
+                    colRows.map((r) => (
+                      <BoardCard
+                        key={r.id}
+                        row={r}
+                        onChangeState={(next) => requestTransition(r.id, next)}
+                        pending={setStateMut.isPending}
+                      />
+                    ))
+                  )}
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -292,6 +402,7 @@ function SummaryCard({
   accent,
   onClick,
   active,
+  ariaLabel,
 }: {
   label: string;
   value: number;
@@ -300,6 +411,7 @@ function SummaryCard({
   accent?: string;
   onClick?: () => void;
   active?: boolean;
+  ariaLabel?: string;
 }) {
   const clickable = !!onClick;
   return (
@@ -307,8 +419,11 @@ function SummaryCard({
       type="button"
       onClick={onClick}
       disabled={!clickable}
+      aria-pressed={clickable ? !!active : undefined}
+      aria-label={ariaLabel}
       className={cn(
         'card flex items-center justify-between px-4 py-3 border-l-2 text-left transition',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
         tone,
         clickable && 'hover:bg-bg-soft/80 cursor-pointer',
         active && 'ring-1 ring-accent',
@@ -339,8 +454,10 @@ function Chip({
     <button
       type="button"
       onClick={onClick}
+      aria-pressed={!!active}
       className={cn(
         'text-xs px-2 py-1 rounded border transition',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
         active
           ? 'bg-accent/20 text-accent border-accent/40'
           : 'bg-bg-soft text-fg-muted border-border hover:border-fg-subtle',
@@ -372,9 +489,11 @@ function BoardCard({
           : 'text-fg-subtle';
 
   return (
-    <div
+    <article
+      aria-label={`과제 ${row.code} — ${rowTitle(row)}`}
       className={cn(
         'rounded-md border bg-bg p-2.5 space-y-2 text-xs',
+        'focus-within:ring-2 focus-within:ring-accent/40',
         overdue ? 'border-rose-500/50' : 'border-border',
       )}
     >
@@ -396,41 +515,57 @@ function BoardCard({
 
       <div className="flex items-center justify-between gap-1.5 text-[11px]">
         <span className="flex items-center gap-1 text-fg-subtle">
-          <UserIcon size={11} />
+          <UserIcon size={11} aria-hidden="true" />
           {rowStudent(row)}
         </span>
         <span className={cn('flex items-center gap-1', dueTone)}>
-          <Clock size={11} />
+          <Clock size={11} aria-hidden="true" />
           {due.label}
         </span>
       </div>
 
       {overdue && (
-        <div className="flex items-center gap-1 text-[10px] text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded px-1.5 py-0.5">
-          <AlertTriangle size={10} /> SLA 초과
+        <div
+          className="flex items-center gap-1 text-[10px] text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded px-1.5 py-0.5"
+          role="status"
+        >
+          <AlertTriangle size={10} aria-hidden="true" /> SLA 초과
         </div>
       )}
 
       <div className="pt-1 border-t border-border">
-        <select
-          value={row.state}
-          disabled={pending}
-          onChange={(e) => {
-            const next = e.target.value as AssignmentState;
-            if (next !== row.state) onChangeState(next);
-          }}
-          className={cn(
-            'input text-[11px] py-1 px-1.5 w-full',
-            stateChipClass(row.state),
+        <label className="sr-only" htmlFor={`state-${row.id}`}>
+          상태 변경
+        </label>
+        <div className="relative">
+          <select
+            id={`state-${row.id}`}
+            value={row.state}
+            disabled={pending}
+            onChange={(e) => {
+              const next = e.target.value as AssignmentState;
+              if (next !== row.state) onChangeState(next);
+            }}
+            aria-label={`${row.code} 상태 변경`}
+            className={cn(
+              'input text-[11px] py-1 px-1.5 w-full',
+              pending && 'opacity-70',
+              stateChipClass(row.state),
+            )}
+          >
+            {ALL_STATES.map((s) => (
+              <option key={s} value={s} className="bg-bg text-fg">
+                {s}
+              </option>
+            ))}
+          </select>
+          {pending && (
+            <span className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-fg-subtle">
+              <Spinner size={11} label="저장 중" />
+            </span>
           )}
-        >
-          {ALL_STATES.map((s) => (
-            <option key={s} value={s} className="bg-bg text-fg">
-              {s}
-            </option>
-          ))}
-        </select>
+        </div>
       </div>
-    </div>
+    </article>
   );
 }

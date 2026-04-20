@@ -1,12 +1,26 @@
 import { useMemo, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
-  FolderOpen, FileText, Plus, Search, User as UserIcon, Tag, X, Save,
+  AlertTriangle,
+  FileText,
+  FolderOpen,
+  FolderX,
+  Plus,
+  Save,
+  Search,
+  Tag,
+  User as UserIcon,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
 import { fmtDate, relative } from '@/lib/date';
 import { cn } from '@/lib/cn';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { LoadingPanel } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { Modal } from '@/components/ui/Modal';
+import { FormField, SelectInput, TextInput } from '@/components/ui/FormField';
+import { firstError, maxLength, numberRange, required } from '@/lib/validators';
 
 interface DocumentRow {
   id: number;
@@ -20,12 +34,14 @@ interface DocumentRow {
 }
 
 const DEFAULT_FOLDERS = ['일반', '사내규정', '교육자료', '계약서', '회계'];
+const NAME_MAX = 200;
+const TAGS_MAX = 200;
+const MIME_MAX = 80;
 
 export function DocumentsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
 
   const [folder, setFolder] = useState<string>('ALL');
   const [search, setSearch] = useState('');
@@ -34,7 +50,7 @@ export function DocumentsPage() {
   const listQuery = useQuery({
     queryKey: ['documents.list', folder],
     queryFn: () =>
-      api!.documents.list(folder === 'ALL' ? undefined : folder) as Promise<DocumentRow[]>,
+      api!.documents.list(folder === 'ALL' ? undefined : folder) as unknown as Promise<DocumentRow[]>,
     enabled: live,
   });
 
@@ -93,23 +109,28 @@ export function DocumentsPage() {
           <div className="px-3 py-2 border-b border-border bg-bg-soft/40 text-sm font-medium">
             폴더
           </div>
-          <div className="divide-y divide-border">
-            {folders.map((f) => (
-              <button
-                key={f}
-                type="button"
-                onClick={() => setFolder(f)}
-                className={cn(
-                  'w-full text-left px-3 py-2 text-sm transition flex items-center gap-2',
-                  folder === f
-                    ? 'bg-accent/10 text-accent'
-                    : 'text-fg-muted hover:bg-bg-soft/40',
-                )}
-              >
-                <FolderOpen size={13} />
-                {f === 'ALL' ? '전체' : f}
-              </button>
-            ))}
+          <div className="divide-y divide-border" role="radiogroup" aria-label="폴더 선택">
+            {folders.map((f) => {
+              const active = folder === f;
+              return (
+                <button
+                  key={f}
+                  type="button"
+                  onClick={() => setFolder(f)}
+                  role="radio"
+                  aria-checked={active}
+                  className={cn(
+                    'w-full text-left px-3 py-2 text-sm transition flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                    active
+                      ? 'bg-accent/10 text-accent'
+                      : 'text-fg-muted hover:bg-bg-soft/40',
+                  )}
+                >
+                  <FolderOpen size={13} />
+                  {f === 'ALL' ? '전체' : f}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -117,87 +138,122 @@ export function DocumentsPage() {
         <div className="col-span-12 lg:col-span-9">
           <div className="card p-0 overflow-hidden">
             <div className="px-3 py-2 border-b border-border bg-bg-soft/40 flex items-center gap-2">
-              <Search size={13} className="text-fg-subtle" />
+              <Search size={13} className="text-fg-subtle" aria-hidden="true" />
               <input
-                type="text"
+                type="search"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="이름 / 태그 / 업로더 검색"
+                aria-label="자료 검색"
                 className="input text-xs py-1 flex-1"
               />
-              <span className="text-xs text-fg-subtle">{filtered.length}건</span>
+              <span className="text-xs text-fg-subtle" aria-live="polite">{filtered.length}건</span>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="bg-bg-soft/30 text-xs text-fg-subtle">
-                  <tr>
-                    <th className="text-left px-3 py-2 font-normal">이름</th>
-                    <th className="text-left px-3 py-2 font-normal">폴더</th>
-                    <th className="text-left px-3 py-2 font-normal">태그</th>
-                    <th className="text-right px-3 py-2 font-normal">크기</th>
-                    <th className="text-left px-3 py-2 font-normal">업로더</th>
-                    <th className="text-left px-3 py-2 font-normal">등록</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {filtered.length === 0 && (
+              {listQuery.isLoading ? (
+                <LoadingPanel label="자료 목록을 불러오는 중…" className="py-10" />
+              ) : listQuery.isError ? (
+                <EmptyState
+                  tone="error"
+                  icon={AlertTriangle}
+                  title="자료 목록을 불러오지 못했습니다"
+                  hint="네트워크 상태를 확인하거나 잠시 후 다시 시도해 주세요."
+                  action={
+                    <button className="btn-outline" onClick={() => listQuery.refetch()}>
+                      다시 시도
+                    </button>
+                  }
+                  className="border-0"
+                />
+              ) : filtered.length === 0 ? (
+                <EmptyState
+                  icon={search.trim() ? Search : FolderX}
+                  title={
+                    search.trim()
+                      ? '검색어와 일치하는 자료가 없습니다'
+                      : folder === 'ALL'
+                        ? '아직 등록된 자료가 없습니다'
+                        : `"${folder}" 폴더에 자료가 없습니다`
+                  }
+                  hint={search.trim() ? '다른 검색어를 시도하거나 검색을 지워 보세요.' : '우측 상단 "자료 등록" 버튼으로 처음 자료를 추가해 보세요.'}
+                  action={
+                    search.trim() ? (
+                      <button className="btn-outline" onClick={() => setSearch('')}>
+                        검색 지우기
+                      </button>
+                    ) : folder !== 'ALL' ? (
+                      <button className="btn-outline" onClick={() => setFolder('ALL')}>
+                        전체 보기
+                      </button>
+                    ) : (
+                      <button className="btn-primary" onClick={() => setNewOpen(true)}>
+                        <Plus size={14} className="mr-1" />
+                        자료 등록
+                      </button>
+                    )
+                  }
+                  className="border-0"
+                />
+              ) : (
+                <table className="w-full text-sm">
+                  <thead className="bg-bg-soft/30 text-xs text-fg-subtle">
                     <tr>
-                      <td colSpan={6} className="p-6 text-center text-fg-subtle">
-                        등록된 자료가 없습니다.
-                      </td>
+                      <th className="text-left px-3 py-2 font-normal">이름</th>
+                      <th className="text-left px-3 py-2 font-normal">폴더</th>
+                      <th className="text-left px-3 py-2 font-normal">태그</th>
+                      <th className="text-right px-3 py-2 font-normal">크기</th>
+                      <th className="text-left px-3 py-2 font-normal">업로더</th>
+                      <th className="text-left px-3 py-2 font-normal">등록</th>
                     </tr>
-                  )}
-                  {filtered.map((r) => (
-                    <tr key={r.id} className="hover:bg-bg-soft/30">
-                      <td className="px-3 py-2">
-                        <span className="flex items-center gap-1.5 text-fg">
-                          <FileText size={13} className="text-fg-subtle" /> {r.name}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-fg-muted">
-                        <span className="text-xs border border-border rounded px-1.5 py-0.5 bg-bg-soft/50">
-                          {r.folder ?? '-'}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-xs text-fg-subtle">
-                        {r.tags ? (
-                          <span className="flex items-center gap-1">
-                            <Tag size={10} /> {r.tags}
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {filtered.map((r) => (
+                      <tr key={r.id} className="hover:bg-bg-soft/30">
+                        <td className="px-3 py-2">
+                          <span className="flex items-center gap-1.5 text-fg">
+                            <FileText size={13} className="text-fg-subtle" /> {r.name}
                           </span>
-                        ) : (
-                          '-'
-                        )}
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-xs text-fg-subtle">
-                        {formatSize(r.size_bytes)}
-                      </td>
-                      <td className="px-3 py-2 text-xs text-fg-muted">
-                        <span className="flex items-center gap-1">
-                          <UserIcon size={10} /> {r.uploader_name ?? '-'}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-xs text-fg-subtle">
-                        <div>{relative(r.created_at)}</div>
-                        <div className="text-[10px]">{fmtDate(r.created_at)}</div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                        </td>
+                        <td className="px-3 py-2 text-fg-muted">
+                          <span className="text-xs border border-border rounded px-1.5 py-0.5 bg-bg-soft/50">
+                            {r.folder ?? '-'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-xs text-fg-subtle">
+                          {r.tags ? (
+                            <span className="flex items-center gap-1">
+                              <Tag size={10} /> {r.tags}
+                            </span>
+                          ) : (
+                            '-'
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-xs text-fg-subtle">
+                          {formatSize(r.size_bytes)}
+                        </td>
+                        <td className="px-3 py-2 text-xs text-fg-muted">
+                          <span className="flex items-center gap-1">
+                            <UserIcon size={10} /> {r.uploader_name ?? '-'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-xs text-fg-subtle">
+                          <div>{relative(r.created_at)}</div>
+                          <div className="text-[10px]">{fmtDate(r.created_at)}</div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
           </div>
         </div>
       </div>
 
-      {newOpen && (
-        <NewDocumentModal
-          onClose={() => setNewOpen(false)}
-          onCreated={() => {
-            setNewOpen(false);
-            qc.invalidateQueries({ queryKey: ['documents.list'] });
-          }}
-        />
-      )}
+      <NewDocumentModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+      />
     </div>
   );
 }
@@ -210,11 +266,11 @@ function formatSize(bytes?: number | null): string {
 }
 
 function NewDocumentModal({
+  open,
   onClose,
-  onCreated,
 }: {
+  open: boolean;
   onClose: () => void;
-  onCreated: () => void;
 }) {
   const { user } = useSession();
   const api = getApi();
@@ -223,13 +279,38 @@ function NewDocumentModal({
   const [tags, setTags] = useState('');
   const [mime, setMime] = useState('');
   const [size, setSize] = useState<number | ''>('');
-  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ name?: boolean; tags?: boolean; mime?: boolean; size?: boolean }>({});
 
-  const mut = useMutation({
+  const nameRules = firstError<string>([required('파일명을 입력해 주세요'), maxLength(NAME_MAX)]);
+  const tagsRules = firstError<string>([maxLength(TAGS_MAX)]);
+  const mimeRules = firstError<string>([maxLength(MIME_MAX)]);
+  const sizeRules = firstError<number | null | undefined>([numberRange(0, 10 * 1024 * 1024 * 1024, '크기는 0 ~ 10GB 사이여야 합니다')]);
+
+  const nameErr = nameRules(name);
+  const tagsErr = tagsRules(tags);
+  const mimeErr = mimeRules(mime);
+  const sizeErr = sizeRules(size === '' ? null : Number(size));
+
+  const showNameErr = touched.name ? nameErr : null;
+  const showTagsErr = touched.tags ? tagsErr : null;
+  const showMimeErr = touched.mime ? mimeErr : null;
+  const showSizeErr = touched.size ? sizeErr : null;
+
+  const invalid = !!(nameErr || tagsErr || mimeErr || sizeErr);
+
+  const resetForm = () => {
+    setName('');
+    setFolder(DEFAULT_FOLDERS[0]);
+    setTags('');
+    setMime('');
+    setSize('');
+    setTouched({});
+  };
+
+  const createMut = useMutationWithToast({
     mutationFn: async () => {
       if (!api || !user) throw new Error('not ready');
-      if (!name.trim()) throw new Error('파일명 필수');
-      const res = await api.documents.create({
+      return api.documents.create({
         name: name.trim(),
         folder: folder || undefined,
         tags: tags.trim() || undefined,
@@ -237,87 +318,165 @@ function NewDocumentModal({
         sizeBytes: size === '' ? undefined : Number(size),
         uploaderId: user.id,
       });
-      if (!res.ok) throw new Error(res.error ?? '등록 실패');
-      return res;
     },
-    onSuccess: onCreated,
-    onError: (e: Error) => setError(e.message),
+    successMessage: `"${name.trim()}" 자료가 등록되었습니다`,
+    errorMessage: '자료 등록에 실패했습니다',
+    invalidates: [['documents.list']],
+    onSuccess: (res) => {
+      if (res.ok) {
+        resetForm();
+        onClose();
+      }
+    },
   });
 
+  const handleSubmit = () => {
+    setTouched({ name: true, tags: true, mime: true, size: true });
+    if (invalid) return;
+    createMut.mutate();
+  };
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-      <div className="bg-bg border border-border rounded-lg shadow-xl max-w-md w-full p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">자료 등록</h2>
-          <button type="button" onClick={onClose} className="text-fg-subtle hover:text-fg">
-            <X size={18} />
-          </button>
-        </div>
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="파일명 (예: 2026-운영매뉴얼.pdf)"
-          className="input text-sm w-full"
-        />
-        <div className="grid grid-cols-2 gap-2">
-          <select
-            value={folder}
-            onChange={(e) => setFolder(e.target.value)}
-            className="input text-sm"
+    <Modal
+      open={open}
+      onClose={() => {
+        if (createMut.isPending) return;
+        resetForm();
+        onClose();
+      }}
+      title="자료 등록"
+      size="md"
+      closeOnEsc={!createMut.isPending}
+      closeOnBackdrop={!createMut.isPending}
+      footer={
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              if (createMut.isPending) return;
+              resetForm();
+              onClose();
+            }}
+            className="btn-ghost text-sm"
+            disabled={createMut.isPending}
           >
-            {DEFAULT_FOLDERS.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            value={mime}
-            onChange={(e) => setMime(e.target.value)}
-            placeholder="MIME (선택)"
-            className="input text-sm"
-          />
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <input
-            type="text"
-            value={tags}
-            onChange={(e) => setTags(e.target.value)}
-            placeholder="태그 (쉼표 구분)"
-            className="input text-sm"
-          />
-          <input
-            type="number"
-            value={size}
-            onChange={(e) => setSize(e.target.value === '' ? '' : Number(e.target.value))}
-            placeholder="크기(bytes, 선택)"
-            className="input text-sm"
-          />
-        </div>
-        {error && (
-          <div className="text-xs text-rose-300 border border-rose-500/40 bg-rose-500/10 rounded px-2 py-1">
-            {error}
-          </div>
-        )}
-        <div className="text-[11px] text-fg-subtle">
-          * 이 버전은 파일 자체를 저장하지 않고 메타데이터만 기록합니다.
-        </div>
-        <div className="flex items-center justify-end gap-2">
-          <button type="button" onClick={onClose} className="btn-ghost text-sm">
             취소
           </button>
           <button
             type="button"
-            disabled={mut.isPending}
-            onClick={() => mut.mutate()}
-            className="btn-primary text-sm flex items-center gap-1.5"
+            disabled={createMut.isPending}
+            onClick={handleSubmit}
+            className="btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50"
           >
-            <Save size={13} /> 등록
+            <Save size={13} /> {createMut.isPending ? '등록 중…' : '등록'}
           </button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormField
+          label="파일명"
+          required
+          error={showNameErr}
+          hint="예: 2026-운영매뉴얼.pdf"
+          count={name.length}
+          max={NAME_MAX}
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, name: true }))}
+              placeholder="예: 2026-운영매뉴얼.pdf"
+              maxLength={NAME_MAX + 20}
+            />
+          )}
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label="폴더">
+            {(slot) => (
+              <SelectInput
+                {...slot}
+                value={folder}
+                onChange={(e) => setFolder(e.target.value)}
+              >
+                {DEFAULT_FOLDERS.map((f) => (
+                  <option key={f} value={f}>
+                    {f}
+                  </option>
+                ))}
+              </SelectInput>
+            )}
+          </FormField>
+          <FormField
+            label="MIME"
+            hint="선택 · 예: application/pdf"
+            error={showMimeErr}
+            count={mime.length}
+            max={MIME_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                type="text"
+                value={mime}
+                onChange={(e) => setMime(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, mime: true }))}
+                placeholder="application/pdf"
+                maxLength={MIME_MAX + 20}
+              />
+            )}
+          </FormField>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField
+            label="태그"
+            hint="쉼표로 구분"
+            error={showTagsErr}
+            count={tags.length}
+            max={TAGS_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                type="text"
+                value={tags}
+                onChange={(e) => setTags(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, tags: true }))}
+                placeholder="예: 2026, 규정, 운영"
+                maxLength={TAGS_MAX + 20}
+              />
+            )}
+          </FormField>
+          <FormField
+            label="크기 (bytes)"
+            hint="선택"
+            error={showSizeErr}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                type="number"
+                min={0}
+                step={1}
+                value={size}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === '') setSize('');
+                  else setSize(Math.max(0, Number(v)));
+                }}
+                onBlur={() => setTouched((t) => ({ ...t, size: true }))}
+                placeholder="예: 102400"
+              />
+            )}
+          </FormField>
+        </div>
+        <div className="text-[11px] text-fg-subtle">
+          * 이 버전은 파일 자체를 저장하지 않고 메타데이터만 기록합니다.
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

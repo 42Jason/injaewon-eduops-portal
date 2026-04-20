@@ -9,9 +9,21 @@ import {
   Scale,
   X,
 } from 'lucide-react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useSession } from '@/stores/session';
+import { useToast } from '@/stores/toast';
 import { getApi } from '@/hooks/useApi';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { useConfirm } from '@/components/ui/ConfirmDialog';
+import { LoadingPanel } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import {
+  FormField,
+  SelectInput,
+  TextInput,
+  Textarea,
+} from '@/components/ui/FormField';
+import { dateOrder, firstError, maxLength } from '@/lib/validators';
 import { cn } from '@/lib/cn';
 import { fmtDate, fmtDateTime, todayLocalYmd } from '@/lib/date';
 
@@ -64,11 +76,18 @@ function asLeaves(raw: Array<Record<string, unknown>>): LeaveRow[] {
   return raw as unknown as LeaveRow[];
 }
 
+const REASON_MAX = 300;
+const COMMENT_MAX = 200;
+
+const reasonRules = firstError<string>([maxLength(REASON_MAX)]);
+const dateOrderRule = dateOrder('시작일', '종료일');
+
 export function LeavePage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
+  const confirm = useConfirm();
+  const toast = useToast();
 
   const isApprover = !!user && APPROVER_ROLES.has(user.role);
 
@@ -76,7 +95,7 @@ export function LeavePage() {
   const [startDate, setStartDate] = useState<string>(todayLocalYmd());
   const [endDate, setEndDate] = useState<string>(todayLocalYmd());
   const [reason, setReason] = useState('');
-  const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+  const [submitTried, setSubmitTried] = useState(false);
   const [commentByRow, setCommentByRow] = useState<Record<number, string>>({});
 
   const balanceQuery = useQuery({
@@ -97,7 +116,15 @@ export function LeavePage() {
     enabled: live && isApprover,
   });
 
-  const createMut = useMutation({
+  const dateErr = dateOrderRule({ start: startDate, end: endDate });
+  const reasonErr = reasonRules(reason);
+  const formErr = submitTried ? dateErr || reasonErr : null;
+
+  const createMut = useMutationWithToast<
+    { ok: boolean; error?: string; days?: number },
+    Error,
+    void
+  >({
     mutationFn: () =>
       api!.leave.create({
         userId: user!.id,
@@ -106,62 +133,71 @@ export function LeavePage() {
         endDate,
         reason: reason.trim() || undefined,
       }),
+    successMessage: '휴가 신청이 접수되었습니다',
+    errorMessage: '휴가 신청에 실패했습니다',
+    invalidates: [
+      ['leave.mine', user?.id],
+      ['leave.pending'],
+    ],
     onSuccess: (res) => {
-      if (!res.ok) {
-        setToast({ kind: 'err', msg: res.error ?? '신청 실패' });
-        return;
+      if (res.ok) {
+        setReason('');
+        setSubmitTried(false);
       }
-      setToast({ kind: 'ok', msg: `신청 완료 (${res.days}일)` });
-      setReason('');
-      qc.invalidateQueries({ queryKey: ['leave.mine', user?.id] });
-      qc.invalidateQueries({ queryKey: ['leave.pending'] });
     },
   });
 
-  const decideMut = useMutation({
-    mutationFn: (payload: { id: number; decision: 'approved' | 'rejected' }) =>
+  const decideMut = useMutationWithToast<
+    { ok: boolean; error?: string; deducted?: number },
+    Error,
+    { id: number; decision: 'approved' | 'rejected' }
+  >({
+    mutationFn: (payload) =>
       api!.leave.decide({
         id: payload.id,
         approverId: user!.id,
         decision: payload.decision,
         comment: commentByRow[payload.id]?.trim() || undefined,
       }),
+    // Variable success copy per decision — emit manually in onSuccess below.
+    successMessage: false,
+    errorMessage: '결재 처리에 실패했습니다',
+    invalidates: [
+      ['leave.mine'],
+      ['leave.pending'],
+      ['leave.balance'],
+    ],
     onSuccess: (res, vars) => {
-      if (!res.ok) {
-        setToast({ kind: 'err', msg: res.error ?? '처리 실패' });
-        return;
-      }
-      setToast({
-        kind: 'ok',
-        msg:
-          vars.decision === 'approved'
-            ? res.deducted
-              ? `승인 완료 — 연차 ${res.deducted}일 차감`
-              : '승인 완료'
-            : '반려 완료',
-      });
+      if (!res?.ok) return;
       setCommentByRow((m) => {
         const n = { ...m };
         delete n[vars.id];
         return n;
       });
-      qc.invalidateQueries({ queryKey: ['leave.mine'] });
-      qc.invalidateQueries({ queryKey: ['leave.pending'] });
-      qc.invalidateQueries({ queryKey: ['leave.balance'] });
+      if (vars.decision === 'approved') {
+        toast.ok(
+          res.deducted
+            ? `승인 완료 — 연차 ${res.deducted}일 차감`
+            : '승인 완료',
+        );
+      } else {
+        toast.ok('반려 완료');
+      }
     },
   });
 
-  const cancelMut = useMutation({
-    mutationFn: (id: number) => api!.leave.cancel({ id, userId: user!.id }),
-    onSuccess: (res) => {
-      if (!res.ok) {
-        setToast({ kind: 'err', msg: '취소 실패' });
-        return;
-      }
-      setToast({ kind: 'ok', msg: '신청 취소됨' });
-      qc.invalidateQueries({ queryKey: ['leave.mine', user?.id] });
-      qc.invalidateQueries({ queryKey: ['leave.pending'] });
-    },
+  const cancelMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    number
+  >({
+    mutationFn: (id) => api!.leave.cancel({ id, userId: user!.id }),
+    successMessage: '신청이 취소되었습니다',
+    errorMessage: '취소에 실패했습니다',
+    invalidates: [
+      ['leave.mine', user?.id],
+      ['leave.pending'],
+    ],
   });
 
   const computedDays = useMemo(() => {
@@ -175,6 +211,37 @@ export function LeavePage() {
 
   const mine = mineQuery.data ?? [];
   const pending = (pendingQuery.data ?? []).filter((r) => r.user_id !== user?.id);
+
+  function submitCreate() {
+    setSubmitTried(true);
+    if (dateErr || reasonErr) return;
+    if (computedDays <= 0) return;
+    createMut.mutate();
+  }
+
+  async function handleCancel(row: LeaveRow) {
+    const ok = await confirm({
+      title: '이 휴가 신청을 취소할까요?',
+      description: `${KIND_LABEL[row.kind]} · ${fmtDate(row.start_date)}${
+        row.start_date !== row.end_date ? ` ~ ${fmtDate(row.end_date)}` : ''
+      }`,
+      confirmLabel: '취소',
+      cancelLabel: '보류',
+      tone: 'danger',
+    });
+    if (ok) cancelMut.mutate(row.id);
+  }
+
+  async function handleDecide(row: LeaveRow, decision: 'approved' | 'rejected') {
+    const ok = await confirm({
+      title: decision === 'approved' ? '승인할까요?' : '반려할까요?',
+      description: `${row.user_name ?? '#' + row.user_id} · ${KIND_LABEL[row.kind]} · ${row.days}일`,
+      confirmLabel: decision === 'approved' ? '승인' : '반려',
+      tone: decision === 'approved' ? 'default' : 'danger',
+    });
+    if (!ok) return;
+    decideMut.mutate({ id: row.id, decision });
+  }
 
   return (
     <div className="flex h-full min-h-[calc(100vh-7rem)] flex-col gap-3">
@@ -197,19 +264,6 @@ export function LeavePage() {
         </div>
       </div>
 
-      {toast && (
-        <div
-          className={cn(
-            'rounded-md px-3 py-2 text-xs',
-            toast.kind === 'ok'
-              ? 'bg-success/15 text-success border border-success/30'
-              : 'bg-danger/15 text-danger border border-danger/30',
-          )}
-        >
-          {toast.msg}
-        </div>
-      )}
-
       <div className="grid flex-1 grid-cols-12 gap-3 overflow-hidden">
         {/* LEFT — apply form + balance */}
         <div className="col-span-5 flex flex-col gap-3 overflow-y-auto">
@@ -222,15 +276,24 @@ export function LeavePage() {
             </div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-semibold text-accent">
-                {balanceQuery.data != null
-                  ? Number(balanceQuery.data).toFixed(1)
-                  : '-'}
+                {balanceQuery.isLoading
+                  ? '…'
+                  : balanceQuery.data != null
+                    ? Number(balanceQuery.data).toFixed(1)
+                    : '-'}
               </span>
               <span className="text-sm text-fg-subtle">일</span>
             </div>
           </div>
 
-          <div className="card flex flex-col gap-3">
+          <form
+            noValidate
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitCreate();
+            }}
+            className="card flex flex-col gap-3"
+          >
             <div className="flex items-center justify-between">
               <div className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
                 휴가 신청
@@ -238,67 +301,92 @@ export function LeavePage() {
               <span className="text-xs text-fg-subtle">예상 차감 {computedDays}일</span>
             </div>
 
-            <label className="flex flex-col gap-1 text-xs text-fg-subtle">
-              종류
-              <select
-                value={kind}
-                onChange={(e) => setKind(e.target.value as LeaveKind)}
-                className="input text-sm"
-                disabled={!live}
-              >
-                {(Object.keys(KIND_LABEL) as LeaveKind[]).map((k) => (
-                  <option key={k} value={k}>
-                    {KIND_LABEL[k]}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <FormField label="종류">
+              {(slot) => (
+                <SelectInput
+                  {...slot}
+                  value={kind}
+                  onChange={(e) => setKind(e.target.value as LeaveKind)}
+                  disabled={!live}
+                >
+                  {(Object.keys(KIND_LABEL) as LeaveKind[]).map((k) => (
+                    <option key={k} value={k}>
+                      {KIND_LABEL[k]}
+                    </option>
+                  ))}
+                </SelectInput>
+              )}
+            </FormField>
 
             <div className="grid grid-cols-2 gap-2">
-              <label className="flex flex-col gap-1 text-xs text-fg-subtle">
-                시작일
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
-                  className="input text-sm"
-                  disabled={!live}
-                />
-              </label>
-              <label className="flex flex-col gap-1 text-xs text-fg-subtle">
-                종료일
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(e) => setEndDate(e.target.value)}
-                  className="input text-sm"
-                  disabled={!live || kind === 'half_am' || kind === 'half_pm'}
-                />
-              </label>
+              <FormField
+                label="시작일"
+                required
+                error={submitTried ? (dateErr ? null : null) : null}
+              >
+                {(slot) => (
+                  <TextInput
+                    {...slot}
+                    type="date"
+                    value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    disabled={!live}
+                  />
+                )}
+              </FormField>
+              <FormField
+                label="종료일"
+                required
+                error={submitTried ? dateErr : null}
+              >
+                {(slot) => (
+                  <TextInput
+                    {...slot}
+                    type="date"
+                    value={endDate}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    disabled={!live || kind === 'half_am' || kind === 'half_pm'}
+                    min={startDate}
+                  />
+                )}
+              </FormField>
             </div>
 
-            <label className="flex flex-col gap-1 text-xs text-fg-subtle">
-              사유
-              <textarea
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                rows={3}
-                placeholder="선택 사항"
-                className="input resize-none text-sm"
-                disabled={!live}
-              />
-            </label>
+            <FormField
+              label="사유"
+              hint="선택 사항. 휴가 종류에 따라 생략 가능합니다."
+              count={reason.length}
+              max={REASON_MAX}
+              error={submitTried ? reasonErr : null}
+            >
+              {(slot) => (
+                <Textarea
+                  {...slot}
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  rows={3}
+                  placeholder="선택 사항"
+                  className="resize-none"
+                  disabled={!live}
+                  maxLength={REASON_MAX}
+                />
+              )}
+            </FormField>
 
             <button
-              type="button"
+              type="submit"
               className="btn-primary disabled:opacity-60"
-              disabled={!live || createMut.isPending || computedDays <= 0}
-              onClick={() => createMut.mutate()}
+              disabled={
+                !live ||
+                createMut.isPending ||
+                computedDays <= 0 ||
+                !!formErr
+              }
             >
               <Plus size={14} className="mr-1 inline" />
               {createMut.isPending ? '신청 중…' : '휴가 신청'}
             </button>
-          </div>
+          </form>
         </div>
 
         {/* RIGHT — my history + (if approver) approval queue */}
@@ -315,10 +403,27 @@ export function LeavePage() {
                 </div>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
-                {pending.length === 0 ? (
-                  <div className="py-6 text-center text-xs text-fg-subtle">
-                    결재 대기 중인 휴가가 없습니다.
-                  </div>
+                {pendingQuery.isLoading ? (
+                  <LoadingPanel label="결재 목록 불러오는 중…" />
+                ) : pendingQuery.isError ? (
+                  <EmptyState
+                    tone="error"
+                    title="결재 목록을 불러오지 못했습니다"
+                    action={
+                      <button
+                        type="button"
+                        onClick={() => pendingQuery.refetch()}
+                        className="btn-outline text-xs"
+                      >
+                        다시 시도
+                      </button>
+                    }
+                  />
+                ) : pending.length === 0 ? (
+                  <EmptyState
+                    title="결재 대기 중인 휴가가 없습니다"
+                    hint="새 신청이 들어오면 이곳에 표시됩니다."
+                  />
                 ) : (
                   <ul className="flex flex-col gap-2">
                     {pending.map((r) => (
@@ -347,20 +452,25 @@ export function LeavePage() {
                           </div>
                         )}
                         <div className="mt-2 flex items-center gap-2">
-                          <input
-                            type="text"
-                            placeholder="코멘트 (선택)"
-                            className="input flex-1 text-xs"
-                            value={commentByRow[r.id] ?? ''}
-                            onChange={(e) =>
-                              setCommentByRow((m) => ({ ...m, [r.id]: e.target.value }))
-                            }
-                          />
+                          <label className="flex-1">
+                            <span className="sr-only">결재 코멘트</span>
+                            <TextInput
+                              type="text"
+                              placeholder="코멘트 (선택)"
+                              className="text-xs"
+                              value={commentByRow[r.id] ?? ''}
+                              onChange={(e) =>
+                                setCommentByRow((m) => ({ ...m, [r.id]: e.target.value }))
+                              }
+                              maxLength={COMMENT_MAX}
+                            />
+                          </label>
                           <button
                             type="button"
                             className="btn-primary text-xs"
-                            onClick={() => decideMut.mutate({ id: r.id, decision: 'approved' })}
+                            onClick={() => handleDecide(r, 'approved')}
                             disabled={decideMut.isPending}
+                            aria-label={`${r.user_name ?? '신청'} 승인`}
                           >
                             <Check size={12} className="mr-1 inline" />
                             승인
@@ -368,8 +478,9 @@ export function LeavePage() {
                           <button
                             type="button"
                             className="btn-outline text-xs text-danger border-danger/40 hover:bg-danger/10"
-                            onClick={() => decideMut.mutate({ id: r.id, decision: 'rejected' })}
+                            onClick={() => handleDecide(r, 'rejected')}
                             disabled={decideMut.isPending}
+                            aria-label={`${r.user_name ?? '신청'} 반려`}
                           >
                             <X size={12} className="mr-1 inline" />
                             반려
@@ -392,8 +503,27 @@ export function LeavePage() {
               <span className="text-xs text-fg-subtle">{mine.length} 건</span>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {mine.length === 0 ? (
-                <div className="py-6 text-center text-xs text-fg-subtle">내역 없음</div>
+              {mineQuery.isLoading ? (
+                <LoadingPanel label="내 내역 불러오는 중…" />
+              ) : mineQuery.isError ? (
+                <EmptyState
+                  tone="error"
+                  title="내 휴가 내역을 불러오지 못했습니다"
+                  action={
+                    <button
+                      type="button"
+                      onClick={() => mineQuery.refetch()}
+                      className="btn-outline text-xs"
+                    >
+                      다시 시도
+                    </button>
+                  }
+                />
+              ) : mine.length === 0 ? (
+                <EmptyState
+                  title="휴가 내역이 없습니다"
+                  hint="왼쪽 양식으로 첫 휴가를 신청해 보세요."
+                />
               ) : (
                 <ul className="flex flex-col gap-2">
                   {mine.map((r) => (
@@ -420,8 +550,9 @@ export function LeavePage() {
                           <button
                             type="button"
                             className="text-xs text-fg-subtle hover:text-danger"
-                            onClick={() => cancelMut.mutate(r.id)}
+                            onClick={() => handleCancel(r)}
                             disabled={cancelMut.isPending}
+                            aria-label="신청 취소"
                           >
                             <Ban size={12} className="mr-1 inline" />
                             취소
@@ -453,3 +584,4 @@ export function LeavePage() {
     </div>
   );
 }
+

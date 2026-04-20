@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   FileCheck2,
   Check,
@@ -10,7 +10,20 @@ import {
   User as UserIcon,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
+import { useToast } from '@/stores/toast';
 import { getApi } from '@/hooks/useApi';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { useConfirm } from '@/components/ui/ConfirmDialog';
+import { Modal } from '@/components/ui/Modal';
+import { LoadingPanel } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import {
+  FormField,
+  SelectInput,
+  Textarea,
+  TextInput,
+} from '@/components/ui/FormField';
+import { firstError, maxLength, required } from '@/lib/validators';
 import { cn } from '@/lib/cn';
 import { fmtDateTime, relative } from '@/lib/date';
 
@@ -76,11 +89,14 @@ function stepChip(s: StepState): string {
 
 type Tab = 'inbox' | 'sent';
 
+const COMMENT_MAX = 500;
+
 export function ApprovalsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
+  const toast = useToast();
+  const confirm = useConfirm();
 
   const [tab, setTab] = useState<Tab>('inbox');
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -104,7 +120,8 @@ export function ApprovalsPage() {
     enabled: live && tab === 'sent',
   });
 
-  const rows = tab === 'inbox' ? inboxQuery.data : sentQuery.data;
+  const activeQuery = tab === 'inbox' ? inboxQuery : sentQuery;
+  const rows = activeQuery.data;
 
   const detailQuery = useQuery({
     queryKey: ['approvals.detail', selectedId],
@@ -112,30 +129,55 @@ export function ApprovalsPage() {
     enabled: live && !!selectedId,
   });
 
-  const decideMut = useMutation({
-    mutationFn: (payload: { decision: 'approved' | 'rejected'; comment?: string }) =>
+  const decideMut = useMutationWithToast<
+    { ok: boolean; error?: string; finalStatus?: 'approved' | 'rejected' | 'pending' },
+    Error,
+    { decision: 'approved' | 'rejected'; comment?: string }
+  >({
+    mutationFn: (payload) =>
       api!.approvals.decide({
         approvalId: selectedId!,
         approverId: user!.id,
         decision: payload.decision,
         comment: payload.comment,
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['approvals.inbox'] });
-      qc.invalidateQueries({ queryKey: ['approvals.sent'] });
-      qc.invalidateQueries({ queryKey: ['approvals.detail'] });
+    successMessage: false,
+    errorMessage: '결재 처리에 실패했습니다',
+    invalidates: [
+      ['approvals.inbox'],
+      ['approvals.sent'],
+      ['approvals.detail'],
+      ['home.stats'],
+    ],
+    onSuccess: (res, vars) => {
+      if (!res?.ok) return;
+      const action = vars.decision === 'approved' ? '승인' : '반려';
+      const finalMsg =
+        res.finalStatus === 'approved'
+          ? ' — 최종 승인 완료'
+          : res.finalStatus === 'rejected'
+            ? ' — 최종 반려'
+            : ' — 다음 결재자에게 전달됨';
+      toast.ok(`${action} 처리되었습니다${finalMsg}`);
     },
   });
 
-  const withdrawMut = useMutation({
+  const withdrawMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    void
+  >({
     mutationFn: () => api!.approvals.withdraw({ approvalId: selectedId!, drafterId: user!.id }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['approvals.sent'] });
-      qc.invalidateQueries({ queryKey: ['approvals.detail'] });
-    },
+    successMessage: '기안이 철회되었습니다',
+    errorMessage: '철회에 실패했습니다',
+    invalidates: [
+      ['approvals.sent'],
+      ['approvals.detail'],
+    ],
   });
 
   const [comment, setComment] = useState('');
+  const [commentTouched, setCommentTouched] = useState(false);
 
   const myStep = useMemo(() => {
     if (!detailQuery.data || !user) return null;
@@ -151,6 +193,46 @@ export function ApprovalsPage() {
       .sort((a, b) => a.step_order - b.step_order)[0];
     return firstPending?.step_order === myStep.step_order;
   }, [myStep, detailQuery.data]);
+
+  async function onApprove() {
+    const ok = await confirm({
+      title: '이 건을 승인할까요?',
+      description: detailQuery.data?.title,
+      confirmLabel: '승인',
+    });
+    if (!ok) return;
+    decideMut.mutate({ decision: 'approved', comment: comment.trim() || undefined });
+    setComment('');
+    setCommentTouched(false);
+  }
+
+  async function onReject() {
+    setCommentTouched(true);
+    if (comment.trim().length < 5) {
+      toast.err('반려 사유를 5자 이상 입력하세요');
+      return;
+    }
+    const ok = await confirm({
+      title: '이 건을 반려할까요?',
+      description: comment.trim(),
+      confirmLabel: '반려',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    decideMut.mutate({ decision: 'rejected', comment: comment.trim() });
+    setComment('');
+    setCommentTouched(false);
+  }
+
+  async function onWithdraw() {
+    const ok = await confirm({
+      title: '이 기안을 철회할까요?',
+      description: '철회 후에는 복구할 수 없습니다.',
+      confirmLabel: '철회',
+      tone: 'danger',
+    });
+    if (ok) withdrawMut.mutate();
+  }
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -168,16 +250,18 @@ export function ApprovalsPage() {
         </button>
       </header>
 
-      <nav className="flex gap-1 border-b border-border">
+      <nav className="flex gap-1 border-b border-border" role="tablist">
         {(['inbox', 'sent'] as Tab[]).map((t) => (
           <button
             key={t}
+            role="tab"
+            aria-selected={tab === t}
             onClick={() => {
               setTab(t);
               setSelectedId(null);
             }}
             className={cn(
-              'px-4 py-2 text-sm border-b-2 -mb-px',
+              'px-4 py-2 text-sm border-b-2 -mb-px focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
               tab === t ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg',
             )}
           >
@@ -192,48 +276,88 @@ export function ApprovalsPage() {
       <div className="grid grid-cols-12 gap-4 flex-1 min-h-0">
         <section className="col-span-5 card flex flex-col min-h-0">
           <div className="overflow-y-auto -mx-3 px-3 flex-1">
-            {rows?.map((r) => (
-              <button
-                key={r.id}
-                onClick={() => setSelectedId(r.id)}
-                className={cn(
-                  'w-full text-left border-b border-border py-3 hover:bg-bg-soft/50 transition',
-                  selectedId === r.id && 'bg-bg-soft',
-                )}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-xs text-fg-muted">{r.code}</span>
-                  <span className={cn('rounded-full px-2 py-0.5 text-xs', statusChip(r.status))}>
-                    {statusLabel(r.status)}
-                  </span>
-                  <span className="text-xs text-fg-subtle">{r.kind}</span>
-                </div>
-                <p className="mt-1 text-sm text-fg">{r.title}</p>
-                <div className="mt-1 text-xs text-fg-muted flex items-center gap-3">
-                  <span className="inline-flex items-center gap-1">
-                    <UserIcon size={12} /> {r.drafter_name ?? '-'}
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <Clock size={12} /> {relative(r.drafted_at)}
-                  </span>
-                  {tab === 'inbox' && r.my_step && (
-                    <span className="ml-auto rounded bg-accent/15 px-2 py-0.5 text-accent">
-                      {r.my_step}단계
-                    </span>
+            {activeQuery.isLoading ? (
+              <LoadingPanel label="목록 불러오는 중…" />
+            ) : activeQuery.isError ? (
+              <EmptyState
+                tone="error"
+                title="결재 목록을 불러오지 못했습니다"
+                action={
+                  <button
+                    type="button"
+                    onClick={() => activeQuery.refetch()}
+                    className="btn-outline text-xs"
+                  >
+                    다시 시도
+                  </button>
+                }
+              />
+            ) : rows && rows.length ? (
+              rows.map((r) => (
+                <button
+                  key={r.id}
+                  onClick={() => setSelectedId(r.id)}
+                  className={cn(
+                    'w-full text-left border-b border-border py-3 hover:bg-bg-soft/50 transition',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded-sm',
+                    selectedId === r.id && 'bg-bg-soft',
                   )}
-                </div>
-              </button>
-            )) ?? null}
-            {rows && !rows.length && (
-              <div className="py-10 text-center text-sm text-fg-subtle">
-                {tab === 'inbox' ? '결재 대기 중인 문서가 없습니다' : '기안한 문서가 없습니다'}
-              </div>
+                  aria-pressed={selectedId === r.id}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs text-fg-muted">{r.code}</span>
+                    <span className={cn('rounded-full px-2 py-0.5 text-xs', statusChip(r.status))}>
+                      {statusLabel(r.status)}
+                    </span>
+                    <span className="text-xs text-fg-subtle">{r.kind}</span>
+                  </div>
+                  <p className="mt-1 text-sm text-fg">{r.title}</p>
+                  <div className="mt-1 text-xs text-fg-muted flex items-center gap-3">
+                    <span className="inline-flex items-center gap-1">
+                      <UserIcon size={12} /> {r.drafter_name ?? '-'}
+                    </span>
+                    <span className="inline-flex items-center gap-1">
+                      <Clock size={12} /> {relative(r.drafted_at)}
+                    </span>
+                    {tab === 'inbox' && r.my_step && (
+                      <span className="ml-auto rounded bg-accent/15 px-2 py-0.5 text-accent">
+                        {r.my_step}단계
+                      </span>
+                    )}
+                  </div>
+                </button>
+              ))
+            ) : (
+              <EmptyState
+                title={tab === 'inbox' ? '결재 대기 문서가 없습니다' : '기안한 문서가 없습니다'}
+                hint={
+                  tab === 'inbox'
+                    ? '결재가 지정되면 이곳에 표시됩니다.'
+                    : '우측 상단의 "새 기안" 버튼으로 기안을 작성해 보세요.'
+                }
+              />
             )}
           </div>
         </section>
 
         <aside className="col-span-7 card flex flex-col min-h-0 overflow-y-auto">
-          {detailQuery.data ? (
+          {detailQuery.isLoading && selectedId ? (
+            <LoadingPanel label="문서 불러오는 중…" />
+          ) : detailQuery.isError ? (
+            <EmptyState
+              tone="error"
+              title="문서를 불러오지 못했습니다"
+              action={
+                <button
+                  type="button"
+                  onClick={() => detailQuery.refetch()}
+                  className="btn-outline text-xs"
+                >
+                  다시 시도
+                </button>
+              }
+            />
+          ) : detailQuery.data ? (
             <div className="flex flex-col gap-4">
               <div>
                 <div className="flex items-center gap-2">
@@ -298,20 +422,31 @@ export function ApprovalsPage() {
               {myStep && isEarliestPending && detailQuery.data.status === 'pending' && (
                 <div className="rounded border border-accent/30 bg-accent/5 p-3">
                   <div className="text-xs text-accent mb-2">내 결재 차례</div>
-                  <textarea
-                    className="input mb-2"
-                    rows={2}
-                    placeholder="코멘트 (선택)"
-                    value={comment}
-                    onChange={(e) => setComment(e.target.value)}
-                  />
-                  <div className="flex gap-2 justify-end">
+                  <FormField
+                    hint="반려 시 최소 5자 이상의 사유가 필요합니다."
+                    count={comment.length}
+                    max={COMMENT_MAX}
+                    error={
+                      commentTouched && comment.trim().length > 0 && comment.trim().length < 5
+                        ? '반려 사유는 최소 5자 이상 입력하세요'
+                        : null
+                    }
+                  >
+                    {(slot) => (
+                      <Textarea
+                        {...slot}
+                        rows={2}
+                        placeholder="코멘트 (승인 시 선택 · 반려 시 필수)"
+                        value={comment}
+                        onChange={(e) => setComment(e.target.value)}
+                        maxLength={COMMENT_MAX}
+                      />
+                    )}
+                  </FormField>
+                  <div className="flex gap-2 justify-end mt-2">
                     <button
                       className="btn-ghost"
-                      onClick={() => {
-                        decideMut.mutate({ decision: 'rejected', comment: comment || undefined });
-                        setComment('');
-                      }}
+                      onClick={onReject}
                       disabled={decideMut.isPending}
                     >
                       <X size={14} className="mr-1" />
@@ -319,10 +454,7 @@ export function ApprovalsPage() {
                     </button>
                     <button
                       className="btn-primary"
-                      onClick={() => {
-                        decideMut.mutate({ decision: 'approved', comment: comment || undefined });
-                        setComment('');
-                      }}
+                      onClick={onApprove}
                       disabled={decideMut.isPending}
                     >
                       <Check size={14} className="mr-1" />
@@ -338,7 +470,7 @@ export function ApprovalsPage() {
                   <div className="flex justify-end">
                     <button
                       className="btn-ghost"
-                      onClick={() => withdrawMut.mutate()}
+                      onClick={onWithdraw}
                       disabled={withdrawMut.isPending}
                     >
                       결재 철회
@@ -355,32 +487,46 @@ export function ApprovalsPage() {
         </aside>
       </div>
 
-      {showNew && (
-        <NewApprovalModal
-          onClose={() => setShowNew(false)}
-          onCreated={() => {
-            qc.invalidateQueries({ queryKey: ['approvals.sent'] });
-            qc.invalidateQueries({ queryKey: ['approvals.inbox'] });
-          }}
-        />
-      )}
+      <NewApprovalModal
+        open={showNew}
+        onClose={() => setShowNew(false)}
+        onCreated={() => {
+          // Cache invalidation happens inside the mutation — just close.
+        }}
+      />
     </div>
   );
 }
 
-function NewApprovalModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+const TITLE_MAX = 120;
+const PAYLOAD_MAX = 2000;
+const titleRules = firstError<string>([
+  required('제목을 입력해 주세요'),
+  maxLength(TITLE_MAX),
+]);
+const payloadRules = firstError<string>([maxLength(PAYLOAD_MAX)]);
+
+function NewApprovalModal({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
   const { user } = useSession();
   const api = getApi();
   const [title, setTitle] = useState('');
   const [kind, setKind] = useState('지출');
   const [payload, setPayload] = useState('');
   const [approverIds, setApproverIds] = useState<number[]>([]);
-  const [err, setErr] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ title?: boolean; approvers?: boolean }>({});
 
   const usersQuery = useQuery({
     queryKey: ['users.list.for-approvers'],
     queryFn: async () => ((await api!.users.list()) as unknown) as UserRow[],
-    enabled: !!api,
+    enabled: !!api && open,
   });
 
   const eligible = useMemo(
@@ -394,7 +540,18 @@ function NewApprovalModal({ onClose, onCreated }: { onClose: () => void; onCreat
     [usersQuery.data, user],
   );
 
-  const createMut = useMutation({
+  const titleErr = titleRules(title);
+  const payloadErr = payloadRules(payload);
+  const approverErr =
+    approverIds.length === 0 ? '결재자를 1명 이상 선택하세요' : null;
+  const showTitleErr = touched.title ? titleErr : null;
+  const showApproverErr = touched.approvers ? approverErr : null;
+
+  const createMut = useMutationWithToast<
+    { ok: boolean; error?: string; code?: string },
+    Error,
+    void
+  >({
     mutationFn: () =>
       api!.approvals.create({
         drafterId: user!.id,
@@ -403,11 +560,19 @@ function NewApprovalModal({ onClose, onCreated }: { onClose: () => void; onCreat
         approverIds,
         payload: payload ? { memo: payload } : undefined,
       }),
+    successMessage: '기안이 제출되었습니다',
+    errorMessage: '기안 제출에 실패했습니다',
+    invalidates: [
+      ['approvals.sent'],
+      ['approvals.inbox'],
+    ],
     onSuccess: (res) => {
-      if (!res.ok) {
-        setErr(res.error ?? '생성 실패');
-        return;
-      }
+      if (!res?.ok) return;
+      setTitle('');
+      setKind('지출');
+      setPayload('');
+      setApproverIds([]);
+      setTouched({});
       onCreated();
       onClose();
     },
@@ -417,63 +582,136 @@ function NewApprovalModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setApproverIds((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div
-        className="card w-[640px] max-w-[90vw] flex flex-col gap-3 max-h-[85vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="text-base font-semibold text-fg">새 전자결재 기안</h3>
+  function handleSubmit() {
+    setTouched({ title: true, approvers: true });
+    if (titleErr || payloadErr || approverErr) return;
+    createMut.mutate();
+  }
 
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        if (!createMut.isPending) onClose();
+      }}
+      title="새 전자결재 기안"
+      size="lg"
+      closeOnEsc={!createMut.isPending}
+      closeOnBackdrop={!createMut.isPending}
+      footer={
+        <>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={onClose}
+            disabled={createMut.isPending}
+          >
+            취소
+          </button>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={handleSubmit}
+            disabled={
+              createMut.isPending || !!titleErr || !!payloadErr || !!approverErr
+            }
+          >
+            {createMut.isPending ? '제출 중…' : '기안 제출'}
+          </button>
+        </>
+      }
+    >
+      <form
+        noValidate
+        onSubmit={(e) => {
+          e.preventDefault();
+          handleSubmit();
+        }}
+        className="space-y-3"
+      >
         <div className="grid grid-cols-2 gap-2">
-          <label className="text-xs text-fg-subtle">
-            결재 종류
-            <select className="input mt-1" value={kind} onChange={(e) => setKind(e.target.value)}>
-              {['지출', '휴가', '연장근무', '출장', '품의', '기타'].map((k) => (
-                <option key={k} value={k}>{k}</option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs text-fg-subtle col-span-1">
-            제목
-            <input
-              className="input mt-1"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="예: 파싱팀 장비 구매 요청"
-            />
-          </label>
+          <FormField label="결재 종류" required>
+            {(slot) => (
+              <SelectInput {...slot} value={kind} onChange={(e) => setKind(e.target.value)}>
+                {['지출', '휴가', '연장근무', '출장', '품의', '기타'].map((k) => (
+                  <option key={k} value={k}>{k}</option>
+                ))}
+              </SelectInput>
+            )}
+          </FormField>
+          <FormField
+            label="제목"
+            required
+            error={showTitleErr}
+            count={title.length}
+            max={TITLE_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, title: true }))}
+                placeholder="예: 파싱팀 장비 구매 요청"
+                maxLength={TITLE_MAX}
+                autoFocus
+              />
+            )}
+          </FormField>
         </div>
 
-        <label className="text-xs text-fg-subtle">
-          메모 / 사유
-          <textarea
-            className="input mt-1"
-            rows={3}
-            value={payload}
-            onChange={(e) => setPayload(e.target.value)}
-          />
-        </label>
+        <FormField
+          label="메모 / 사유"
+          hint="선택 사항. 결재자가 검토 시 참고합니다."
+          count={payload.length}
+          max={PAYLOAD_MAX}
+          error={payloadErr}
+        >
+          {(slot) => (
+            <Textarea
+              {...slot}
+              rows={3}
+              value={payload}
+              onChange={(e) => setPayload(e.target.value)}
+              maxLength={PAYLOAD_MAX}
+            />
+          )}
+        </FormField>
 
         <div>
-          <div className="text-xs text-fg-subtle mb-1">
+          <div className="text-[11px] font-medium text-fg-muted mb-1">
             결재선 (순서대로 선택)
-            <span className="ml-2 text-fg-muted">
+            <span className="ml-2 text-fg-subtle font-normal">
               {approverIds.length}명 선택됨
             </span>
+            <span className="ml-1 text-danger">*</span>
           </div>
           <div className="flex flex-col gap-1 rounded border border-border bg-bg-soft/50 p-2 max-h-40 overflow-y-auto">
+            {usersQuery.isLoading && (
+              <div className="p-3 text-center text-xs text-fg-subtle">불러오는 중…</div>
+            )}
+            {!usersQuery.isLoading && eligible.length === 0 && (
+              <div className="p-3 text-center text-xs text-fg-subtle">
+                선택 가능한 결재자가 없습니다.
+              </div>
+            )}
             {eligible.map((u) => {
               const idx = approverIds.indexOf(u.id);
               const selected = idx >= 0;
               return (
                 <button
                   key={u.id}
-                  onClick={() => toggle(u.id)}
+                  type="button"
+                  onClick={() => {
+                    toggle(u.id);
+                    setTouched((t) => ({ ...t, approvers: true }));
+                  }}
                   className={cn(
                     'flex items-center justify-between rounded px-2 py-1.5 text-sm',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                     selected ? 'bg-accent/15 text-accent' : 'text-fg hover:bg-bg-soft',
                   )}
+                  aria-pressed={selected}
                 >
                   <span>
                     {u.name}
@@ -484,26 +722,13 @@ function NewApprovalModal({ onClose, onCreated }: { onClose: () => void; onCreat
               );
             })}
           </div>
+          <div className="mt-1 min-h-[14px] text-[11px] text-danger" role={showApproverErr ? 'alert' : undefined}>
+            {showApproverErr ?? '\u00A0'}
+          </div>
         </div>
 
-        {err && <p className="text-xs text-danger">{err}</p>}
-
-        <div className="flex justify-end gap-2">
-          <button className="btn-ghost" onClick={onClose}>취소</button>
-          <button
-            className="btn-primary"
-            onClick={() => {
-              if (!title.trim()) return setErr('제목을 입력하세요');
-              if (!approverIds.length) return setErr('결재자를 1명 이상 선택하세요');
-              setErr(null);
-              createMut.mutate();
-            }}
-            disabled={createMut.isPending}
-          >
-            기안 제출
-          </button>
-        </div>
-      </div>
-    </div>
+        <button type="submit" className="hidden" aria-hidden="true" tabIndex={-1} />
+      </form>
+    </Modal>
   );
 }

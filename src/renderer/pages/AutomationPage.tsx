@@ -1,13 +1,28 @@
 import { useMemo, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
-  Bot, ShieldAlert, Settings2, Save, Search, RefreshCcw, FileCode,
-  CheckCircle2, XCircle, User as UserIcon, ListFilter,
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  FileCode,
+  Inbox,
+  ListFilter,
+  RefreshCcw,
+  Save,
+  Search,
+  Settings2,
+  ShieldAlert,
+  User as UserIcon,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
 import { fmtDateTime, relative } from '@/lib/date';
 import { cn } from '@/lib/cn';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { LoadingPanel, Spinner } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { FormField, TextInput, Textarea } from '@/components/ui/FormField';
+import { firstError, maxLength, required } from '@/lib/validators';
 
 interface LogRow {
   id: number;
@@ -25,11 +40,23 @@ interface SettingRow {
   updated_at: string;
 }
 
+const KEY_MAX = 80;
+const KEY_RE = /^[a-z][a-z0-9_.\-]{1,78}[a-z0-9]$/;
+
+function validateJson(v: string): string | null {
+  if (!v.trim()) return 'JSON 값을 입력해 주세요';
+  try {
+    JSON.parse(v);
+    return null;
+  } catch {
+    return '유효한 JSON이 아닙니다';
+  }
+}
+
 export function AutomationPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
 
   const isCTO = user?.role === 'CTO' || user?.role === 'CEO';
 
@@ -43,7 +70,7 @@ export function AutomationPage() {
       api!.logs.list({
         action: actionFilter || undefined,
         limit,
-      }) as Promise<LogRow[]>,
+      }) as unknown as Promise<LogRow[]>,
     enabled: live && isCTO,
     refetchInterval: 30_000,
   });
@@ -100,7 +127,7 @@ export function AutomationPage() {
             활동 로그(감사 트레일) · 시스템 설정(key/value).
           </p>
         </div>
-        <div className="flex items-center gap-1 bg-bg-soft rounded-lg p-1">
+        <div className="flex items-center gap-1 bg-bg-soft rounded-lg p-1" role="tablist">
           <TabBtn active={tab === 'logs'} onClick={() => setTab('logs')} icon={<FileCode size={13} />}>
             활동 로그
           </TabBtn>
@@ -118,13 +145,20 @@ export function AutomationPage() {
           setActionFilter={setActionFilter}
           limit={limit}
           setLimit={setLimit}
-          onRefresh={() => qc.invalidateQueries({ queryKey: ['logs.list'] })}
+          onRefresh={() => logsQuery.refetch()}
           loading={logsQuery.isLoading}
+          isError={logsQuery.isError}
+          isFetching={logsQuery.isFetching}
         />
       )}
 
       {tab === 'settings' && (
-        <SettingsTab settings={(settingsQuery.data ?? []) as SettingRow[]} />
+        <SettingsTab
+          settings={(settingsQuery.data ?? []) as SettingRow[]}
+          isLoading={settingsQuery.isLoading}
+          isError={settingsQuery.isError}
+          onRetry={() => settingsQuery.refetch()}
+        />
       )}
     </div>
   );
@@ -145,8 +179,10 @@ function TabBtn({
     <button
       type="button"
       onClick={onClick}
+      role="tab"
+      aria-selected={active}
       className={cn(
-        'px-3 py-1.5 rounded-md text-sm flex items-center gap-1.5 transition',
+        'px-3 py-1.5 rounded-md text-sm flex items-center gap-1.5 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
         active ? 'bg-bg text-fg shadow-sm' : 'text-fg-muted hover:text-fg',
       )}
     >
@@ -165,6 +201,8 @@ function LogsTab({
   setLimit,
   onRefresh,
   loading,
+  isError,
+  isFetching,
 }: {
   logs: LogRow[];
   stats: Array<[string, number]>;
@@ -174,6 +212,8 @@ function LogsTab({
   setLimit: (n: number) => void;
   onRefresh: () => void;
   loading: boolean;
+  isError: boolean;
+  isFetching: boolean;
 }) {
   return (
     <div className="grid grid-cols-12 gap-4">
@@ -184,12 +224,14 @@ function LogsTab({
           </span>
           <span className="text-xs text-fg-subtle">{stats.length}종</span>
         </div>
-        <div className="max-h-[70vh] overflow-y-auto divide-y divide-border">
+        <div className="max-h-[70vh] overflow-y-auto divide-y divide-border" role="radiogroup" aria-label="액션 필터">
           <button
             type="button"
             onClick={() => setActionFilter('')}
+            role="radio"
+            aria-checked={!actionFilter}
             className={cn(
-              'w-full text-left px-3 py-2 text-xs flex items-center justify-between',
+              'w-full text-left px-3 py-2 text-xs flex items-center justify-between focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
               !actionFilter ? 'bg-accent/10 text-accent' : 'hover:bg-bg-soft/40',
             )}
           >
@@ -201,8 +243,10 @@ function LogsTab({
               key={action}
               type="button"
               onClick={() => setActionFilter(action)}
+              role="radio"
+              aria-checked={actionFilter === action}
               className={cn(
-                'w-full text-left px-3 py-2 text-xs flex items-center justify-between font-mono',
+                'w-full text-left px-3 py-2 text-xs flex items-center justify-between font-mono focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                 actionFilter === action ? 'bg-accent/10 text-accent' : 'hover:bg-bg-soft/40',
               )}
             >
@@ -215,17 +259,19 @@ function LogsTab({
 
       <div className="col-span-12 lg:col-span-9 card p-0 overflow-hidden">
         <div className="px-3 py-2 border-b border-border bg-bg-soft/40 flex items-center gap-2 flex-wrap">
-          <Search size={13} className="text-fg-subtle" />
+          <Search size={13} className="text-fg-subtle" aria-hidden="true" />
           <input
-            type="text"
+            type="search"
             value={actionFilter}
             onChange={(e) => setActionFilter(e.target.value)}
             placeholder="action 패턴 (예: cs.update)"
+            aria-label="action 필터"
             className="input text-xs py-1 w-48 font-mono"
           />
           <select
             value={limit}
             onChange={(e) => setLimit(Number(e.target.value))}
+            aria-label="조회 개수"
             className="input text-xs py-1 w-24"
           >
             <option value={50}>50건</option>
@@ -236,61 +282,97 @@ function LogsTab({
           <button
             type="button"
             onClick={onRefresh}
-            className="btn-outline text-xs flex items-center gap-1 ml-auto"
+            disabled={isFetching}
+            className="btn-outline text-xs flex items-center gap-1 ml-auto disabled:opacity-60"
           >
-            <RefreshCcw size={12} /> 새로고침
+            {isFetching ? <Spinner size={12} /> : <RefreshCcw size={12} />} 새로고침
           </button>
         </div>
 
         <div className="max-h-[70vh] overflow-y-auto">
-          {loading && (
-            <div className="p-6 text-center text-sm text-fg-subtle">로딩 중…</div>
-          )}
-          {!loading && logs.length === 0 && (
-            <div className="p-6 text-center text-sm text-fg-subtle">로그 없음</div>
-          )}
-          <table className="w-full text-xs">
-            <thead className="bg-bg-soft/30 sticky top-0">
-              <tr className="text-fg-subtle">
-                <th className="text-left px-3 py-1.5 font-normal">시각</th>
-                <th className="text-left px-3 py-1.5 font-normal">실행자</th>
-                <th className="text-left px-3 py-1.5 font-normal">액션</th>
-                <th className="text-left px-3 py-1.5 font-normal">대상</th>
-                <th className="text-left px-3 py-1.5 font-normal">메타</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {logs.map((r) => (
-                <tr key={r.id} className="hover:bg-bg-soft/30">
-                  <td className="px-3 py-1.5 text-fg-subtle whitespace-nowrap">
-                    <div>{relative(r.created_at)}</div>
-                    <div className="text-[10px]">{fmtDateTime(r.created_at)}</div>
-                  </td>
-                  <td className="px-3 py-1.5 whitespace-nowrap">
-                    <span className="flex items-center gap-1 text-fg-muted">
-                      <UserIcon size={11} /> {r.actor_name ?? `#${r.actor_id ?? '-'}`}
-                    </span>
-                  </td>
-                  <td className="px-3 py-1.5">
-                    <span className="font-mono text-[11px] text-accent">{r.action}</span>
-                  </td>
-                  <td className="px-3 py-1.5 font-mono text-[11px] text-fg-subtle">
-                    {r.target ?? '-'}
-                  </td>
-                  <td className="px-3 py-1.5 font-mono text-[10px] text-fg-subtle max-w-xs truncate">
-                    {r.meta_json ?? ''}
-                  </td>
+          {loading ? (
+            <LoadingPanel label="로그를 불러오는 중…" className="py-10" />
+          ) : isError ? (
+            <EmptyState
+              tone="error"
+              icon={AlertTriangle}
+              title="로그를 불러오지 못했습니다"
+              hint="네트워크 상태를 확인하거나 잠시 후 다시 시도해 주세요."
+              action={
+                <button className="btn-outline" onClick={onRefresh}>
+                  다시 시도
+                </button>
+              }
+              className="border-0"
+            />
+          ) : logs.length === 0 ? (
+            <EmptyState
+              icon={Inbox}
+              title={actionFilter ? `"${actionFilter}" 패턴에 해당하는 로그가 없습니다` : '기록된 로그가 없습니다'}
+              hint={actionFilter ? '패턴을 지우거나 다른 액션을 시도해 보세요.' : '작업이 발생하면 여기에 기록됩니다.'}
+              action={
+                actionFilter && (
+                  <button className="btn-outline" onClick={() => setActionFilter('')}>
+                    필터 초기화
+                  </button>
+                )
+              }
+              className="border-0"
+            />
+          ) : (
+            <table className="w-full text-xs">
+              <thead className="bg-bg-soft/30 sticky top-0">
+                <tr className="text-fg-subtle">
+                  <th className="text-left px-3 py-1.5 font-normal">시각</th>
+                  <th className="text-left px-3 py-1.5 font-normal">실행자</th>
+                  <th className="text-left px-3 py-1.5 font-normal">액션</th>
+                  <th className="text-left px-3 py-1.5 font-normal">대상</th>
+                  <th className="text-left px-3 py-1.5 font-normal">메타</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {logs.map((r) => (
+                  <tr key={r.id} className="hover:bg-bg-soft/30">
+                    <td className="px-3 py-1.5 text-fg-subtle whitespace-nowrap">
+                      <div>{relative(r.created_at)}</div>
+                      <div className="text-[10px]">{fmtDateTime(r.created_at)}</div>
+                    </td>
+                    <td className="px-3 py-1.5 whitespace-nowrap">
+                      <span className="flex items-center gap-1 text-fg-muted">
+                        <UserIcon size={11} /> {r.actor_name ?? `#${r.actor_id ?? '-'}`}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <span className="font-mono text-[11px] text-accent">{r.action}</span>
+                    </td>
+                    <td className="px-3 py-1.5 font-mono text-[11px] text-fg-subtle">
+                      {r.target ?? '-'}
+                    </td>
+                    <td className="px-3 py-1.5 font-mono text-[10px] text-fg-subtle max-w-xs truncate">
+                      {r.meta_json ?? ''}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function SettingsTab({ settings }: { settings: SettingRow[] }) {
+function SettingsTab({
+  settings,
+  isLoading,
+  isError,
+  onRetry,
+}: {
+  settings: SettingRow[];
+  isLoading: boolean;
+  isError: boolean;
+  onRetry: () => void;
+}) {
   return (
     <div className="space-y-3">
       <div className="card text-xs text-fg-muted flex items-start gap-2">
@@ -300,14 +382,32 @@ function SettingsTab({ settings }: { settings: SettingRow[] }) {
           값은 JSON 형식이어야 하며 저장 시 즉시 반영됩니다.
         </div>
       </div>
-      {settings.length === 0 && (
-        <div className="card text-sm text-fg-subtle">등록된 설정이 없습니다.</div>
+      {isLoading ? (
+        <LoadingPanel label="설정을 불러오는 중…" />
+      ) : isError ? (
+        <EmptyState
+          tone="error"
+          icon={AlertTriangle}
+          title="설정을 불러오지 못했습니다"
+          action={
+            <button className="btn-outline" onClick={onRetry}>
+              다시 시도
+            </button>
+          }
+        />
+      ) : settings.length === 0 ? (
+        <EmptyState
+          icon={Settings2}
+          title="등록된 설정이 없습니다"
+          hint="아래 “설정 추가”로 첫 key/value를 등록해 보세요."
+        />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {settings.map((s) => (
+            <SettingEditor key={s.key} setting={s} />
+          ))}
+        </div>
       )}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {settings.map((s) => (
-          <SettingEditor key={s.key} setting={s} />
-        ))}
-      </div>
       <NewSettingForm />
     </div>
   );
@@ -316,31 +416,25 @@ function SettingsTab({ settings }: { settings: SettingRow[] }) {
 function SettingEditor({ setting }: { setting: SettingRow }) {
   const { user } = useSession();
   const api = getApi();
-  const qc = useQueryClient();
   const [value, setValue] = useState(setting.value_json);
-  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState(false);
 
-  const mut = useMutation({
+  const jsonErr = validateJson(value);
+  const showErr = touched ? jsonErr : null;
+
+  const mut = useMutationWithToast({
     mutationFn: async () => {
       if (!api || !user) throw new Error('not ready');
-      try {
-        JSON.parse(value);
-      } catch {
-        throw new Error('유효한 JSON이 아닙니다.');
-      }
-      const res = await api.settings.set({
+      if (jsonErr) throw new Error(jsonErr);
+      return api.settings.set({
         key: setting.key,
         valueJson: value,
         actorId: user.id,
       });
-      if (!res.ok) throw new Error(res.error ?? '저장 실패');
-      return res;
     },
-    onSuccess: () => {
-      setError(null);
-      qc.invalidateQueries({ queryKey: ['settings.list'] });
-    },
-    onError: (e: Error) => setError(e.message),
+    successMessage: `"${setting.key}" 설정이 저장되었습니다`,
+    errorMessage: '설정 저장에 실패했습니다',
+    invalidates: [['settings.list']],
   });
 
   const dirty = value !== setting.value_json;
@@ -351,28 +445,33 @@ function SettingEditor({ setting }: { setting: SettingRow }) {
         <div className="font-mono text-sm text-fg">{setting.key}</div>
         <div className="text-[10px] text-fg-subtle">{relative(setting.updated_at)}</div>
       </div>
-      <textarea
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        rows={4}
-        className="input text-xs font-mono w-full"
-      />
-      {error && (
-        <div className="text-[11px] text-rose-300 border border-rose-500/40 bg-rose-500/10 rounded px-2 py-1">
-          {error}
-        </div>
-      )}
+      <FormField error={showErr} hint="JSON 형식 · 변경 후 저장을 눌러 주세요">
+        {(slot) => (
+          <Textarea
+            {...slot}
+            value={value}
+            onChange={(e) => {
+              setValue(e.target.value);
+              if (!touched) setTouched(true);
+            }}
+            onBlur={() => setTouched(true)}
+            rows={4}
+            className="text-xs font-mono"
+            spellCheck={false}
+          />
+        )}
+      </FormField>
       <div className="flex items-center gap-2">
         <button
           type="button"
-          disabled={!dirty || mut.isPending}
+          disabled={!dirty || mut.isPending || !!jsonErr}
           onClick={() => mut.mutate()}
-          className="btn-primary text-xs flex items-center gap-1"
+          className="btn-primary text-xs flex items-center gap-1 disabled:opacity-50"
         >
-          <Save size={11} /> 저장
+          {mut.isPending ? <Spinner size={11} /> : <Save size={11} />} 저장
         </button>
         {mut.isSuccess && !dirty && (
-          <span className="text-[11px] text-emerald-300 flex items-center gap-1">
+          <span className="text-[11px] text-emerald-300 flex items-center gap-1" role="status">
             <CheckCircle2 size={11} /> 저장됨
           </span>
         )}
@@ -384,68 +483,99 @@ function SettingEditor({ setting }: { setting: SettingRow }) {
 function NewSettingForm() {
   const { user } = useSession();
   const api = getApi();
-  const qc = useQueryClient();
   const [key, setKey] = useState('');
   const [value, setValue] = useState('{}');
-  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ key?: boolean; value?: boolean }>({});
 
-  const mut = useMutation({
+  const keyRules = firstError<string>([
+    required('key를 입력해 주세요'),
+    maxLength(KEY_MAX),
+    (v) => (KEY_RE.test(v) ? null : '영문 소문자/숫자/._- 조합으로 입력해 주세요'),
+  ]);
+  const keyErr = keyRules(key);
+  const valueErr = validateJson(value);
+
+  const showKeyErr = touched.key ? keyErr : null;
+  const showValueErr = touched.value ? valueErr : null;
+
+  const mut = useMutationWithToast({
     mutationFn: async () => {
       if (!api || !user) throw new Error('not ready');
-      if (!key.trim()) throw new Error('key 필수');
-      try {
-        JSON.parse(value);
-      } catch {
-        throw new Error('유효한 JSON이 아닙니다.');
-      }
-      const res = await api.settings.set({
+      return api.settings.set({
         key: key.trim(),
         valueJson: value,
         actorId: user.id,
       });
-      if (!res.ok) throw new Error(res.error ?? '저장 실패');
-      return res;
     },
-    onSuccess: () => {
-      setKey('');
-      setValue('{}');
-      setError(null);
-      qc.invalidateQueries({ queryKey: ['settings.list'] });
+    successMessage: `"${key.trim()}" 설정이 추가되었습니다`,
+    errorMessage: '설정 추가에 실패했습니다',
+    invalidates: [['settings.list']],
+    onSuccess: (res) => {
+      if (res.ok) {
+        setKey('');
+        setValue('{}');
+        setTouched({});
+      }
     },
-    onError: (e: Error) => setError(e.message),
   });
+
+  const invalid = !!(keyErr || valueErr);
+  const handleSubmit = () => {
+    setTouched({ key: true, value: true });
+    if (invalid) return;
+    mut.mutate();
+  };
 
   return (
     <div className="card space-y-2">
       <h3 className="text-sm font-semibold">설정 추가</h3>
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={key}
-          onChange={(e) => setKey(e.target.value)}
-          placeholder="key (예: sla.qa1_hours)"
-          className="input text-xs font-mono flex-1"
-        />
-      </div>
-      <textarea
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        rows={3}
-        className="input text-xs font-mono w-full"
-        placeholder='JSON 값 (예: {"hours": 24})'
-      />
-      {error && (
-        <div className="text-[11px] text-rose-300 border border-rose-500/40 bg-rose-500/10 rounded px-2 py-1">
-          {error}
-        </div>
-      )}
+      <FormField
+        label="key"
+        required
+        error={showKeyErr}
+        hint="예: sla.qa1_hours"
+        count={key.length}
+        max={KEY_MAX}
+      >
+        {(slot) => (
+          <TextInput
+            {...slot}
+            type="text"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            onBlur={() => setTouched((t) => ({ ...t, key: true }))}
+            placeholder="sla.qa1_hours"
+            className="font-mono text-xs"
+            maxLength={KEY_MAX + 20}
+          />
+        )}
+      </FormField>
+      <FormField
+        label="JSON 값"
+        required
+        error={showValueErr}
+        hint="예: {&quot;hours&quot;: 24}"
+      >
+        {(slot) => (
+          <Textarea
+            {...slot}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={() => setTouched((t) => ({ ...t, value: true }))}
+            rows={3}
+            className="text-xs font-mono"
+            placeholder='{"hours": 24}'
+            spellCheck={false}
+          />
+        )}
+      </FormField>
       <button
         type="button"
         disabled={mut.isPending}
-        onClick={() => mut.mutate()}
-        className="btn-primary text-xs flex items-center gap-1"
+        onClick={handleSubmit}
+        className="btn-primary text-xs flex items-center gap-1 disabled:opacity-50"
       >
-        <Save size={11} /> 추가
+        {mut.isPending ? <Spinner size={11} /> : <Save size={11} />} 추가
       </button>
     </div>
   );

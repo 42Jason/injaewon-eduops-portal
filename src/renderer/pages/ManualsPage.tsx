@@ -1,10 +1,21 @@
 import { useMemo, useState, useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
   BookOpen, FileText, Plus, Edit3, Save, X, Trash2, Search, FolderOpen,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { useConfirm } from '@/components/ui/ConfirmDialog';
+import { Modal } from '@/components/ui/Modal';
+import { LoadingPanel } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import {
+  FormField,
+  TextInput,
+  Textarea,
+} from '@/components/ui/FormField';
+import { firstError, maxLength, pattern, required } from '@/lib/validators';
 import { renderMarkdown } from '@/lib/markdown';
 import { fmtDateTime, relative } from '@/lib/date';
 import { cn } from '@/lib/cn';
@@ -21,11 +32,27 @@ interface ManualRow {
   author_name?: string | null;
 }
 
+const TITLE_MAX = 120;
+const CATEGORY_MAX = 40;
+const BODY_MAX = 50000;
+const SLUG_RE = /^[a-z0-9][a-z0-9\-]{1,60}$/;
+
+const titleRules = firstError<string>([
+  required('제목을 입력해 주세요'),
+  maxLength(TITLE_MAX),
+]);
+const slugRules = firstError<string>([
+  required('slug를 입력해 주세요'),
+  pattern(SLUG_RE, 'slug는 영문 소문자/숫자/하이픈만 허용됩니다'),
+]);
+const categoryRules = firstError<string>([maxLength(CATEGORY_MAX)]);
+const bodyRules = firstError<string>([maxLength(BODY_MAX)]);
+
 export function ManualsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
+  const confirm = useConfirm();
 
   const canEdit = !!user?.perms.isLeadership;
 
@@ -36,7 +63,7 @@ export function ManualsPage() {
 
   const listQuery = useQuery({
     queryKey: ['manuals.list'],
-    queryFn: () => api!.manuals.list() as Promise<ManualRow[]>,
+    queryFn: () => api!.manuals.list() as unknown as Promise<ManualRow[]>,
     enabled: live,
   });
 
@@ -78,6 +105,20 @@ export function ManualsPage() {
 
   const manual = detailQuery.data ?? null;
 
+  const deleteMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    number
+  >({
+    mutationFn: (id) => api!.manuals.delete({ id, actorId: user!.id }),
+    successMessage: '문서가 삭제되었습니다',
+    errorMessage: '삭제에 실패했습니다',
+    invalidates: [['manuals.list']],
+    onSuccess: (res) => {
+      if (res.ok) setSelectedSlug(null);
+    },
+  });
+
   if (!live) {
     return (
       <div className="p-6">
@@ -86,6 +127,17 @@ export function ManualsPage() {
         </div>
       </div>
     );
+  }
+
+  async function handleDelete() {
+    if (!manual) return;
+    const ok = await confirm({
+      title: '이 문서를 삭제할까요?',
+      description: manual.title,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (ok) deleteMut.mutate(manual.id);
   }
 
   return (
@@ -115,103 +167,131 @@ export function ManualsPage() {
         {/* Left tree */}
         <div className="col-span-12 lg:col-span-3 card p-0 overflow-hidden">
           <div className="p-2 border-b border-border bg-bg-soft/40">
-            <div className="flex items-center gap-1.5">
-              <Search size={13} className="text-fg-subtle" />
+            <label className="flex items-center gap-1.5">
+              <Search size={13} className="text-fg-subtle" aria-hidden="true" />
+              <span className="sr-only">매뉴얼 검색</span>
               <input
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="검색"
                 className="input text-xs py-1 flex-1"
+                aria-label="매뉴얼 검색"
               />
-            </div>
+            </label>
           </div>
           <div className="max-h-[70vh] overflow-y-auto">
-            {grouped.length === 0 && (
-              <div className="p-4 text-center text-xs text-fg-subtle">문서 없음</div>
+            {listQuery.isLoading ? (
+              <LoadingPanel label="불러오는 중…" className="py-6" />
+            ) : listQuery.isError ? (
+              <EmptyState
+                tone="error"
+                title="불러오지 못했습니다"
+                action={
+                  <button
+                    type="button"
+                    onClick={() => listQuery.refetch()}
+                    className="btn-outline text-xs"
+                  >
+                    다시 시도
+                  </button>
+                }
+              />
+            ) : grouped.length === 0 ? (
+              <EmptyState
+                title="문서 없음"
+                hint={search ? '검색 조건에 맞는 문서가 없습니다.' : '첫 문서를 작성해 보세요.'}
+              />
+            ) : (
+              grouped.map(([cat, pages]) => (
+                <div key={cat}>
+                  <div className="px-3 py-1.5 text-[11px] uppercase tracking-wider text-fg-subtle bg-bg-soft/30 flex items-center gap-1">
+                    <FolderOpen size={11} /> {cat}
+                  </div>
+                  <div>
+                    {pages.map((p) => {
+                      const active = p.slug === selectedSlug;
+                      return (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedSlug(p.slug);
+                            setEditing(false);
+                          }}
+                          className={cn(
+                            'w-full text-left px-3 py-2 text-sm flex items-center gap-2 transition',
+                            'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                            active
+                              ? 'bg-accent/15 text-accent'
+                              : 'text-fg-muted hover:bg-bg-soft/40',
+                          )}
+                          aria-pressed={active}
+                        >
+                          <FileText size={13} />
+                          <span className="truncate">{p.title}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))
             )}
-            {grouped.map(([cat, pages]) => (
-              <div key={cat}>
-                <div className="px-3 py-1.5 text-[11px] uppercase tracking-wider text-fg-subtle bg-bg-soft/30 flex items-center gap-1">
-                  <FolderOpen size={11} /> {cat}
-                </div>
-                <div>
-                  {pages.map((p) => {
-                    const active = p.slug === selectedSlug;
-                    return (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => {
-                          setSelectedSlug(p.slug);
-                          setEditing(false);
-                        }}
-                        className={cn(
-                          'w-full text-left px-3 py-2 text-sm flex items-center gap-2 transition',
-                          active
-                            ? 'bg-accent/15 text-accent'
-                            : 'text-fg-muted hover:bg-bg-soft/40',
-                        )}
-                      >
-                        <FileText size={13} />
-                        <span className="truncate">{p.title}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
           </div>
         </div>
 
         {/* Detail */}
         <div className="col-span-12 lg:col-span-9">
-          {!manual && (
-            <div className="card text-sm text-fg-muted">좌측에서 문서를 선택하세요.</div>
-          )}
-          {manual && !editing && (
+          {detailQuery.isLoading && selectedSlug ? (
+            <LoadingPanel label="문서 불러오는 중…" />
+          ) : detailQuery.isError ? (
+            <EmptyState
+              tone="error"
+              title="문서를 불러오지 못했습니다"
+              action={
+                <button
+                  type="button"
+                  onClick={() => detailQuery.refetch()}
+                  className="btn-outline text-xs"
+                >
+                  다시 시도
+                </button>
+              }
+            />
+          ) : !manual ? (
+            <EmptyState
+              title="문서를 선택하세요"
+              hint="좌측 목록에서 읽을 문서를 선택하거나 새 문서를 작성해 보세요."
+            />
+          ) : !editing ? (
             <ManualViewer
               manual={manual}
               canEdit={canEdit}
+              deleting={deleteMut.isPending}
               onEdit={() => setEditing(true)}
-              onDelete={async () => {
-                if (!confirm(`"${manual.title}" 을(를) 삭제하시겠습니까?`)) return;
-                const res = await api!.manuals.delete({
-                  id: manual.id,
-                  actorId: user!.id,
-                });
-                if (res.ok) {
-                  qc.invalidateQueries({ queryKey: ['manuals.list'] });
-                  setSelectedSlug(null);
-                }
-              }}
+              onDelete={handleDelete}
             />
-          )}
-          {manual && editing && (
+          ) : (
             <ManualEditor
               initial={manual}
               onCancel={() => setEditing(false)}
               onSaved={(slug) => {
                 setEditing(false);
                 setSelectedSlug(slug);
-                qc.invalidateQueries({ queryKey: ['manuals.list'] });
-                qc.invalidateQueries({ queryKey: ['manuals.get'] });
               }}
             />
           )}
         </div>
       </div>
 
-      {newOpen && (
-        <NewManualModal
-          onClose={() => setNewOpen(false)}
-          onCreated={(slug) => {
-            setNewOpen(false);
-            setSelectedSlug(slug);
-            qc.invalidateQueries({ queryKey: ['manuals.list'] });
-          }}
-        />
-      )}
+      <NewManualModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        onCreated={(slug) => {
+          setNewOpen(false);
+          setSelectedSlug(slug);
+        }}
+      />
     </div>
   );
 }
@@ -219,11 +299,13 @@ export function ManualsPage() {
 function ManualViewer({
   manual,
   canEdit,
+  deleting,
   onEdit,
   onDelete,
 }: {
   manual: ManualRow;
   canEdit: boolean;
+  deleting: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -258,15 +340,18 @@ function ManualViewer({
               type="button"
               onClick={onEdit}
               className="btn-outline text-sm flex items-center gap-1.5"
+              aria-label="이 문서 편집"
             >
               <Edit3 size={13} /> 편집
             </button>
             <button
               type="button"
               onClick={onDelete}
-              className="btn-outline text-sm border-rose-500/40 text-rose-300 flex items-center gap-1.5"
+              disabled={deleting}
+              className="btn-outline text-sm border-rose-500/40 text-rose-300 flex items-center gap-1.5 disabled:opacity-50"
+              aria-label="이 문서 삭제"
             >
-              <Trash2 size={13} /> 삭제
+              <Trash2 size={13} /> {deleting ? '삭제 중…' : '삭제'}
             </button>
           </div>
         )}
@@ -294,12 +379,21 @@ function ManualEditor({
   const [category, setCategory] = useState(initial.category ?? '');
   const [body, setBody] = useState(initial.body_md ?? '');
   const [slug, setSlug] = useState(initial.slug);
-  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ title?: boolean; slug?: boolean; category?: boolean; body?: boolean }>({});
 
-  const saveMut = useMutation({
+  const titleErr = titleRules(title);
+  const slugErr = slugRules(slug);
+  const categoryErr = categoryRules(category);
+  const bodyErr = bodyRules(body);
+  const anyErr = titleErr || slugErr || categoryErr || bodyErr;
+
+  const saveMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    void
+  >({
     mutationFn: async () => {
       if (!api || !user) throw new Error('not ready');
-      if (!title.trim()) throw new Error('제목 필수');
       const res = await api.manuals.save({
         id: initial.id,
         slug: slug.trim() || initial.slug,
@@ -308,73 +402,133 @@ function ManualEditor({
         category: category.trim() || undefined,
         authorId: user.id,
       });
-      if (!res.ok) throw new Error(res.error ?? '저장 실패');
       return res;
     },
-    onSuccess: () => onSaved(slug.trim() || initial.slug),
-    onError: (e: Error) => setError(e.message),
+    successMessage: '문서가 저장되었습니다',
+    errorMessage: '저장에 실패했습니다',
+    invalidates: [['manuals.list'], ['manuals.get']],
+    onSuccess: (res) => {
+      if (res.ok) onSaved(slug.trim() || initial.slug);
+    },
   });
 
+  function handleSave() {
+    setTouched({ title: true, slug: true, category: true, body: true });
+    if (anyErr) return;
+    saveMut.mutate();
+  }
+
   return (
-    <div className="card space-y-3">
+    <form
+      noValidate
+      onSubmit={(e) => {
+        e.preventDefault();
+        handleSave();
+      }}
+      className="card space-y-3"
+    >
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        <input
-          className="input text-sm"
-          placeholder="제목"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <input
-          className="input text-sm font-mono"
-          placeholder="slug"
-          value={slug}
-          onChange={(e) => setSlug(e.target.value)}
-        />
-        <input
-          className="input text-sm"
-          placeholder="카테고리"
-          value={category}
-          onChange={(e) => setCategory(e.target.value)}
-        />
+        <FormField
+          label="제목"
+          required
+          error={touched.title ? titleErr : null}
+          count={title.length}
+          max={TITLE_MAX}
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, title: true }))}
+              placeholder="제목"
+              maxLength={TITLE_MAX}
+            />
+          )}
+        </FormField>
+        <FormField label="slug" required error={touched.slug ? slugErr : null}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={slug}
+              onChange={(e) => setSlug(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, slug: true }))}
+              placeholder="slug"
+              className="font-mono"
+            />
+          )}
+        </FormField>
+        <FormField
+          label="카테고리"
+          error={touched.category ? categoryErr : null}
+          count={category.length}
+          max={CATEGORY_MAX}
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, category: true }))}
+              placeholder="카테고리"
+              maxLength={CATEGORY_MAX}
+            />
+          )}
+        </FormField>
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-        <textarea
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          rows={20}
-          className="input text-xs font-mono leading-relaxed w-full"
-          placeholder="# Markdown"
-        />
-        <div className="border border-border rounded p-3 overflow-y-auto max-h-[60vh] bg-bg-soft/30">
-          {renderMarkdown(body || '*미리보기*')}
+        <FormField
+          label="본문 (Markdown)"
+          error={touched.body ? bodyErr : null}
+          count={body.length}
+          max={BODY_MAX}
+        >
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, body: true }))}
+              rows={20}
+              className="text-xs font-mono leading-relaxed"
+              placeholder="# Markdown"
+            />
+          )}
+        </FormField>
+        <div>
+          <div className="text-[11px] font-medium text-fg-muted mb-1">미리보기</div>
+          <div className="border border-border rounded p-3 overflow-y-auto max-h-[60vh] bg-bg-soft/30">
+            {renderMarkdown(body || '*미리보기*')}
+          </div>
         </div>
       </div>
-      {error && (
-        <div className="text-xs text-rose-300 border border-rose-500/40 bg-rose-500/10 rounded px-2 py-1">
-          {error}
-        </div>
-      )}
       <div className="flex items-center gap-2">
         <button
-          type="button"
-          disabled={saveMut.isPending}
-          onClick={() => saveMut.mutate()}
-          className="btn-primary text-sm flex items-center gap-1.5"
+          type="submit"
+          disabled={saveMut.isPending || !!anyErr}
+          className="btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50"
         >
-          <Save size={13} /> 저장
+          <Save size={13} /> {saveMut.isPending ? '저장 중…' : '저장'}
         </button>
-        <button type="button" onClick={onCancel} className="btn-ghost text-sm flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={saveMut.isPending}
+          className="btn-ghost text-sm flex items-center gap-1.5"
+        >
           <X size={13} /> 취소
         </button>
       </div>
-    </div>
+    </form>
   );
 }
 
 function NewManualModal({
+  open,
   onClose,
   onCreated,
 }: {
+  open: boolean;
   onClose: () => void;
   onCreated: (slug: string) => void;
 }) {
@@ -384,13 +538,21 @@ function NewManualModal({
   const [slug, setSlug] = useState('');
   const [category, setCategory] = useState('');
   const [body, setBody] = useState('# 새 문서\n\n내용을 작성하세요.');
-  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ title?: boolean; slug?: boolean; category?: boolean; body?: boolean }>({});
 
-  const saveMut = useMutation({
+  const titleErr = titleRules(title);
+  const slugErr = slugRules(slug);
+  const categoryErr = categoryRules(category);
+  const bodyErr = bodyRules(body);
+  const anyErr = titleErr || slugErr || categoryErr || bodyErr;
+
+  const saveMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    void
+  >({
     mutationFn: async () => {
       if (!api || !user) throw new Error('not ready');
-      if (!title.trim()) throw new Error('제목 필수');
-      if (!slug.trim()) throw new Error('slug 필수');
       const res = await api.manuals.save({
         slug: slug.trim(),
         title: title.trim(),
@@ -398,67 +560,142 @@ function NewManualModal({
         category: category.trim() || undefined,
         authorId: user.id,
       });
-      if (!res.ok) throw new Error(res.error ?? '생성 실패');
       return res;
     },
-    onSuccess: () => onCreated(slug.trim()),
-    onError: (e: Error) => setError(e.message),
+    successMessage: '문서가 생성되었습니다',
+    errorMessage: '생성에 실패했습니다',
+    invalidates: [['manuals.list']],
+    onSuccess: (res) => {
+      if (!res.ok) return;
+      const created = slug.trim();
+      setTitle('');
+      setSlug('');
+      setCategory('');
+      setBody('# 새 문서\n\n내용을 작성하세요.');
+      setTouched({});
+      onCreated(created);
+    },
   });
 
+  function handleSubmit() {
+    setTouched({ title: true, slug: true, category: true, body: true });
+    if (anyErr) return;
+    saveMut.mutate();
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-      <div className="bg-bg border border-border rounded-lg shadow-xl max-w-2xl w-full p-5 space-y-3 max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">새 매뉴얼 문서</h2>
-          <button type="button" onClick={onClose} className="text-fg-subtle hover:text-fg">
-            <X size={18} />
-          </button>
-        </div>
-        <input
-          className="input text-sm w-full"
-          placeholder="제목"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <div className="grid grid-cols-2 gap-2">
-          <input
-            className="input text-sm font-mono"
-            placeholder="slug (예: qa-checklist)"
-            value={slug}
-            onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
-          />
-          <input
-            className="input text-sm"
-            placeholder="카테고리"
-            value={category}
-            onChange={(e) => setCategory(e.target.value)}
-          />
-        </div>
-        <textarea
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          rows={12}
-          className="input text-xs font-mono leading-relaxed w-full"
-        />
-        {error && (
-          <div className="text-xs text-rose-300 border border-rose-500/40 bg-rose-500/10 rounded px-2 py-1">
-            {error}
-          </div>
-        )}
-        <div className="flex items-center justify-end gap-2">
-          <button type="button" onClick={onClose} className="btn-ghost text-sm">
+    <Modal
+      open={open}
+      onClose={() => {
+        if (!saveMut.isPending) onClose();
+      }}
+      title="새 매뉴얼 문서"
+      size="lg"
+      closeOnEsc={!saveMut.isPending}
+      closeOnBackdrop={!saveMut.isPending}
+      footer={
+        <>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saveMut.isPending}
+            className="btn-ghost text-sm"
+          >
             취소
           </button>
           <button
             type="button"
-            disabled={saveMut.isPending}
-            onClick={() => saveMut.mutate()}
+            onClick={handleSubmit}
+            disabled={saveMut.isPending || !!anyErr}
             className="btn-primary text-sm flex items-center gap-1.5"
           >
-            <Save size={13} /> 생성
+            <Save size={13} /> {saveMut.isPending ? '생성 중…' : '생성'}
           </button>
+        </>
+      }
+    >
+      <form
+        noValidate
+        onSubmit={(e) => {
+          e.preventDefault();
+          handleSubmit();
+        }}
+        className="space-y-3"
+      >
+        <FormField
+          label="제목"
+          required
+          error={touched.title ? titleErr : null}
+          count={title.length}
+          max={TITLE_MAX}
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              placeholder="제목"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, title: true }))}
+              maxLength={TITLE_MAX}
+              autoFocus
+            />
+          )}
+        </FormField>
+        <div className="grid grid-cols-2 gap-2">
+          <FormField
+            label="slug"
+            required
+            hint="영문 소문자 + 숫자 + 하이픈"
+            error={touched.slug ? slugErr : null}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                className="font-mono"
+                placeholder="예: qa-checklist"
+                value={slug}
+                onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
+                onBlur={() => setTouched((t) => ({ ...t, slug: true }))}
+              />
+            )}
+          </FormField>
+          <FormField
+            label="카테고리"
+            error={touched.category ? categoryErr : null}
+            count={category.length}
+            max={CATEGORY_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                placeholder="카테고리"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, category: true }))}
+                maxLength={CATEGORY_MAX}
+              />
+            )}
+          </FormField>
         </div>
-      </div>
-    </div>
+        <FormField
+          label="본문 (Markdown)"
+          error={touched.body ? bodyErr : null}
+          count={body.length}
+          max={BODY_MAX}
+        >
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, body: true }))}
+              rows={12}
+              className="text-xs font-mono leading-relaxed"
+            />
+          )}
+        </FormField>
+        <button type="submit" className="hidden" aria-hidden="true" tabIndex={-1} />
+      </form>
+    </Modal>
   );
 }

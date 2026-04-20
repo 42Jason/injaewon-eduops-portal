@@ -1,5 +1,5 @@
-import type { ComponentType } from 'react';
 import { NavLink } from 'react-router-dom';
+import type { LucideIcon } from 'lucide-react';
 import {
   LayoutDashboard,
   CheckSquare,
@@ -30,7 +30,7 @@ import { UpdateBanner } from './UpdateBanner';
 interface MenuItem {
   to: string;
   label: string;
-  icon: ComponentType<{ size?: number; className?: string }>;
+  icon: LucideIcon;
   group?: string;
 }
 
@@ -94,9 +94,10 @@ export function Sidebar() {
                   <li key={item.to}>
                     <NavLink
                       to={item.to}
+                      title={item.label}
                       className={({ isActive }) =>
                         cn(
-                          'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors',
+                          'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60',
                           isActive
                             ? 'bg-accent-soft text-accent-strong font-medium'
                             : 'text-fg-muted hover:bg-bg-card hover:text-fg',

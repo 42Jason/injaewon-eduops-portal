@@ -22,6 +22,9 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Kill DevTools entirely in production. F12 / Ctrl+Shift+I / menu —
+      // nothing opens it. In dev we still want full debugging.
+      devTools: isDev,
     },
   });
 
@@ -32,8 +35,13 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
 
-  // F12 / Ctrl+Shift+I still toggles DevTools in packaged builds — leave that
-  // up to the keyboard shortcut rather than auto-opening for everyone.
+  // Belt-and-suspenders: even if something tries to force-open DevTools
+  // in production, slam it shut immediately.
+  if (!isDev) {
+    mainWindow.webContents.on('devtools-opened', () => {
+      mainWindow?.webContents.closeDevTools();
+    });
+  }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);

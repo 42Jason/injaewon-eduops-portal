@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
   ClipboardList, Filter, Search, AlertTriangle, Check, X, RotateCcw,
-  User as UserIcon, Clock, Sparkles, Info, FileText,
+  User as UserIcon, Clock, Sparkles, Info, FileText, Inbox,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
+import { useToast } from '@/stores/toast';
 import { getApi } from '@/hooks/useApi';
 import { MOCK_ASSIGNMENTS } from '@shared/mock/assignments';
 import type { AssignmentState, Risk } from '@shared/types/assignment';
@@ -17,6 +18,10 @@ import {
 } from '@/lib/assignment';
 import { fmtDate, fmtDateTime, relative } from '@/lib/date';
 import { cn } from '@/lib/cn';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { useConfirm } from '@/components/ui/ConfirmDialog';
+import { LoadingPanel, Spinner } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
 
 /** The shape we actually render — union of DB row and mock. */
 interface AssignmentRow {
@@ -125,7 +130,8 @@ export function AssignmentsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
+  const toast = useToast();
+  const confirm = useConfirm();
 
   // --- filter state --------------------------------------------------------
   const [stateFilter, setStateFilter] = useState<AssignmentState | 'ALL'>('ALL');
@@ -192,13 +198,18 @@ export function AssignmentsPage() {
   });
   const reviewsQuery = useQuery({
     queryKey: ['assignments.reviews', selected?.id],
-    queryFn: () => api!.assignments.qaReviews(selected!.id) as Promise<QaReviewRow[]>,
+    queryFn: () => api!.assignments.qaReviews(selected!.id) as unknown as Promise<QaReviewRow[]>,
     enabled: live && !!selected,
   });
 
-  const setStateMut = useMutation({
-    mutationFn: (payload: { state: AssignmentState; note?: string }) => {
-      if (!live || !selected || !user) return Promise.resolve({ ok: false });
+  const setStateMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    { state: AssignmentState; note?: string }
+  >({
+    mutationFn: (payload) => {
+      if (!live || !selected || !user)
+        return Promise.resolve({ ok: false, error: '권한/연결 없음' } as { ok: boolean; error?: string });
       return api!.assignments.setState({
         id: selected.id,
         state: payload.state,
@@ -206,12 +217,34 @@ export function AssignmentsPage() {
         note: payload.note,
       });
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['assignments.list'] });
-      qc.invalidateQueries({ queryKey: ['assignments.reviews', selected?.id] });
-      qc.invalidateQueries({ queryKey: ['home.stats'] });
+    // Variable success text per target state — emit manually.
+    successMessage: false,
+    errorMessage: '상태 변경에 실패했습니다',
+    invalidates: [
+      ['assignments.list'],
+      ['assignments.reviews', selected?.id],
+      ['home.stats'],
+    ],
+    onSuccess: (res, vars) => {
+      if (res.ok) toast.ok(`상태가 "${vars.state}" (으)로 변경되었습니다`);
     },
   });
+
+  async function requestTransition(next: AssignmentState) {
+    // Ask before destructive transitions; silent path for routine steps.
+    const destructive: AssignmentState[] = ['1차QA반려', '최종QA반려', '보류', '수정요청'];
+    const isDestructive = destructive.includes(next);
+    if (isDestructive) {
+      const ok = await confirm({
+        title: `${next} 처리할까요?`,
+        description: '이 변경은 QA 이력에 기록되며 담당자에게 알림이 갑니다.',
+        confirmLabel: next,
+        tone: 'danger',
+      });
+      if (!ok) return;
+    }
+    setStateMut.mutate({ state: next });
+  }
 
   // --- derived: counts for filter pills ------------------------------------
   const counts = useMemo(() => {
@@ -345,13 +378,47 @@ export function AssignmentsPage() {
         <div className="col-span-4 flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-bg-soft/30">
           <div className="flex items-center justify-between border-b border-border px-3 py-1.5 text-[11px] text-fg-subtle">
             <span>과제 목록 ({filteredRows.length})</span>
-            {listQuery.isFetching && <span>불러오는 중…</span>}
+            {listQuery.isFetching && (
+              <span className="inline-flex items-center gap-1" aria-live="polite">
+                <Spinner size={10} /> 불러오는 중…
+              </span>
+            )}
           </div>
           <div className="flex-1 overflow-y-auto divide-y divide-border">
-            {filteredRows.length === 0 ? (
-              <div className="p-6 text-center text-xs text-fg-subtle">
-                필터 조건에 맞는 과제가 없습니다.
-              </div>
+            {live && listQuery.isLoading ? (
+              <LoadingPanel label="과제 목록을 불러오는 중…" />
+            ) : live && listQuery.isError ? (
+              <EmptyState
+                tone="error"
+                icon={AlertTriangle}
+                title="과제 목록을 불러오지 못했습니다"
+                action={
+                  <button className="btn-outline" onClick={() => listQuery.refetch()}>
+                    다시 시도
+                  </button>
+                }
+                className="border-0"
+              />
+            ) : filteredRows.length === 0 ? (
+              <EmptyState
+                icon={Inbox}
+                title="필터 조건에 맞는 과제가 없습니다"
+                hint={search.trim() ? '검색어를 지우거나 필터를 초기화해 보세요.' : '상단의 상태/위험 필터를 확인해 주세요.'}
+                action={
+                  <button
+                    className="btn-outline"
+                    onClick={() => {
+                      setStateFilter('ALL');
+                      setRiskFilter('ALL');
+                      setMineOnly(false);
+                      setSearch('');
+                    }}
+                  >
+                    필터 초기화
+                  </button>
+                }
+                className="border-0"
+              />
             ) : (
               filteredRows.map((r) => {
                 const due = formatDueLabel(rowDue(r));
@@ -359,9 +426,11 @@ export function AssignmentsPage() {
                 return (
                   <button
                     key={r.id}
+                    type="button"
                     onClick={() => setSelectedId(r.id)}
+                    aria-pressed={isSel}
                     className={cn(
-                      'w-full text-left px-3 py-2.5 hover:bg-bg-soft/60 transition-colors',
+                      'w-full text-left px-3 py-2.5 hover:bg-bg-soft/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                       isSel && 'bg-accent/10 border-l-2 border-l-accent',
                     )}
                   >
@@ -403,9 +472,12 @@ export function AssignmentsPage() {
         {/* MIDDLE — detail + parsing */}
         <div className="col-span-5 flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-bg-soft/30">
           {!selected ? (
-            <div className="flex flex-1 items-center justify-center text-sm text-fg-subtle">
-              왼쪽 목록에서 과제를 선택하세요.
-            </div>
+            <EmptyState
+              icon={ClipboardList}
+              title="왼쪽 목록에서 과제를 선택하세요"
+              hint="과제 상세, 파싱 결과, QA 이력을 이곳에서 확인합니다."
+              className="flex-1 border-0 bg-transparent"
+            />
           ) : (
             <>
               <div className="border-b border-border px-4 py-3">
@@ -477,7 +549,17 @@ export function AssignmentsPage() {
                   </div>
                   {live ? (
                     parsingQuery.isLoading ? (
-                      <div className="text-xs text-fg-subtle">불러오는 중…</div>
+                      <LoadingPanel label="파싱 결과 불러오는 중…" className="min-h-[60px]" />
+                    ) : parsingQuery.isError ? (
+                      <div className="rounded-lg border border-danger/30 bg-danger/5 p-3 text-xs text-danger">
+                        파싱 결과를 불러오지 못했습니다.{' '}
+                        <button
+                          className="underline focus:outline-none focus-visible:ring-2 focus-visible:ring-danger rounded"
+                          onClick={() => parsingQuery.refetch()}
+                        >
+                          다시 시도
+                        </button>
+                      </div>
                     ) : parsingQuery.data ? (
                       <ParsingCard data={parsingQuery.data} />
                     ) : (
@@ -502,9 +584,11 @@ export function AssignmentsPage() {
             액션
           </div>
           {!selected ? (
-            <div className="flex flex-1 items-center justify-center text-xs text-fg-subtle">
-              과제를 선택하세요.
-            </div>
+            <EmptyState
+              icon={ClipboardList}
+              title="과제를 선택하세요"
+              className="flex-1 border-0 bg-transparent"
+            />
           ) : (
             <div className="flex-1 overflow-y-auto p-3 space-y-3 text-xs">
               <ActionButtons
@@ -513,7 +597,8 @@ export function AssignmentsPage() {
                 canQa1={user?.perms.canReviewQA1}
                 canQaFinal={user?.perms.canReviewQAFinal}
                 disabled={!live || setStateMut.isPending}
-                onTransition={(s) => setStateMut.mutate({ state: s })}
+                pending={setStateMut.isPending}
+                onTransition={(s) => void requestTransition(s)}
               />
 
               {/* QA history */}
@@ -523,6 +608,18 @@ export function AssignmentsPage() {
                 </div>
                 {!live ? (
                   <div className="text-[11px] text-fg-subtle">Mock 모드 — 이력은 DB 모드에서 표시</div>
+                ) : reviewsQuery.isLoading ? (
+                  <LoadingPanel label="이력 불러오는 중…" className="min-h-[60px]" />
+                ) : reviewsQuery.isError ? (
+                  <div className="rounded border border-danger/30 bg-danger/5 p-2 text-[11px] text-danger">
+                    이력을 불러오지 못했습니다.{' '}
+                    <button
+                      className="underline"
+                      onClick={() => reviewsQuery.refetch()}
+                    >
+                      다시 시도
+                    </button>
+                  </div>
                 ) : reviewsQuery.data && reviewsQuery.data.length > 0 ? (
                   <ul className="space-y-2">
                     {reviewsQuery.data.map((r) => (
@@ -657,6 +754,7 @@ function ActionButtons({
   canQa1,
   canQaFinal,
   disabled,
+  pending,
   onTransition,
 }: {
   state: AssignmentState;
@@ -664,6 +762,7 @@ function ActionButtons({
   canQa1?: boolean;
   canQaFinal?: boolean;
   disabled?: boolean;
+  pending?: boolean;
   onTransition: (next: AssignmentState) => void;
 }) {
   const buttons: Array<{ label: string; next: AssignmentState; icon: typeof Check; variant: 'primary' | 'danger' | 'ghost' }> = [];
@@ -713,16 +812,17 @@ function ActionButtons({
         return (
           <button
             key={b.label + b.next}
+            type="button"
             onClick={() => onTransition(b.next)}
             disabled={disabled}
             className={cn(
-              'w-full inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium transition-colors disabled:opacity-50',
+              'w-full inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium transition-colors disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
               b.variant === 'primary' && 'border-accent bg-accent/10 text-accent hover:bg-accent/20',
               b.variant === 'danger'  && 'border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20',
               b.variant === 'ghost'   && 'border-border bg-bg-soft text-fg-muted hover:bg-bg-soft/70',
             )}
           >
-            <Icon size={12} /> {b.label}
+            {pending ? <Spinner size={12} /> : <Icon size={12} />} {b.label}
           </button>
         );
       })}

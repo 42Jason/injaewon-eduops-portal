@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
   Headphones,
   Mail,
@@ -8,11 +8,18 @@ import {
   AlertTriangle,
   Plus,
   Check,
+  Inbox,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
 import { cn } from '@/lib/cn';
 import { fmtDateTime, relative } from '@/lib/date';
+import { useMutationWithToast } from '@/hooks/useMutationWithToast';
+import { LoadingPanel } from '@/components/ui/Spinner';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { Modal } from '@/components/ui/Modal';
+import { FormField, SelectInput, TextInput, Textarea } from '@/components/ui/FormField';
+import { firstError, maxLength, required } from '@/lib/validators';
 
 type Priority = 'low' | 'normal' | 'high' | 'urgent';
 type Status = 'open' | 'in_progress' | 'waiting' | 'resolved' | 'closed';
@@ -54,6 +61,11 @@ const STATUS_LABEL: Record<Status, string> = {
   closed: '종료',
 };
 
+const SUBJECT_MAX = 120;
+const BODY_MAX = 2000;
+const INQUIRER_MAX = 40;
+const STUDENT_CODE_MAX = 20;
+
 function prioChip(p: Priority): string {
   if (p === 'urgent') return 'bg-rose-500/15 text-rose-300 border border-rose-500/30';
   if (p === 'high') return 'bg-amber-500/15 text-amber-300 border border-amber-500/30';
@@ -78,7 +90,6 @@ export function CSPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const qc = useQueryClient();
 
   const [statusFilter, setStatusFilter] = useState<'' | Status>('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -104,16 +115,16 @@ export function CSPage() {
     [listQuery.data, selectedId],
   );
 
-  const updateMut = useMutation({
+  const updateMut = useMutationWithToast({
     mutationFn: (payload: { status?: Status; priority?: Priority }) =>
       api!.cs.update({ id: selectedId!, actorId: user!.id, ...payload }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['cs.list'] });
-      qc.invalidateQueries({ queryKey: ['cs.stats'] });
-    },
+    successMessage: '티켓이 업데이트되었습니다',
+    errorMessage: '티켓 업데이트에 실패했습니다',
+    invalidates: [['cs.list'], ['cs.stats']],
   });
 
   const stats = statsQuery.data ?? { open: 0, in_progress: 0, waiting: 0, resolved: 0, closed: 0 };
+  const rows = listQuery.data ?? [];
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -132,19 +143,23 @@ export function CSPage() {
       </header>
 
       <div className="grid grid-cols-5 gap-3">
-        {(['open', 'in_progress', 'waiting', 'resolved', 'closed'] as Status[]).map((s) => (
-          <button
-            key={s}
-            onClick={() => setStatusFilter(statusFilter === s ? '' : s)}
-            className={cn(
-              'card flex flex-col items-start gap-1 transition hover:border-accent',
-              statusFilter === s && 'border-accent',
-            )}
-          >
-            <span className="text-xs text-fg-subtle">{STATUS_LABEL[s]}</span>
-            <span className="text-2xl font-semibold text-fg">{stats[s] ?? 0}</span>
-          </button>
-        ))}
+        {(['open', 'in_progress', 'waiting', 'resolved', 'closed'] as Status[]).map((s) => {
+          const active = statusFilter === s;
+          return (
+            <button
+              key={s}
+              onClick={() => setStatusFilter(active ? '' : s)}
+              aria-pressed={active}
+              className={cn(
+                'card flex flex-col items-start gap-1 transition hover:border-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                active && 'border-accent',
+              )}
+            >
+              <span className="text-xs text-fg-subtle">{STATUS_LABEL[s]}</span>
+              <span className="text-2xl font-semibold text-fg">{stats[s] ?? 0}</span>
+            </button>
+          );
+        })}
       </div>
 
       <div className="grid grid-cols-12 gap-4 flex-1 min-h-0">
@@ -154,66 +169,102 @@ export function CSPage() {
             {statusFilter && (
               <button
                 onClick={() => setStatusFilter('')}
-                className="text-xs text-fg-muted hover:text-fg"
+                className="text-xs text-fg-muted hover:text-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
               >
                 필터 초기화
               </button>
             )}
           </div>
           <div className="overflow-y-auto flex-1 -mx-3 px-3">
-            <table className="w-full text-sm">
-              <thead className="text-xs text-fg-subtle sticky top-0 bg-bg-soft">
-                <tr className="text-left">
-                  <th className="py-2 pr-2">코드</th>
-                  <th className="py-2 pr-2">채널</th>
-                  <th className="py-2 pr-2">제목</th>
-                  <th className="py-2 pr-2">우선순위</th>
-                  <th className="py-2 pr-2">상태</th>
-                  <th className="py-2 pr-2">담당</th>
-                  <th className="py-2 pr-2">접수</th>
-                </tr>
-              </thead>
-              <tbody>
-                {listQuery.data?.map((t) => (
-                  <tr
-                    key={t.id}
-                    onClick={() => setSelectedId(t.id)}
-                    className={cn(
-                      'cursor-pointer border-t border-border hover:bg-bg-soft/50',
-                      selectedId === t.id && 'bg-bg-soft',
-                    )}
-                  >
-                    <td className="py-2 pr-2 font-mono text-xs text-fg-muted">{t.code}</td>
-                    <td className="py-2 pr-2">
-                      <span className="inline-flex items-center gap-1 text-xs text-fg-muted">
-                        {channelIcon(t.channel)}
-                        {CHANNEL_LABEL[t.channel]}
-                      </span>
-                    </td>
-                    <td className="py-2 pr-2 text-fg">{t.subject}</td>
-                    <td className="py-2 pr-2">
-                      <span className={cn('rounded-full px-2 py-0.5 text-xs', prioChip(t.priority))}>
-                        {PRIO_LABEL[t.priority]}
-                      </span>
-                    </td>
-                    <td className="py-2 pr-2">
-                      <span className={cn('rounded-full px-2 py-0.5 text-xs', statusChip(t.status))}>
-                        {STATUS_LABEL[t.status]}
-                      </span>
-                    </td>
-                    <td className="py-2 pr-2 text-xs text-fg-muted">{t.assignee_name ?? '-'}</td>
-                    <td className="py-2 pr-2 text-xs text-fg-subtle">{relative(t.opened_at)}</td>
+            {listQuery.isLoading ? (
+              <LoadingPanel label="티켓을 불러오는 중…" />
+            ) : listQuery.isError ? (
+              <EmptyState
+                tone="error"
+                icon={AlertTriangle}
+                title="티켓을 불러오지 못했습니다"
+                hint="네트워크 상태를 확인하거나 잠시 후 다시 시도해 주세요."
+                action={
+                  <button className="btn-outline" onClick={() => listQuery.refetch()}>
+                    다시 시도
+                  </button>
+                }
+              />
+            ) : rows.length === 0 ? (
+              <EmptyState
+                icon={Inbox}
+                title={statusFilter ? '조건에 맞는 티켓이 없습니다' : '아직 접수된 티켓이 없습니다'}
+                hint={statusFilter ? '필터를 초기화해 전체 목록을 확인해 보세요.' : '우측 상단 "새 티켓" 버튼으로 처음 티켓을 등록해 보세요.'}
+                action={
+                  statusFilter ? (
+                    <button className="btn-outline" onClick={() => setStatusFilter('')}>
+                      필터 초기화
+                    </button>
+                  ) : (
+                    <button className="btn-primary" onClick={() => setShowNew(true)}>
+                      <Plus size={14} className="mr-1" />
+                      새 티켓
+                    </button>
+                  )
+                }
+              />
+            ) : (
+              <table className="w-full text-sm">
+                <thead className="text-xs text-fg-subtle sticky top-0 bg-bg-soft">
+                  <tr className="text-left">
+                    <th className="py-2 pr-2">코드</th>
+                    <th className="py-2 pr-2">채널</th>
+                    <th className="py-2 pr-2">제목</th>
+                    <th className="py-2 pr-2">우선순위</th>
+                    <th className="py-2 pr-2">상태</th>
+                    <th className="py-2 pr-2">담당</th>
+                    <th className="py-2 pr-2">접수</th>
                   </tr>
-                ))}
-                {!listQuery.data?.length && (
-                  <tr>
-                    <td colSpan={7} className="py-8 text-center text-fg-subtle">
-                      티켓이 없습니다.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {rows.map((t) => (
+                    <tr
+                      key={t.id}
+                      onClick={() => setSelectedId(t.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          setSelectedId(t.id);
+                        }
+                      }}
+                      tabIndex={0}
+                      role="button"
+                      aria-pressed={selectedId === t.id}
+                      className={cn(
+                        'cursor-pointer border-t border-border hover:bg-bg-soft/50 focus:outline-none focus-visible:bg-bg-soft',
+                        selectedId === t.id && 'bg-bg-soft',
+                      )}
+                    >
+                      <td className="py-2 pr-2 font-mono text-xs text-fg-muted">{t.code}</td>
+                      <td className="py-2 pr-2">
+                        <span className="inline-flex items-center gap-1 text-xs text-fg-muted">
+                          {channelIcon(t.channel)}
+                          {CHANNEL_LABEL[t.channel]}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-2 text-fg">{t.subject}</td>
+                      <td className="py-2 pr-2">
+                        <span className={cn('rounded-full px-2 py-0.5 text-xs', prioChip(t.priority))}>
+                          {PRIO_LABEL[t.priority]}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-2">
+                        <span className={cn('rounded-full px-2 py-0.5 text-xs', statusChip(t.status))}>
+                          {STATUS_LABEL[t.status]}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-2 text-xs text-fg-muted">{t.assignee_name ?? '-'}</td>
+                      <td className="py-2 pr-2 text-xs text-fg-subtle">{relative(t.opened_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </section>
 
@@ -254,54 +305,59 @@ export function CSPage() {
                 </div>
               </div>
 
-              <div>
-                <label className="text-xs text-fg-subtle">상태 변경</label>
-                <select
-                  className="input mt-1"
-                  value={selected.status}
-                  onChange={(e) => updateMut.mutate({ status: e.target.value as Status })}
-                  disabled={updateMut.isPending}
-                >
-                  {(['open', 'in_progress', 'waiting', 'resolved', 'closed'] as Status[]).map((s) => (
-                    <option key={s} value={s}>
-                      {STATUS_LABEL[s]}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-fg-subtle">우선순위</label>
-                <select
-                  className="input mt-1"
-                  value={selected.priority}
-                  onChange={(e) => updateMut.mutate({ priority: e.target.value as Priority })}
-                  disabled={updateMut.isPending}
-                >
-                  {(['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => (
-                    <option key={p} value={p}>
-                      {PRIO_LABEL[p]}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <FormField label="상태 변경" hint="선택 즉시 저장됩니다">
+                {(slot) => (
+                  <SelectInput
+                    {...slot}
+                    value={selected.status}
+                    onChange={(e) => updateMut.mutate({ status: e.target.value as Status })}
+                    disabled={updateMut.isPending}
+                  >
+                    {(['open', 'in_progress', 'waiting', 'resolved', 'closed'] as Status[]).map((s) => (
+                      <option key={s} value={s}>
+                        {STATUS_LABEL[s]}
+                      </option>
+                    ))}
+                  </SelectInput>
+                )}
+              </FormField>
+              <FormField label="우선순위" hint="선택 즉시 저장됩니다">
+                {(slot) => (
+                  <SelectInput
+                    {...slot}
+                    value={selected.priority}
+                    onChange={(e) => updateMut.mutate({ priority: e.target.value as Priority })}
+                    disabled={updateMut.isPending}
+                  >
+                    {(['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => (
+                      <option key={p} value={p}>
+                        {PRIO_LABEL[p]}
+                      </option>
+                    ))}
+                  </SelectInput>
+                )}
+              </FormField>
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-fg-subtle text-sm">
-              <AlertTriangle size={24} className="mb-2" />
-              좌측 목록에서 티켓을 선택하세요
-            </div>
+            <EmptyState
+              icon={AlertTriangle}
+              title="좌측 목록에서 티켓을 선택하세요"
+              hint="선택한 티켓의 상세 정보와 상태 변경 옵션을 여기서 확인할 수 있습니다."
+              className="flex-1 border-0 bg-transparent"
+            />
           )}
         </aside>
       </div>
 
-      {showNew && (
-        <NewTicketModal onClose={() => setShowNew(false)} onCreated={() => qc.invalidateQueries({ queryKey: ['cs.list'] })} />
-      )}
+      <NewTicketModal
+        open={showNew}
+        onClose={() => setShowNew(false)}
+      />
     </div>
   );
 }
 
-function NewTicketModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+function NewTicketModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { user } = useSession();
   const api = getApi();
   const [channel, setChannel] = useState<Channel>('phone');
@@ -310,128 +366,208 @@ function NewTicketModal({ onClose, onCreated }: { onClose: () => void; onCreated
   const [priority, setPriority] = useState<Priority>('normal');
   const [inquirer, setInquirer] = useState('');
   const [studentCode, setStudentCode] = useState('');
-  const [err, setErr] = useState<string | null>(null);
+  const [touched, setTouched] = useState<{ subject?: boolean; body?: boolean; inquirer?: boolean; studentCode?: boolean }>({});
 
-  const createMut = useMutation({
+  const subjectRules = firstError<string>([required('제목을 입력해 주세요'), maxLength(SUBJECT_MAX)]);
+  const bodyRules = firstError<string>([maxLength(BODY_MAX)]);
+  const inquirerRules = firstError<string>([maxLength(INQUIRER_MAX)]);
+  const studentCodeRules = firstError<string>([maxLength(STUDENT_CODE_MAX)]);
+
+  const subjectErr = subjectRules(subject);
+  const bodyErr = bodyRules(body);
+  const inquirerErr = inquirerRules(inquirer);
+  const studentCodeErr = studentCodeRules(studentCode);
+
+  const showSubjectErr = touched.subject ? subjectErr : null;
+  const showBodyErr = touched.body ? bodyErr : null;
+  const showInquirerErr = touched.inquirer ? inquirerErr : null;
+  const showStudentCodeErr = touched.studentCode ? studentCodeErr : null;
+
+  const resetForm = () => {
+    setChannel('phone');
+    setSubject('');
+    setBody('');
+    setPriority('normal');
+    setInquirer('');
+    setStudentCode('');
+    setTouched({});
+  };
+
+  const createMut = useMutationWithToast({
     mutationFn: () =>
       api!.cs.create({
         actorId: user!.id,
         channel,
-        subject,
-        body: body || undefined,
+        subject: subject.trim(),
+        body: body.trim() || undefined,
         priority,
-        inquirer: inquirer || undefined,
-        studentCode: studentCode || undefined,
+        inquirer: inquirer.trim() || undefined,
+        studentCode: studentCode.trim() || undefined,
       }),
+    successMessage: 'CS 티켓이 생성되었습니다',
+    errorMessage: 'CS 티켓 생성에 실패했습니다',
+    invalidates: [['cs.list'], ['cs.stats']],
     onSuccess: (res) => {
-      if (!res.ok) {
-        setErr(res.error ?? '생성 실패');
-        return;
+      if (res.ok) {
+        resetForm();
+        onClose();
       }
-      onCreated();
-      onClose();
     },
   });
 
+  const invalid = !!(subjectErr || bodyErr || inquirerErr || studentCodeErr);
+
+  const handleSubmit = () => {
+    setTouched({ subject: true, body: true, inquirer: true, studentCode: true });
+    if (invalid) return;
+    createMut.mutate();
+  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div
-        className="card w-[540px] max-w-[90vw] flex flex-col gap-3"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="text-base font-semibold text-fg">새 CS 티켓</h3>
-
-        <div className="grid grid-cols-2 gap-2">
-          <label className="text-xs text-fg-subtle">
-            채널
-            <select
-              className="input mt-1"
-              value={channel}
-              onChange={(e) => setChannel(e.target.value as Channel)}
-            >
-              {(['phone', 'email', 'kakao', 'other'] as Channel[]).map((c) => (
-                <option key={c} value={c}>
-                  {CHANNEL_LABEL[c]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs text-fg-subtle">
-            우선순위
-            <select
-              className="input mt-1"
-              value={priority}
-              onChange={(e) => setPriority(e.target.value as Priority)}
-            >
-              {(['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => (
-                <option key={p} value={p}>
-                  {PRIO_LABEL[p]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs text-fg-subtle">
-            문의자
-            <input
-              className="input mt-1"
-              value={inquirer}
-              onChange={(e) => setInquirer(e.target.value)}
-              placeholder="예: 김학부모"
-            />
-          </label>
-          <label className="text-xs text-fg-subtle">
-            학생 코드
-            <input
-              className="input mt-1"
-              value={studentCode}
-              onChange={(e) => setStudentCode(e.target.value)}
-              placeholder="예: S-0012"
-            />
-          </label>
-        </div>
-        <label className="text-xs text-fg-subtle">
-          제목
-          <input
-            className="input mt-1"
-            value={subject}
-            onChange={(e) => setSubject(e.target.value)}
-            placeholder="문의 제목"
-          />
-        </label>
-        <label className="text-xs text-fg-subtle">
-          내용
-          <textarea
-            className="input mt-1"
-            rows={4}
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder="문의 내용 상세"
-          />
-        </label>
-
-        {err && <p className="text-xs text-danger">{err}</p>}
-
-        <div className="flex justify-end gap-2 mt-2">
-          <button className="btn-ghost" onClick={onClose}>
+    <Modal
+      open={open}
+      onClose={() => {
+        if (createMut.isPending) return;
+        resetForm();
+        onClose();
+      }}
+      title="새 CS 티켓"
+      size="md"
+      closeOnEsc={!createMut.isPending}
+      closeOnBackdrop={!createMut.isPending}
+      footer={
+        <>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => {
+              if (createMut.isPending) return;
+              resetForm();
+              onClose();
+            }}
+            disabled={createMut.isPending}
+          >
             취소
           </button>
           <button
+            type="button"
             className="btn-primary"
-            onClick={() => {
-              if (!subject.trim()) {
-                setErr('제목을 입력하세요');
-                return;
-              }
-              setErr(null);
-              createMut.mutate();
-            }}
+            onClick={handleSubmit}
             disabled={createMut.isPending}
           >
             <Check size={14} className="mr-1" />
             생성
           </button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label="채널" required>
+            {(slot) => (
+              <SelectInput
+                {...slot}
+                value={channel}
+                onChange={(e) => setChannel(e.target.value as Channel)}
+              >
+                {(['phone', 'email', 'kakao', 'other'] as Channel[]).map((c) => (
+                  <option key={c} value={c}>
+                    {CHANNEL_LABEL[c]}
+                  </option>
+                ))}
+              </SelectInput>
+            )}
+          </FormField>
+          <FormField label="우선순위" required>
+            {(slot) => (
+              <SelectInput
+                {...slot}
+                value={priority}
+                onChange={(e) => setPriority(e.target.value as Priority)}
+              >
+                {(['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => (
+                  <option key={p} value={p}>
+                    {PRIO_LABEL[p]}
+                  </option>
+                ))}
+              </SelectInput>
+            )}
+          </FormField>
+          <FormField
+            label="문의자"
+            error={showInquirerErr}
+            hint="예: 김학부모"
+            count={inquirer.length}
+            max={INQUIRER_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                value={inquirer}
+                onChange={(e) => setInquirer(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, inquirer: true }))}
+                placeholder="예: 김학부모"
+                maxLength={INQUIRER_MAX + 20}
+              />
+            )}
+          </FormField>
+          <FormField
+            label="학생 코드"
+            error={showStudentCodeErr}
+            hint="예: S-0012"
+            count={studentCode.length}
+            max={STUDENT_CODE_MAX}
+          >
+            {(slot) => (
+              <TextInput
+                {...slot}
+                value={studentCode}
+                onChange={(e) => setStudentCode(e.target.value)}
+                onBlur={() => setTouched((t) => ({ ...t, studentCode: true }))}
+                placeholder="예: S-0012"
+                maxLength={STUDENT_CODE_MAX + 10}
+              />
+            )}
+          </FormField>
         </div>
+        <FormField
+          label="제목"
+          required
+          error={showSubjectErr}
+          count={subject.length}
+          max={SUBJECT_MAX}
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, subject: true }))}
+              placeholder="문의 제목"
+              maxLength={SUBJECT_MAX + 20}
+            />
+          )}
+        </FormField>
+        <FormField
+          label="내용"
+          error={showBodyErr}
+          hint="문의 내용 상세 — 최대 2,000자"
+          count={body.length}
+          max={BODY_MAX}
+        >
+          {(slot) => (
+            <Textarea
+              {...slot}
+              rows={4}
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              onBlur={() => setTouched((t) => ({ ...t, body: true }))}
+              placeholder="문의 내용 상세"
+              maxLength={BODY_MAX + 200}
+            />
+          )}
+        </FormField>
       </div>
-    </div>
+    </Modal>
   );
 }

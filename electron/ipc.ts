@@ -1564,6 +1564,156 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
       }
     },
   );
+
+  // ===========================================================================
+  // Work logs (업무 일지)
+  // ===========================================================================
+
+  ipcMain.handle(
+    'workLogs:list',
+    (
+      _e,
+      filter?: { userId?: number; from?: string; to?: string; limit?: number },
+    ) => {
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (filter?.userId != null) {
+        where.push('w.user_id = ?');
+        params.push(filter.userId);
+      }
+      if (filter?.from) {
+        where.push('w.log_date >= ?');
+        params.push(filter.from);
+      }
+      if (filter?.to) {
+        where.push('w.log_date <= ?');
+        params.push(filter.to);
+      }
+      const lim = Math.min(Math.max(filter?.limit ?? 60, 1), 365);
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      return db
+        .prepare(
+          `SELECT w.id, w.user_id, w.log_date, w.summary, w.details, w.tags, w.created_at,
+                  u.name AS user_name
+             FROM work_logs w
+             LEFT JOIN users u ON u.id = w.user_id
+             ${whereSql}
+            ORDER BY w.log_date DESC, w.created_at DESC
+            LIMIT ${lim}`,
+        )
+        .all(...params);
+    },
+  );
+
+  ipcMain.handle(
+    'workLogs:create',
+    (
+      _e,
+      payload: {
+        userId: number;
+        logDate: string;
+        summary: string;
+        details?: string;
+        tags?: string;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        if (!payload.summary?.trim()) {
+          return { ok: false, error: '요약을 입력해 주세요.' };
+        }
+        if (!payload.logDate) {
+          return { ok: false, error: '날짜를 선택해 주세요.' };
+        }
+        const info = db
+          .prepare(
+            `INSERT INTO work_logs (user_id, log_date, summary, details, tags)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(
+            payload.userId,
+            payload.logDate,
+            payload.summary.trim(),
+            payload.details?.trim() ?? null,
+            payload.tags?.trim() ?? null,
+          );
+        logActivity(db, payload.userId, 'workLogs.create', `log:${info.lastInsertRowid}`, {
+          date: payload.logDate,
+        });
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'create_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'workLogs:update',
+    (
+      _e,
+      payload: {
+        id: number;
+        userId: number;
+        summary?: string;
+        details?: string;
+        tags?: string;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const row = db
+          .prepare(`SELECT user_id FROM work_logs WHERE id = ?`)
+          .get(payload.id) as { user_id: number } | undefined;
+        if (!row) return { ok: false, error: 'not_found' };
+        if (row.user_id !== payload.userId) {
+          return { ok: false, error: '본인의 일지만 수정할 수 있습니다.' };
+        }
+        const sets: string[] = [];
+        const params: unknown[] = [];
+        if (payload.summary !== undefined) {
+          sets.push('summary = ?');
+          params.push(payload.summary.trim());
+        }
+        if (payload.details !== undefined) {
+          sets.push('details = ?');
+          params.push(payload.details.trim() || null);
+        }
+        if (payload.tags !== undefined) {
+          sets.push('tags = ?');
+          params.push(payload.tags.trim() || null);
+        }
+        if (!sets.length) return { ok: true };
+        params.push(payload.id);
+        db.prepare(`UPDATE work_logs SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        logActivity(db, payload.userId, 'workLogs.update', `log:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'update_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'workLogs:delete',
+    (_e, payload: { id: number; userId: number }) => {
+      const db = getDb();
+      try {
+        const row = db
+          .prepare(`SELECT user_id FROM work_logs WHERE id = ?`)
+          .get(payload.id) as { user_id: number } | undefined;
+        if (!row) return { ok: false, error: 'not_found' };
+        if (row.user_id !== payload.userId) {
+          return { ok: false, error: '본인의 일지만 삭제할 수 있습니다.' };
+        }
+        db.prepare(`DELETE FROM work_logs WHERE id = ?`).run(payload.id);
+        logActivity(db, payload.userId, 'workLogs.delete', `log:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'delete_failed' };
+      }
+    },
+  );
 }
 
 /**
