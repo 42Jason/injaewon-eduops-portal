@@ -122,7 +122,10 @@ export function initAutoUpdater() {
     const isSuppressible =
       // GitHub response errors that almost always mean "no release yet" or
       // "rate limit" — neither is actionable by the user.
-      /HttpError:\s*(?:401|403|404|409|5\d\d)/i.test(msg) ||
+      /HttpError:\s*(?:400|401|403|404|406|409|410|429|5\d\d)/i.test(msg) ||
+      // GitHub sometimes returns 406 with MIME-related messages when Release
+      // feed shape is unexpected (e.g., empty release list on a fresh repo).
+      /Cannot parse releases feed|releases feed|MIME|content-type/i.test(msg) ||
       /Cannot find (?:latest-[a-z-]+\.yml|latest\.yml)/i.test(msg) ||
       // Transient DNS / network / TLS / proxy failures.
       /ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|EPIPE|net::ERR_|getaddrinfo/i.test(msg) ||
