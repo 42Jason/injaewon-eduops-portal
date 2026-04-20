@@ -1,0 +1,89 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Light theme tokens (RGB triplets, consumed via rgb(var(--x) / <alpha-value>)) */
+    --bg: 250 250 251;
+    --bg-soft: 244 244 246;
+    --bg-card: 255 255 255;
+    --fg: 17 24 39;
+    --fg-muted: 75 85 99;
+    --fg-subtle: 156 163 175;
+    --accent: 79 70 229;
+    --accent-soft: 224 231 255;
+    --accent-strong: 67 56 202;
+    --border: 229 231 235;
+    --success: 16 185 129;
+    --warn: 245 158 11;
+    --danger: 239 68 68;
+  }
+
+  .dark {
+    --bg: 11 13 16;
+    --bg-soft: 17 19 24;
+    --bg-card: 23 26 32;
+    --fg: 229 231 235;
+    --fg-muted: 156 163 175;
+    --fg-subtle: 107 114 128;
+    --accent: 129 140 248;
+    --accent-soft: 55 48 163;
+    --accent-strong: 165 180 252;
+    --border: 38 41 48;
+    --success: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 248 113 113;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: 'Pretendard', 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  * {
+    border-color: rgb(var(--border));
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-bg-card border border-border rounded-xl p-4 shadow-sm;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5
+      text-sm font-medium transition-colors
+      focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent
+      disabled:opacity-50 disabled:pointer-events-none;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-strong;
+  }
+
+  .btn-ghost {
+    @apply btn hover:bg-bg-soft text-fg;
+  }
+
+  .btn-outline {
+    @apply btn border border-border hover:bg-bg-soft text-fg;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-border bg-bg-card px-3 py-2 text-sm
+      placeholder:text-fg-subtle
+      focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+}

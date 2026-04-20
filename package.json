@@ -1,0 +1,134 @@
+{
+  "name": "eduops-portal",
+  "version": "0.1.1",
+  "private": true,
+  "description": "EduOps Employee Portal — 직원 포털 + 운영 ERP + 안내문 파싱 + QA 생산관리",
+  "main": "dist-electron/main.js",
+  "author": {
+    "name": "EduOps",
+    "email": "shootingstaraca@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/42Jason/injaewon-eduops-portal.git"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "wait-on http://localhost:5173 && tsc -p electron/tsconfig.json && cross-env NODE_ENV=development electron dist-electron/main.js",
+    "build": "tsc -p electron/tsconfig.json && vite build",
+    "make:icon": "node scripts/make-icon.js",
+    "dist": "npm run make:icon && npm run build && electron-builder --win --x64 --publish never",
+    "release": "npm run make:icon && npm run build && electron-builder --win --x64 --publish always",
+    "release:draft": "npm run make:icon && npm run build && electron-builder --win --x64 --publish always -c.publish.releaseType=draft",
+    "preview": "vite preview",
+    "init-db": "node scripts/init-db.js",
+    "seed": "node scripts/seed.js",
+    "reset": "node scripts/init-db.js && node scripts/seed.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "postinstall": "electron-builder install-app-deps",
+    "rebuild": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.0.0",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "xlsx": "^0.18.5",
+    "electron-updater": "^6.3.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.27.0",
+    "zustand": "^5.0.0",
+    "@tanstack/react-query": "^5.59.0",
+    "lucide-react": "^0.452.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.5.4",
+    "date-fns": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.7.5",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "^32.1.2",
+    "electron-builder": "^25.0.5",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.eduops.portal",
+    "productName": "EduOps 포털",
+    "copyright": "Copyright © 2026 EduOps",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "src/shared/db/**/*",
+      "package.json",
+      "!**/*.map",
+      "!**/*.ts",
+      "!**/tsconfig*.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "node_modules/better-sqlite3/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "EduOps-Portal-Setup-${version}.${ext}",
+      "executableName": "EduOps-Portal",
+      "publisherName": "EduOps"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "EduOps 포털",
+      "menuCategory": "EduOps",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "differentialPackage": true,
+      "artifactName": "EduOps-Portal-Setup-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "42Jason",
+        "repo": "injaewon-eduops-portal",
+        "releaseType": "release",
+        "vPrefixedTagName": true
+      }
+    ],
+    "generateUpdatesFilesForAllChannels": false,
+    "electronLanguages": [
+      "ko",
+      "en-US"
+    ],
+    "compression": "normal"
+  }

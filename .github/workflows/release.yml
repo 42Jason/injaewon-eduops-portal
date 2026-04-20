@@ -1,0 +1,78 @@
+name: Build & Release (Windows)
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Publish as draft release'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build installer + publish to GitHub Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          # Skip postinstall rebuild during CI — we rebuild explicitly below so it picks up
+          # the correct Electron headers before the build step.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '0'
+
+      - name: Rebuild native modules for Electron (better-sqlite3)
+        run: npm run rebuild
+
+      - name: Generate placeholder icon (if missing)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/icon.ico)) {
+            node scripts/make-icon.js
+          } else {
+            Write-Host "build/icon.ico already present — skipping placeholder generator."
+          }
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build renderer + main
+        run: npm run build
+
+      - name: Build + publish Windows installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Skip code signing — no certificate configured (user selected "no signing").
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: >
+          npx electron-builder --win --x64 --publish always
+          ${{ (github.event_name == 'workflow_dispatch' && inputs.draft) && '-c.publish.releaseType=draft' || '' }}
+
+      - name: Upload installer artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EduOps-Portal-Windows-${{ github.ref_name }}
+          path: |
+            release/*.exe
+            release/*.yml
+            release/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 14
