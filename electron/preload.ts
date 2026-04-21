@@ -206,6 +206,84 @@ const api = {
       }>,
     recent: () =>
       ipcRenderer.invoke('parsing:recent') as Promise<Array<Record<string, unknown>>>,
+
+    // ---- TA 업로드 워크큐 ------------------------------------------------
+    uploadExcel: (payload: {
+      filename: string;
+      buffer: ArrayBuffer | Uint8Array;
+      mimeType?: string | null;
+      note?: string | null;
+      studentCode?: string | null;
+      subject?: string | null;
+      title?: string | null;
+    }) =>
+      ipcRenderer.invoke('parsing:uploadExcel', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        id?: number;
+        storedPath?: string;
+      }>,
+    listUploads: (filter?: {
+      status?: 'pending' | 'consumed' | 'archived' | 'all';
+      mineOnly?: boolean;
+    }) =>
+      ipcRenderer.invoke('parsing:listUploads', filter) as Promise<
+        Array<{
+          id: number;
+          uploader_user_id: number | null;
+          original_name: string;
+          stored_path: string;
+          mime_type: string | null;
+          size_bytes: number | null;
+          note: string | null;
+          student_code: string | null;
+          subject: string | null;
+          title: string | null;
+          status: 'pending' | 'consumed' | 'archived';
+          consumed_by_user_id: number | null;
+          consumed_at: string | null;
+          consumed_note: string | null;
+          uploaded_at: string;
+          uploader_name: string | null;
+          consumer_name: string | null;
+        }>
+      >,
+    downloadUpload: (payload: { id: number }) =>
+      ipcRenderer.invoke('parsing:downloadUpload', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        filename?: string;
+        mimeType?: string;
+        size?: number;
+        buffer?: ArrayBuffer;
+      }>,
+    openUpload: (payload: { id: number }) =>
+      ipcRenderer.invoke('parsing:openUpload', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    markConsumed: (payload: { id: number; note?: string | null }) =>
+      ipcRenderer.invoke('parsing:markConsumed', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    reopenUpload: (payload: { id: number }) =>
+      ipcRenderer.invoke('parsing:reopenUpload', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    deleteUpload: (payload: { id: number }) =>
+      ipcRenderer.invoke('parsing:deleteUpload', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    uploadsStats: () =>
+      ipcRenderer.invoke('parsing:uploadsStats') as Promise<{
+        pending: number;
+        consumed: number;
+        archived: number;
+        total: number;
+      }>,
   },
   attendance: {
     today: (userId: number) =>

@@ -7,7 +7,8 @@ import { HomePage } from '@/pages/HomePage';
 import { AssignmentsPage } from '@/pages/AssignmentsPage';
 import { AttendancePage } from '@/pages/AttendancePage';
 import { LeavePage } from '@/pages/LeavePage';
-import { ParsingCenterPage } from '@/pages/ParsingCenterPage';
+import { ParsingCenterRouter } from '@/pages/ParsingCenterPage';
+import { ParsingOutputsPage } from '@/pages/ParsingOutputsPage';
 import { CSPage } from '@/pages/CSPage';
 import { ApprovalsPage } from '@/pages/ApprovalsPage';
 import { OperationsBoardPage } from '@/pages/OperationsBoardPage';
@@ -74,7 +75,8 @@ export default function App() {
           <Route path="my-payslips" element={<MyPayslipsPage />} />
 
           <Route path="assignments" element={<AssignmentsPage />} />
-          <Route path="instruction-parser" element={<ParsingCenterPage />} />
+          <Route path="instruction-parser" element={<ParsingCenterRouter />} />
+          <Route path="parsing/outputs" element={<ParsingOutputsPage />} />
           <Route path="operations-board" element={<OperationsBoardPage />} />
           <Route path="qa/first" element={<QAFirstPage />} />
           <Route path="qa/final" element={<QAFinalPage />} />

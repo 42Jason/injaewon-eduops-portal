@@ -180,6 +180,7 @@ export const ROLES = {
   QA1: 'QA1',
   QA_FINAL: 'QA_FINAL',
   PARSER: 'PARSER',
+  TA: 'TA',
 } as const;
 
 export const ROLE_SETS = {
@@ -193,7 +194,17 @@ export const ROLE_SETS = {
   qaReviewer: [ROLES.CEO, ROLES.CTO, ROLES.QA1, ROLES.QA_FINAL] as const,
   /** QA 최종 심사 가능. */
   qaFinalReviewer: [ROLES.CEO, ROLES.CTO, ROLES.QA_FINAL] as const,
-  /** 과제 파싱 작업자. */
+  /** 과제 파싱 작업자 (정규직). assignments 생성/수정 권한 있음. */
   parser: [ROLES.CEO, ROLES.CTO, ROLES.OPS_MANAGER, ROLES.PARSER] as const,
+  /** 파싱 엑셀 업로더 — 정규직 + 조교(TA). 업로드/자신 파일 조회만 가능. */
+  parsingUploader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.PARSER,
+    ROLES.TA,
+  ] as const,
+  /** 업로드 큐 소비자 (정규직 한정). downloadUpload / markConsumed 용. */
+  parsingConsumer: [ROLES.CEO, ROLES.CTO, ROLES.OPS_MANAGER, ROLES.PARSER] as const,
 } as const;
 

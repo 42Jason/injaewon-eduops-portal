@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
   name           TEXT    NOT NULL,
   role           TEXT    NOT NULL CHECK (role IN (
                    'CEO','CTO','OPS_MANAGER','HR_ADMIN',
-                   'PARSER','QA1','QA_FINAL','CS','STAFF'
+                   'PARSER','QA1','QA_FINAL','CS','STAFF','TA'
                  )),
   department_id  INTEGER REFERENCES departments(id) ON DELETE SET NULL,
   title          TEXT,
@@ -673,3 +673,34 @@ CREATE TABLE IF NOT EXISTS student_counseling_logs (
   updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_student_counseling_student ON student_counseling_logs(student_id, log_date DESC);
+
+-- ===========================================================================
+-- Parsed Excel uploads (파싱 엑셀 업로드함)
+--   조교(TA) 가 학생 첨부/교사 요구사항을 읽고 파싱해서 만든 엑셀 파일을 업로드.
+--   정규직(PARSER/리더십)이 이 파일을 받아 외부 전용 프로그램으로 수행평가를 생성한 뒤
+--   '소비 완료'(consumed) 로 체크한다. assignments 와는 의도적으로 분리 — 과제 row 자동 생성 없음.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS parsed_excel_uploads (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  uploader_user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  original_name       TEXT    NOT NULL,
+  stored_path         TEXT    NOT NULL,                    -- userData 기준 상대 경로
+  mime_type           TEXT,
+  size_bytes          INTEGER,
+  note                TEXT,                                 -- 업로더 메모 (학생 코드/출처 등 자유 텍스트)
+  student_code        TEXT,                                 -- 선택: 연관 학생 코드 (검색용)
+  subject             TEXT,                                 -- 선택: 과목
+  title               TEXT,                                 -- 선택: 수행평가명
+  status              TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN (
+                        'pending','consumed','archived'
+                      )),
+  consumed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  consumed_at         TEXT,
+  consumed_note       TEXT,
+  uploaded_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_parsed_uploads_status   ON parsed_excel_uploads(status);
+CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploader ON parsed_excel_uploads(uploader_user_id);
+CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploaded ON parsed_excel_uploads(uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_parsed_uploads_student  ON parsed_excel_uploads(student_code);

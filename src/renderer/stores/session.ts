@@ -3,13 +3,20 @@ import type { Role, SessionUser, User } from '@shared/types/user';
 
 function derivePerms(role: Role): SessionUser['perms'] {
   const leadership = role === 'CEO' || role === 'CTO' || role === 'OPS_MANAGER';
+  const ta = role === 'TA';
+  // 정규직(= 조교가 아닌 사람). TA가 업로드한 파싱 엑셀을 보고 외부 프로그램으로
+  // 수행평가를 생성하는 "소비자" 레인.
+  const fullTimeParser = role === 'PARSER' || leadership;
   return {
-    canReviewQA1: role === 'QA1' || leadership,
-    canReviewQAFinal: role === 'QA_FINAL' || leadership,
-    canParseAssignments: role === 'PARSER' || leadership,
-    canManagePeople: role === 'HR_ADMIN' || role === 'CEO' || role === 'OPS_MANAGER',
-    canApprove: leadership || role === 'HR_ADMIN',
+    canReviewQA1: !ta && (role === 'QA1' || leadership),
+    canReviewQAFinal: !ta && (role === 'QA_FINAL' || leadership),
+    // TA도 파싱 업로드는 할 수 있다. 단, 실제 assignments 생성은 정규직만.
+    canParseAssignments: ta || fullTimeParser,
+    canManagePeople: !ta && (role === 'HR_ADMIN' || role === 'CEO' || role === 'OPS_MANAGER'),
+    canApprove: !ta && (leadership || role === 'HR_ADMIN'),
     isLeadership: leadership,
+    canReviewParsedExcel: fullTimeParser,
+    isParsingAssistantOnly: ta,
   };
 }
 

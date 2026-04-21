@@ -338,6 +338,160 @@ function runMigrations(db: Db) {
   } catch (err) {
     console.warn('[db] student_counseling_logs 생성 skipped:', err);
   }
+
+  // --- users.role CHECK 확장 ('TA' 추가) ----------------------------------
+  // v0.1.12 에서 조교(TA) 역할이 추가됨. 기존 설치본의 users 테이블 CHECK 은
+  // 'TA' 를 모르기 때문에 INSERT/UPDATE 시 제약 위반이 난다. notion_sync_runs
+  // 와 동일한 패턴으로 테이블을 통째로 재생성. sqlite_master 스니핑으로
+  // 멱등 보장.
+  //
+  // ⚠️ v0.1.12 에서는 `PRAGMA foreign_keys = ON` 상태 그대로 이 재구축을
+  //    실행하는 치명 버그가 있었다. users 를 FK 로 참조하는 자식 테이블 37 곳
+  //    중:
+  //      - RESTRICT (qa.reviewer_id, approvals.drafter_id/approver_id) →
+  //        자식에 행이 있으면 DROP TABLE users 가 즉시 실패.
+  //      - CASCADE (attendance, work_logs, notifications 등) → DROP 시 자식
+  //        데이터가 통째로 삭제됨.
+  //      - SET NULL (~25 곳) → DROP 시 자식의 FK 컬럼이 NULL 로 덮어쓰여짐.
+  //    운영 중인 DB 에서는 RESTRICT 에 걸려 BEGIN/ROLLBACK → 바깥 catch 가
+  //    에러를 삼키고, users 는 구 CHECK 상태로 남아 조교(TA) 계정 추가가
+  //    영구적으로 실패.
+  //
+  //    정석 해법 (SQLite 공식 "Making Other Kinds Of Table Schema Changes"):
+  //      1) PRAGMA foreign_keys = OFF
+  //      2) BEGIN
+  //      3) 자식 테이블은 그대로 두고 users 만 안전하게 스왑
+  //      4) PRAGMA foreign_key_check — 남은 위반 없음을 확인
+  //      5) COMMIT
+  //      6) PRAGMA foreign_keys = ON
+  try {
+    const defRow = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'`)
+      .get() as { sql: string } | undefined;
+    const currentSql = defRow?.sql ?? '';
+    if (currentSql && !currentSql.includes("'TA'")) {
+      // FK 가 켜진 상태로 DROP TABLE 하면 자식 테이블에 ON DELETE 액션이
+      // 발화된다. 스키마 재구축은 "정의 변경"이지 "행 삭제" 가 아니므로
+      // 자식 테이블이 그 사실을 알 필요가 없다. 토글로 막는다.
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN');
+      try {
+        db.exec(
+          `CREATE TABLE users__new (
+             id             INTEGER PRIMARY KEY AUTOINCREMENT,
+             email          TEXT    NOT NULL UNIQUE,
+             password_hash  TEXT    NOT NULL,
+             name           TEXT    NOT NULL,
+             role           TEXT    NOT NULL CHECK (role IN (
+                              'CEO','CTO','OPS_MANAGER','HR_ADMIN',
+                              'PARSER','QA1','QA_FINAL','CS','STAFF','TA'
+                            )),
+             department_id  INTEGER REFERENCES departments(id) ON DELETE SET NULL,
+             title          TEXT,
+             phone          TEXT,
+             avatar_url     TEXT,
+             active         INTEGER NOT NULL DEFAULT 1,
+             joined_at      TEXT,
+             leave_balance  REAL    NOT NULL DEFAULT 15.0,
+             created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+             updated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+             notion_user_id TEXT,
+             notion_synced_at TEXT
+           )`,
+        );
+        // 기존에 존재하는 컬럼만 골라서 복사 — notion_* 는 앞선 마이그레이션에서
+        // 추가됐을 수도 있고 아닐 수도 있기 때문에 COALESCE 로 방어.
+        const oldCols = new Set(
+          (db.prepare(`PRAGMA table_info(users)`).all() as ColumnRow[]).map((r) => r.name),
+        );
+        const pick = (col: string, fallback = 'NULL') => (oldCols.has(col) ? col : fallback);
+        db.exec(
+          `INSERT INTO users__new
+             (id, email, password_hash, name, role, department_id, title, phone, avatar_url,
+              active, joined_at, leave_balance, created_at, updated_at,
+              notion_user_id, notion_synced_at)
+           SELECT id, email, password_hash, name, role, department_id,
+                  ${pick('title')}, ${pick('phone')}, ${pick('avatar_url')},
+                  ${pick('active', '1')}, ${pick('joined_at')}, ${pick('leave_balance', '15.0')},
+                  ${pick('created_at', "datetime('now')")}, ${pick('updated_at', "datetime('now')")},
+                  ${pick('notion_user_id')}, ${pick('notion_synced_at')}
+             FROM users`,
+        );
+        db.exec(`DROP TABLE users`);
+        db.exec(`ALTER TABLE users__new RENAME TO users`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_users_department ON users(department_id)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_users_notion_user ON users(notion_user_id)`);
+
+        // 자식 테이블 FK 가 새 users 를 제대로 가리키는지 검증.
+        // ALTER TABLE ... RENAME TO 는 SQLite 3.26+ 에서 타 테이블의 FK 참조를
+        // 자동으로 새 이름으로 갱신해준다. 그래도 무결성을 재확인.
+        const violations = db
+          .prepare('PRAGMA foreign_key_check')
+          .all() as Array<{ table: string; rowid: number; parent: string; fkid: number }>;
+        if (violations.length > 0) {
+          throw new Error(
+            `FK violations after users rebuild: ${JSON.stringify(violations.slice(0, 5))}`,
+          );
+        }
+        db.exec('COMMIT');
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        // 성공이든 실패든 FK 는 반드시 다시 켠다.
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (err) {
+    console.warn('[db] users.role CHECK 확장 skipped:', err);
+    // 안전망: 혹시 BEGIN 은 됐는데 토글이 꼬여 FK 가 OFF 로 남았다면 복구.
+    try { db.exec('PRAGMA foreign_keys = ON'); } catch { /* ignore */ }
+  }
+
+  // --- parsed_excel_uploads: TA 파싱 결과 업로드함 -------------------------
+  // 조교가 파싱해서 만든 엑셀을 담고, 정규직이 '소비' 표시할 수 있는 워크큐.
+  try {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS parsed_excel_uploads (
+         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+         uploader_user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         original_name       TEXT    NOT NULL,
+         stored_path         TEXT    NOT NULL,
+         mime_type           TEXT,
+         size_bytes          INTEGER,
+         note                TEXT,
+         student_code        TEXT,
+         subject             TEXT,
+         title               TEXT,
+         status              TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN (
+                               'pending','consumed','archived'
+                             )),
+         consumed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         consumed_at         TEXT,
+         consumed_note       TEXT,
+         uploaded_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+       )`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_parsed_uploads_status
+         ON parsed_excel_uploads(status)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploader
+         ON parsed_excel_uploads(uploader_user_id)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploaded
+         ON parsed_excel_uploads(uploaded_at DESC)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_parsed_uploads_student
+         ON parsed_excel_uploads(student_code)`,
+    );
+  } catch (err) {
+    console.warn('[db] parsed_excel_uploads 생성 skipped:', err);
+  }
 }
 
 /**

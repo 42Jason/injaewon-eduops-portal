@@ -5,6 +5,7 @@ import {
   CheckSquare,
   ClipboardList,
   FileInput,
+  Inbox,
   Kanban,
   ShieldCheck,
   Shield,
@@ -41,15 +42,29 @@ interface MenuItem {
   group?: string;
   /** If true, only users with perms.isLeadership see this item. */
   leadershipOnly?: boolean;
+  /**
+   * 조교(TA) 계정이 볼 수 있는 항목인가?
+   *   - true  : TA 에게도 노출 (홈/내업무/내급여명세서/파싱 업로드)
+   *   - false/undefined : TA 에게 감춤
+   * 화이트리스트 방식 — 명시적으로 허용한 것만 TA 에게 보이게.
+   */
+  taVisible?: boolean;
 }
 
 const MENU: MenuItem[] = [
-  { to: '/home', label: '홈', icon: LayoutDashboard, group: '내 공간' },
-  { to: '/my-work', label: '내 업무', icon: CheckSquare, group: '내 공간' },
-  { to: '/my-payslips', label: '내 급여 명세서', icon: Wallet, group: '내 공간' },
+  { to: '/home', label: '홈', icon: LayoutDashboard, group: '내 공간', taVisible: true },
+  { to: '/my-work', label: '내 업무', icon: CheckSquare, group: '내 공간', taVisible: true },
+  { to: '/my-payslips', label: '내 급여 명세서', icon: Wallet, group: '내 공간', taVisible: true },
 
   { to: '/assignments', label: '과제 관리', icon: ClipboardList, group: '업무' },
-  { to: '/instruction-parser', label: '안내문 파싱 센터', icon: FileInput, group: '업무' },
+  {
+    to: '/instruction-parser',
+    label: '안내문 파싱 센터',
+    icon: FileInput,
+    group: '업무',
+    taVisible: true,
+  },
+  { to: '/parsing/outputs', label: '파싱 결과함', icon: Inbox, group: '업무' },
   { to: '/operations-board', label: '운영 보드', icon: Kanban, group: '업무' },
   { to: '/qa/first', label: '1차 QA', icon: ShieldCheck, group: '업무' },
   { to: '/qa/final', label: '최종 QA', icon: Shield, group: '업무' },
@@ -82,7 +97,13 @@ export function Sidebar() {
   const { user, logout } = useSession();
 
   const isLeadership = !!user?.perms.isLeadership;
-  const visible = MENU.filter((item) => !item.leadershipOnly || isLeadership);
+  const isTA = !!user?.perms.isParsingAssistantOnly;
+  const visible = MENU.filter((item) => {
+    if (item.leadershipOnly && !isLeadership) return false;
+    // 조교는 taVisible 로 명시된 항목만.
+    if (isTA && !item.taVisible) return false;
+    return true;
+  });
   const groups = visible.reduce<Record<string, MenuItem[]>>((acc, item) => {
     const g = item.group ?? '';
     (acc[g] ||= []).push(item);
