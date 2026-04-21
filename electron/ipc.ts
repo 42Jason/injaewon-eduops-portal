@@ -561,6 +561,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
               WHERE id = ? AND deleted_at IS NULL`,
           );
           for (const id of payload.ids) {
+            // 휴지통 박제 — 복원 가능하도록 행 전체 JSON 보관
+            recordDeletion(db, 'assignments', id, actor.userId, { reason: 'bulk delete' });
             const res = stmt.run(id);
             if (res.changes > 0) {
               changed += 1;
@@ -1805,9 +1807,11 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'manuals:delete',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
+      // 휴지통 박제: 실패해도 본 DELETE 는 진행.
+      recordDeletion(db, 'manual_pages', payload.id, actor.userId, { reason: payload.reason });
       const res = db.prepare(`DELETE FROM manual_pages WHERE id = ?`).run(payload.id);
       logActivity(db, actor.userId, 'manuals.delete', `manual:${payload.id}`, {});
       return { ok: res.changes > 0 };
@@ -2269,7 +2273,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'workLogs:delete',
-    (_e, payload: { id: number; userId: number }) => {
+    (_e, payload: { id: number; userId: number; reason?: string }) => {
       const db = getDb();
       try {
         const row = db
@@ -2279,6 +2283,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         if (row.user_id !== payload.userId) {
           return { ok: false, error: '본인의 일지만 삭제할 수 있습니다.' };
         }
+        // 휴지통 박제 후 DELETE
+        recordDeletion(db, 'work_logs', payload.id, payload.userId, { reason: payload.reason });
         db.prepare(`DELETE FROM work_logs WHERE id = ?`).run(payload.id);
         logActivity(db, payload.userId, 'workLogs.delete', `log:${payload.id}`, {});
         return { ok: true };
@@ -2292,6 +2298,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   registerStudentArchiveIpc();
   registerReleaseIpc(meta.version);
   registerParsingUploadsIpc();
+  registerTrashIpc();
 }
 
 // ===========================================================================
@@ -3394,10 +3401,13 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'subscriptions:delete',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
+        recordDeletion(db, 'recurring_subscriptions', payload.id, actor.userId, {
+          reason: payload.reason,
+        });
         db.prepare(`DELETE FROM recurring_subscriptions WHERE id = ?`).run(payload.id);
         logActivity(db, actor.userId, 'subscriptions.delete', `sub:${payload.id}`, {});
         return { ok: true };
@@ -3659,10 +3669,13 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'corpCards:deleteTransaction',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
+        recordDeletion(db, 'corporate_card_transactions', payload.id, actor.userId, {
+          reason: payload.reason,
+        });
         db.prepare(`DELETE FROM corporate_card_transactions WHERE id = ?`).run(payload.id);
         logActivity(db, actor.userId, 'corpCards.deleteTransaction', `tx:${payload.id}`, {});
         return { ok: true };
@@ -3885,11 +3898,14 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:softDelete',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       // 학생 삭제는 운영관리자·임원만 가능.
       const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
+        // students 는 이미 deleted_at 로 soft-delete 되지만, 휴지통 UI 통합을
+        // 위해 tombstone 도 같이 기록한다. 복원 시 두 경로 모두 처리.
+        recordDeletion(db, 'students', payload.id, actor.userId, { reason: payload.reason });
         const res = db
           .prepare(
             `UPDATE students SET deleted_at = datetime('now')
@@ -4042,9 +4058,10 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteGrade',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
+      recordDeletion(db, 'student_grades', payload.id, actor.userId, { reason: payload.reason });
       const res = db.prepare(`DELETE FROM student_grades WHERE id = ?`).run(payload.id);
       logActivity(db, actor.userId, 'students.deleteGrade', `grade:${payload.id}`, {});
       return { ok: res.changes > 0 };
@@ -4130,9 +4147,12 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteCounseling',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
+      recordDeletion(db, 'student_counseling_logs', payload.id, actor.userId, {
+        reason: payload.reason,
+      });
       const res = db
         .prepare(`DELETE FROM student_counseling_logs WHERE id = ?`)
         .run(payload.id);
@@ -4314,10 +4334,13 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteReportTopic',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
+        recordDeletion(db, 'student_report_topics', payload.id, actor.userId, {
+          reason: payload.reason,
+        });
         const res = db
           .prepare(`DELETE FROM student_report_topics WHERE id = ?`)
           .run(payload.id);
@@ -4421,7 +4444,7 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteArchiveFile',
-    (event, payload: { id: number; actorId?: number }) => {
+    (event, payload: { id: number; actorId?: number; reason?: string }) => {
       const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
@@ -4437,6 +4460,9 @@ function registerStudentArchiveIpc() {
         if (existing.auto_generated) {
           return { ok: false, error: 'auto_generated_readonly' };
         }
+        recordDeletion(db, 'student_archive_files', payload.id, actor.userId, {
+          reason: payload.reason,
+        });
         const res = db
           .prepare(`DELETE FROM student_archive_files WHERE id = ?`)
           .run(payload.id);
@@ -4838,6 +4864,117 @@ function logActivity(
   }
 }
 
+// ===========================================================================
+// 휴지통 (deleted_records) 헬퍼 — v0.1.15
+// ===========================================================================
+// 모든 hard-DELETE / soft-delete 직전에 호출해 원본 row 를 JSON 으로 박제한다.
+// 복원은 이 JSON 을 원본 테이블에 INSERT 하면 끝 (id 컬럼은 제외 또는 유지).
+//
+// 인자:
+//   table : 원본 테이블 이름 (사용자 UI 에 그대로 노출하지 않음)
+//   id    : 원본 row 의 id (복원 성공 여부 추적/activity 용)
+//   actorId: 삭제를 유발한 사용자 (null 허용)
+//   opts.category : UI 탭 분류
+//   opts.label    : 사용자에게 보여줄 짧은 이름 (과제 코드, 업무일지 요약 등)
+//   opts.reason   : 사용자가 남긴 메모
+//
+// 구현 디테일:
+//   1) `SELECT * FROM <table> WHERE id = ?` 로 row 를 읽어 JSON 화.
+//   2) row 가 이미 없으면 ("먼저 삭제됨") 조용히 리턴해 bulk 삭제의 경쟁조건을
+//      죽이지 않는다.
+//   3) 이 함수 자체는 DELETE 를 하지 않는다 — 호출 측이 기존대로 DELETE/UPDATE.
+// ===========================================================================
+const TABLE_CATEGORY: Record<string, string> = {
+  assignments: 'operations',
+  students: 'students',
+  student_grades: 'students',
+  student_counseling_logs: 'students',
+  student_report_topics: 'students',
+  student_archive_files: 'students',
+  cs_tickets: 'cs',
+  recurring_subscriptions: 'admin',
+  corporate_card_transactions: 'admin',
+  manual_pages: 'knowledge',
+  notices: 'knowledge',
+  work_logs: 'org',
+  leave_requests: 'org',
+  approvals: 'org',
+  users: 'org',
+  parsed_excel_uploads: 'parsing',
+};
+
+// 각 테이블에서 복원 시 UI 에 보여줄 라벨을 뽑는 필드 우선순위.
+// 예: assignments 는 code, students 는 name, work_logs 는 summary 등.
+const TABLE_LABEL_FIELDS: Record<string, string[]> = {
+  assignments: ['code', 'title'],
+  students: ['name', 'student_code'],
+  student_grades: ['subject', 'semester'],
+  student_counseling_logs: ['title', 'log_date'],
+  student_report_topics: ['topic', 'subject'],
+  student_archive_files: ['original_name', 'stored_name'],
+  cs_tickets: ['code', 'subject'],
+  recurring_subscriptions: ['vendor', 'product'],
+  corporate_card_transactions: ['merchant', 'memo'],
+  manual_pages: ['title', 'slug'],
+  notices: ['title'],
+  work_logs: ['summary', 'log_date'],
+  leave_requests: ['kind', 'start_date'],
+  approvals: ['code', 'title'],
+  users: ['name', 'email'],
+  parsed_excel_uploads: ['original_name', 'note'],
+};
+
+function pickLabel(table: string, row: Record<string, unknown>): string {
+  const fields = TABLE_LABEL_FIELDS[table] ?? [];
+  for (const f of fields) {
+    const v = row[f];
+    if (v != null && String(v).trim() !== '') return String(v);
+  }
+  // fallback — 아무 텍스트 값이든
+  for (const [, v] of Object.entries(row)) {
+    if (typeof v === 'string' && v.trim() && v.length < 120) return v;
+  }
+  return `#${row.id ?? '?'}`;
+}
+
+function recordDeletion(
+  db: ReturnType<typeof getDb>,
+  table: string,
+  id: number,
+  actorId: number | null,
+  opts?: { reason?: string | null; label?: string | null; category?: string | null },
+): boolean {
+  try {
+    // PRAGMA 로 컬럼 검증은 생략 — table 명은 코드 상수이므로 SQL 인젝션 위험 없음.
+    const row = db
+      .prepare(`SELECT * FROM ${table} WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return false; // 이미 없는 행 — 조용히 넘어간다.
+
+    const category = opts?.category ?? TABLE_CATEGORY[table] ?? 'other';
+    const label = opts?.label ?? pickLabel(table, row);
+
+    db.prepare(
+      `INSERT INTO deleted_records
+         (table_name, row_id, category, label, payload_json, reason, deleted_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      table,
+      id,
+      category,
+      label,
+      JSON.stringify(row),
+      opts?.reason ?? null,
+      actorId,
+    );
+    return true;
+  } catch (err) {
+    // tombstone 실패가 본 DELETE 를 막게 하진 않는다 — 로그만 남긴다.
+    console.warn(`[ipc] recordDeletion(${table}#${id}) failed:`, err);
+    return false;
+  }
+}
+
 /**
  * Sync the student archive with an assignment's current state.
  *
@@ -5234,7 +5371,7 @@ function registerParsingUploadsIpc() {
   // -- delete ---------------------------------------------------------------
   ipcMain.handle(
     'parsing:deleteUpload',
-    (event, payload: { id: number }) => {
+    (event, payload: { id: number; reason?: string }) => {
       const actor = requireActor(event);
       const db = getDb();
       const row = db
@@ -5262,6 +5399,10 @@ function registerParsingUploadsIpc() {
       if (!isLeadership && row.status === 'consumed') {
         return { ok: false as const, error: 'already_consumed' };
       }
+      // 휴지통에 먼저 기록 (파일 unlink 전에 — 복구 시 row 만 살리고 파일은 사용자가 다시 업로드)
+      recordDeletion(db, 'parsed_excel_uploads', payload.id, actor.userId, {
+        reason: payload.reason,
+      });
       try {
         const abs = path.join(app.getPath('userData'), row.stored_path);
         if (fs.existsSync(abs)) fs.unlinkSync(abs);
@@ -5297,4 +5438,291 @@ function registerParsingUploadsIpc() {
     }
     return stats;
   });
+}
+
+// ===========================================================================
+// Trash / Recycle Bin (휴지통)
+//   삭제된 레코드를 deleted_records 에 보관하고, 복원/영구삭제/통계를 제공.
+//   복원은 payload_json 을 그대로 INSERT — 이미 같은 id 가 살아있으면
+//   id 를 비우고 새 PK 로 다시 끼워넣음. 복원 후엔 purged_at 을 기록해
+//   리스트에서 사라지게 한다 (감사 로그용으로는 그대로 남는다).
+//
+//   누가 보나? — opsAdmin (CEO/CTO/운영실장).
+// ===========================================================================
+function registerTrashIpc() {
+  const TRASH_CATEGORY_LABELS: Record<string, string> = {
+    operations: '운영보드',
+    students: '학생',
+    cs: 'CS',
+    admin: '행정',
+    knowledge: '지식',
+    org: '조직',
+    parsing: '파싱',
+    other: '기타',
+  };
+
+  // -- list ----------------------------------------------------------------
+  //  필터: { category?: string; tableName?: string; includePurged?: boolean }
+  //  반환: 휴지통 row 배열 (payload_json 은 클라이언트 표시용으로 일부 발췌)
+  ipcMain.handle(
+    'trash:list',
+    (
+      event,
+      filter?: {
+        category?: string | null;
+        tableName?: string | null;
+        includePurged?: boolean;
+        search?: string | null;
+        limit?: number;
+      },
+    ) => {
+      requireRole(event, ROLE_SETS.opsAdmin);
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (!filter?.includePurged) where.push('d.purged_at IS NULL');
+      if (filter?.category && filter.category !== 'all') {
+        where.push('d.category = ?');
+        params.push(filter.category);
+      }
+      if (filter?.tableName) {
+        where.push('d.table_name = ?');
+        params.push(filter.tableName);
+      }
+      if (filter?.search) {
+        where.push('(d.label LIKE ? OR d.reason LIKE ? OR d.table_name LIKE ?)');
+        const like = `%${filter.search.trim()}%`;
+        params.push(like, like, like);
+      }
+      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+      const limit = Math.min(Math.max(filter?.limit ?? 200, 1), 1000);
+      const rows = db
+        .prepare(
+          `SELECT d.id, d.table_name, d.row_id, d.category, d.label,
+                  d.payload_json, d.reason,
+                  d.deleted_by, d.deleted_at, d.purged_at,
+                  u.name AS deleted_by_name
+             FROM deleted_records d
+             LEFT JOIN users u ON u.id = d.deleted_by
+             ${whereSql}
+             ORDER BY d.deleted_at DESC
+             LIMIT ?`,
+        )
+        .all(...params, limit) as Array<{
+        id: number;
+        table_name: string;
+        row_id: number | null;
+        category: string;
+        label: string | null;
+        payload_json: string;
+        reason: string | null;
+        deleted_by: number | null;
+        deleted_at: string;
+        purged_at: string | null;
+        deleted_by_name: string | null;
+      }>;
+      return rows.map((r) => ({
+        id: r.id,
+        tableName: r.table_name,
+        rowId: r.row_id,
+        category: r.category,
+        categoryLabel: TRASH_CATEGORY_LABELS[r.category] ?? r.category,
+        label: r.label,
+        reason: r.reason,
+        deletedBy: r.deleted_by,
+        deletedByName: r.deleted_by_name,
+        deletedAt: r.deleted_at,
+        purgedAt: r.purged_at,
+        // payload 는 미리보기용 — 첫 8개 필드만.
+        payloadPreview: previewPayload(r.payload_json),
+      }));
+    },
+  );
+
+  // -- stats ---------------------------------------------------------------
+  //  카테고리별 활성 휴지통 개수 + 가장 오래된 deleted_at.
+  ipcMain.handle('trash:stats', (event) => {
+    requireRole(event, ROLE_SETS.opsAdmin);
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT category, COUNT(*) AS c, MIN(deleted_at) AS oldest
+           FROM deleted_records
+          WHERE purged_at IS NULL
+          GROUP BY category`,
+      )
+      .all() as Array<{ category: string; c: number; oldest: string | null }>;
+    const total = rows.reduce((acc, r) => acc + r.c, 0);
+    return {
+      total,
+      byCategory: rows.map((r) => ({
+        category: r.category,
+        categoryLabel: TRASH_CATEGORY_LABELS[r.category] ?? r.category,
+        count: r.c,
+        oldest: r.oldest,
+      })),
+    };
+  });
+
+  // -- restore --------------------------------------------------------------
+  //  payload_json 을 같은 테이블에 다시 INSERT.
+  //  이미 같은 PK 가 존재하면 id 를 빼고 새 PK 로 삽입 (UNIQUE 충돌 시 에러).
+  //  성공 시 purged_at 갱신 (= "처리 완료" 표시).
+  ipcMain.handle(
+    'trash:restore',
+    (event, payload: { id: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
+      const db = getDb();
+      const ts = db
+        .prepare(
+          `SELECT id, table_name, row_id, payload_json, purged_at
+             FROM deleted_records WHERE id = ?`,
+        )
+        .get(payload.id) as
+        | {
+            id: number;
+            table_name: string;
+            row_id: number | null;
+            payload_json: string;
+            purged_at: string | null;
+          }
+        | undefined;
+      if (!ts) return { ok: false as const, error: 'not_found' };
+      if (ts.purged_at) return { ok: false as const, error: 'already_purged' };
+
+      let row: Record<string, unknown>;
+      try {
+        row = JSON.parse(ts.payload_json) as Record<string, unknown>;
+      } catch {
+        return { ok: false as const, error: 'corrupt_payload' };
+      }
+
+      try {
+        // 같은 PK 로 살아있는 행이 있는지 확인. 있으면 id 를 비우고 새 PK 부여.
+        let useOriginalId = true;
+        if (ts.row_id != null) {
+          const existing = db
+            .prepare(`SELECT 1 FROM ${ts.table_name} WHERE id = ?`)
+            .get(ts.row_id);
+          if (existing) useOriginalId = false;
+        }
+
+        const cols = Object.keys(row).filter((k) => useOriginalId || k !== 'id');
+        const placeholders = cols.map(() => '?').join(', ');
+        const values = cols.map((c) => normalizeRestoreValue(row[c]));
+
+        const info = db
+          .prepare(
+            `INSERT INTO ${ts.table_name} (${cols.join(', ')}) VALUES (${placeholders})`,
+          )
+          .run(...values);
+
+        const restoredId = useOriginalId ? ts.row_id : Number(info.lastInsertRowid);
+
+        // 만약 students 처럼 deleted_at 컬럼이 있고 SELECT 가 그걸로 필터한다면,
+        // restore 했더라도 deleted_at 이 채워져 있을 수 있다. 안전하게 NULL 로.
+        try {
+          const colsInfo = db
+            .prepare(`PRAGMA table_info(${ts.table_name})`)
+            .all() as Array<{ name: string }>;
+          if (colsInfo.some((c) => c.name === 'deleted_at')) {
+            db.prepare(
+              `UPDATE ${ts.table_name} SET deleted_at = NULL WHERE id = ?`,
+            ).run(restoredId);
+          }
+        } catch (err) {
+          console.warn('[ipc] trash:restore deleted_at clear failed', err);
+        }
+
+        // 휴지통 레코드는 purged_at 으로 마킹 — 다시 복원 못 하게.
+        db.prepare(
+          `UPDATE deleted_records SET purged_at = datetime('now') WHERE id = ?`,
+        ).run(ts.id);
+
+        logActivity(db, actor.userId, 'trash.restore', `tombstone:${ts.id}`, {
+          table: ts.table_name,
+          restoredId,
+          newId: !useOriginalId,
+        });
+
+        return { ok: true as const, restoredId, newId: !useOriginalId };
+      } catch (err) {
+        console.error('[ipc] trash:restore error', err);
+        return { ok: false as const, error: (err as Error).message ?? 'restore_failed' };
+      }
+    },
+  );
+
+  // -- purge (영구삭제) -----------------------------------------------------
+  //  단일 또는 일괄. 단순히 deleted_records 에서 row 제거.
+  ipcMain.handle(
+    'trash:purge',
+    (event, payload: { ids: number[] }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
+      const db = getDb();
+      const ids = Array.isArray(payload?.ids) ? payload.ids.filter((x) => typeof x === 'number') : [];
+      if (ids.length === 0) return { ok: false as const, error: 'no_ids' };
+      const tx = db.transaction((arr: number[]) => {
+        const stmt = db.prepare(`DELETE FROM deleted_records WHERE id = ?`);
+        for (const id of arr) stmt.run(id);
+      });
+      tx(ids);
+      logActivity(db, actor.userId, 'trash.purge', `tombstones:${ids.length}`, {
+        ids,
+      });
+      return { ok: true as const, purged: ids.length };
+    },
+  );
+
+  // -- purgeAll (카테고리/전체 비우기) -------------------------------------
+  ipcMain.handle(
+    'trash:purgeAll',
+    (event, payload?: { category?: string | null }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
+      const db = getDb();
+      const category = payload?.category && payload.category !== 'all' ? payload.category : null;
+      const sql = category
+        ? `DELETE FROM deleted_records WHERE purged_at IS NULL AND category = ?`
+        : `DELETE FROM deleted_records WHERE purged_at IS NULL`;
+      const res = category
+        ? db.prepare(sql).run(category)
+        : db.prepare(sql).run();
+      logActivity(db, actor.userId, 'trash.purgeAll', `tombstones:${res.changes}`, {
+        category,
+      });
+      return { ok: true as const, purged: res.changes };
+    },
+  );
+}
+
+// payload_json 미리보기용 — 비밀스럽거나 너무 긴 필드는 잘라서 반환.
+function previewPayload(json: string): Record<string, string> {
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    let count = 0;
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === 'id' || k === 'created_at' || k === 'updated_at' || k === 'deleted_at') continue;
+      if (count >= 8) break;
+      let s: string;
+      if (v == null) s = '∅';
+      else if (typeof v === 'string') s = v.length > 60 ? `${v.slice(0, 57)}…` : v;
+      else if (typeof v === 'number' || typeof v === 'boolean') s = String(v);
+      else s = JSON.stringify(v).slice(0, 60);
+      out[k] = s;
+      count += 1;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// JSON 파싱 후 sqlite 가 안 받는 타입 (객체/배열/undefined) 을 string 으로 강제.
+function normalizeRestoreValue(v: unknown): unknown {
+  if (v === undefined) return null;
+  if (v === null) return null;
+  if (typeof v === 'string' || typeof v === 'number') return v;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  return JSON.stringify(v);
 }

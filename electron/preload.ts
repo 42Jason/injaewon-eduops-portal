@@ -1174,6 +1174,54 @@ const api = {
         | { ok: false; error: string; detail?: string }
       >,
   },
+  trash: {
+    list: (filter?: {
+      category?: string | null;
+      tableName?: string | null;
+      includePurged?: boolean;
+      search?: string | null;
+      limit?: number;
+    }) =>
+      ipcRenderer.invoke('trash:list', filter ?? {}) as Promise<
+        Array<{
+          id: number;
+          tableName: string;
+          rowId: number | null;
+          category: string;
+          categoryLabel: string;
+          label: string | null;
+          reason: string | null;
+          deletedBy: number | null;
+          deletedByName: string | null;
+          deletedAt: string;
+          purgedAt: string | null;
+          payloadPreview: Record<string, string>;
+        }>
+      >,
+    stats: () =>
+      ipcRenderer.invoke('trash:stats') as Promise<{
+        total: number;
+        byCategory: Array<{
+          category: string;
+          categoryLabel: string;
+          count: number;
+          oldest: string | null;
+        }>;
+      }>,
+    restore: (payload: { id: number }) =>
+      ipcRenderer.invoke('trash:restore', payload) as Promise<
+        | { ok: true; restoredId: number | null; newId: boolean }
+        | { ok: false; error: string }
+      >,
+    purge: (payload: { ids: number[] }) =>
+      ipcRenderer.invoke('trash:purge', payload) as Promise<
+        { ok: true; purged: number } | { ok: false; error: string }
+      >,
+    purgeAll: (payload?: { category?: string | null }) =>
+      ipcRenderer.invoke('trash:purgeAll', payload ?? {}) as Promise<
+        { ok: true; purged: number } | { ok: false; error: string }
+      >,
+  },
 };
 
 export type UpdaterStatusPayload =

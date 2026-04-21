@@ -29,6 +29,7 @@ import {
   Archive,
   RefreshCw,
   Rocket,
+  Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useSession } from '@/stores/session';
@@ -89,6 +90,7 @@ const MENU: MenuItem[] = [
   { to: '/reports', label: '리포트', icon: BarChart3, group: '운영' },
   { to: '/automation', label: 'CTO 자동화', icon: Bot, group: '운영' },
   { to: '/settings/notion', label: '노션 동기화', icon: RefreshCw, group: '운영' },
+  { to: '/trash', label: '휴지통', icon: Trash2, group: '운영', leadershipOnly: true },
   { to: '/release', label: '릴리스', icon: Rocket, group: '운영', leadershipOnly: true },
   { to: '/settings', label: '설정', icon: Settings, group: '운영' },
 ];

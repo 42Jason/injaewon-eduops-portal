@@ -30,6 +30,7 @@ import { CorporateCardsPage } from '@/pages/CorporateCardsPage';
 import { StudentArchivePage } from '@/pages/StudentArchivePage';
 import { NotionSyncPage } from '@/pages/NotionSyncPage';
 import { ReleasePage } from '@/pages/ReleasePage';
+import { TrashPage } from '@/pages/TrashPage';
 import { UpdateGate } from '@/components/UpdateGate';
 import { useSession } from '@/stores/session';
 
@@ -102,6 +103,7 @@ export default function App() {
           <Route path="automation" element={<AutomationPage />} />
           <Route path="settings/notion" element={<NotionSyncPage />} />
           <Route path="release" element={<ReleasePage />} />
+          <Route path="trash" element={<TrashPage />} />
           <Route path="settings" element={<SettingsPage />} />
         </Route>
 
