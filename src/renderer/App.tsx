@@ -28,6 +28,7 @@ import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
 import { CorporateCardsPage } from '@/pages/CorporateCardsPage';
 import { StudentArchivePage } from '@/pages/StudentArchivePage';
 import { NotionSyncPage } from '@/pages/NotionSyncPage';
+import { UpdateGate } from '@/components/UpdateGate';
 import { useSession } from '@/stores/session';
 
 function RequireAuth({ children }: { children: ReactElement }) {
@@ -53,53 +54,55 @@ export default function App() {
   }, [hydrateFromStorage]);
 
   return (
-    <Routes>
-      <Route path="/login" element={<LoginPage />} />
+    <UpdateGate>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
 
-      <Route
-        path="/"
-        element={
-          <RequireAuth>
-            <AppLayout />
-          </RequireAuth>
-        }
-      >
-        <Route index element={<Navigate to="/home" replace />} />
+        <Route
+          path="/"
+          element={
+            <RequireAuth>
+              <AppLayout />
+            </RequireAuth>
+          }
+        >
+          <Route index element={<Navigate to="/home" replace />} />
 
-        <Route path="home" element={<HomePage />} />
-        <Route path="my-work" element={<MyWorkPage />} />
-        <Route path="my-payslips" element={<MyPayslipsPage />} />
+          <Route path="home" element={<HomePage />} />
+          <Route path="my-work" element={<MyWorkPage />} />
+          <Route path="my-payslips" element={<MyPayslipsPage />} />
 
-        <Route path="assignments" element={<AssignmentsPage />} />
-        <Route path="instruction-parser" element={<ParsingCenterPage />} />
-        <Route path="operations-board" element={<OperationsBoardPage />} />
-        <Route path="qa/first" element={<QAFirstPage />} />
-        <Route path="qa/final" element={<QAFinalPage />} />
-        <Route path="cs" element={<CSPage />} />
+          <Route path="assignments" element={<AssignmentsPage />} />
+          <Route path="instruction-parser" element={<ParsingCenterPage />} />
+          <Route path="operations-board" element={<OperationsBoardPage />} />
+          <Route path="qa/first" element={<QAFirstPage />} />
+          <Route path="qa/final" element={<QAFinalPage />} />
+          <Route path="cs" element={<CSPage />} />
 
-        <Route path="attendance" element={<AttendancePage />} />
-        <Route path="work-logs" element={<WorkLogsPage />} />
-        <Route path="leave" element={<LeavePage />} />
-        <Route path="approvals" element={<ApprovalsPage />} />
-        <Route path="employees" element={<EmployeesPage />} />
+          <Route path="attendance" element={<AttendancePage />} />
+          <Route path="work-logs" element={<WorkLogsPage />} />
+          <Route path="leave" element={<LeavePage />} />
+          <Route path="approvals" element={<ApprovalsPage />} />
+          <Route path="employees" element={<EmployeesPage />} />
 
-        <Route path="admin/tuition" element={<TuitionPage />} />
-        <Route path="admin/payroll" element={<PayrollAdminPage />} />
-        <Route path="admin/subscriptions" element={<SubscriptionsPage />} />
-        <Route path="admin/cards" element={<CorporateCardsPage />} />
-        <Route path="students/archive" element={<StudentArchivePage />} />
+          <Route path="admin/tuition" element={<TuitionPage />} />
+          <Route path="admin/payroll" element={<PayrollAdminPage />} />
+          <Route path="admin/subscriptions" element={<SubscriptionsPage />} />
+          <Route path="admin/cards" element={<CorporateCardsPage />} />
+          <Route path="students/archive" element={<StudentArchivePage />} />
 
-        <Route path="announcements" element={<AnnouncementsPage />} />
-        <Route path="manuals" element={<ManualsPage />} />
-        <Route path="documents" element={<DocumentsPage />} />
+          <Route path="announcements" element={<AnnouncementsPage />} />
+          <Route path="manuals" element={<ManualsPage />} />
+          <Route path="documents" element={<DocumentsPage />} />
 
-        <Route path="reports" element={<ReportsPage />} />
-        <Route path="automation" element={<AutomationPage />} />
-        <Route path="settings/notion" element={<NotionSyncPage />} />
-        <Route path="settings" element={<SettingsPage />} />
-      </Route>
+          <Route path="reports" element={<ReportsPage />} />
+          <Route path="automation" element={<AutomationPage />} />
+          <Route path="settings/notion" element={<NotionSyncPage />} />
+          <Route path="settings" element={<SettingsPage />} />
+        </Route>
 
-      <Route path="*" element={<Navigate to="/home" replace />} />
-    </Routes>
+        <Route path="*" element={<Navigate to="/home" replace />} />
+      </Routes>
+    </UpdateGate>
   );
 }

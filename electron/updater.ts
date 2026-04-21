@@ -65,9 +65,19 @@ export function initAutoUpdater() {
     return;
   }
 
-  // Let the user confirm the download — we surface the "available" status
-  // and provide an explicit IPC to trigger downloadUpdate().
-  autoUpdater.autoDownload = false;
+  // Game-launcher style: once we decide to poll, go all the way.
+  //
+  // `autoDownload = true` kicks off the binary download the moment
+  // `update-available` fires. The renderer's `<UpdateGate>` uses
+  // `download-progress` events to show a determinate progress bar, and the
+  // subsequent `update-downloaded` event flips the gate into a short auto-
+  // install countdown. The net effect is: on launch, before login, the user
+  // sees "확인 중 → 다운로드 중 → 재시작" and nothing else.
+  //
+  // If the user cancels via the gate's "건너뛰기" button we still leave
+  // `autoInstallOnAppQuit = true` so the installer runs the next time they
+  // quit anyway (same contract Steam and most launchers offer).
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.allowDowngrade = false;
 
@@ -144,12 +154,16 @@ export function initAutoUpdater() {
     broadcast({ state: 'error', message: msg });
   });
 
-  // First check after a short delay so we don't race the initial window load.
+  // First check fires ASAP so the `<UpdateGate>` doesn't sit on an empty
+  // spinner. The 800 ms delay is just enough for the BrowserWindow to finish
+  // its first paint and for the renderer to mount its `onStatus` subscription
+  // — because `currentStatus` is cached, any events the renderer "missed"
+  // during boot are recoverable via `api.updater.status()`.
   setTimeout(() => {
     autoUpdater.checkForUpdates().catch((err) => {
       console.error('[updater] initial check failed:', err);
     });
-  }, 8_000);
+  }, 800);
 
   // Re-check every 6 hours.
   setInterval(
