@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Bell, Coffee, LogIn, LogOut, Search, X } from 'lucide-react';
+import {
+  Bell,
+  BellOff,
+  CheckCheck,
+  Clock,
+  Coffee,
+  ExternalLink,
+  LogIn,
+  LogOut,
+  Search,
+  X,
+} from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { cn } from '@/lib/cn';
@@ -25,12 +36,55 @@ interface AssignmentSearchRow {
   state: string;
 }
 
-interface NoticeRow {
+type NotificationCategory =
+  | 'approval'
+  | 'assignment'
+  | 'qa'
+  | 'cs'
+  | 'tuition'
+  | 'trash'
+  | 'notice'
+  | 'system'
+  | string;
+
+interface NotificationItem {
   id: number;
+  userId: number;
+  category: NotificationCategory;
+  kind: string;
   title: string;
-  author_name?: string | null;
-  published_at: string;
+  body: string | null;
+  link: string | null;
+  entityTable: string | null;
+  entityId: number | null;
+  priority: number;
+  readAt: string | null;
+  snoozeUntil: string | null;
+  dismissedAt: string | null;
+  createdAt: string;
 }
+
+const CATEGORY_LABEL: Record<string, string> = {
+  approval: '결재',
+  assignment: '과제',
+  qa: 'QA',
+  cs: 'CS',
+  tuition: '학원비',
+  trash: '휴지통',
+  notice: '공지',
+  system: '시스템',
+};
+
+const CATEGORY_COLOR: Record<string, string> = {
+  approval: 'bg-accent-soft text-accent-strong',
+  assignment: 'bg-info/15 text-info',
+  qa: 'bg-warn/15 text-warn',
+  cs: 'bg-danger/10 text-danger',
+  tuition: 'bg-success/10 text-success',
+  trash: 'bg-fg-subtle/10 text-fg-muted',
+  notice: 'bg-bg-soft text-fg-muted',
+  system: 'bg-bg-soft text-fg-muted',
+};
 
 export function TopBar() {
   const { user } = useSession();
@@ -170,18 +224,94 @@ export function TopBar() {
   // ---------------- Notifications ----------------
 
   const [notifOpen, setNotifOpen] = useState(false);
+  const [notifCategory, setNotifCategory] = useState<string>('all');
   const notifRef = useRef<HTMLDivElement>(null);
 
-  const noticesQuery = useQuery({
-    queryKey: ['topbar.notices'],
-    queryFn: () => api!.notices.list() as unknown as Promise<NoticeRow[]>,
+  // 배지/카운트용 — 드로워가 닫혀 있어도 10초마다 폴링.
+  const statsQuery = useQuery({
+    queryKey: ['topbar.notifications.stats', user?.id],
+    queryFn: () =>
+      api!.notifications.stats({ userId: user!.id }) as unknown as Promise<{
+        total: number;
+        byCategory: Array<{ category: string; count: number }>;
+      }>,
     enabled: live,
-    refetchInterval: 5 * 60_000,
-    staleTime: 60_000,
+    refetchInterval: 10_000,
+    staleTime: 5_000,
   });
 
-  const notices = noticesQuery.data ?? [];
-  const hasUnread = notices.length > 0;
+  // 드로워가 열린 동안만 리스트 조회. (카테고리 필터 반영)
+  const notifQuery = useQuery({
+    queryKey: [
+      'topbar.notifications.list',
+      user?.id,
+      notifOpen,
+      notifCategory,
+    ],
+    queryFn: () =>
+      api!.notifications.list({
+        userId: user!.id,
+        status: 'all',
+        category: notifCategory === 'all' ? null : notifCategory,
+        limit: 40,
+      }) as unknown as Promise<NotificationItem[]>,
+    enabled: live && notifOpen,
+    refetchInterval: notifOpen ? 15_000 : false,
+    staleTime: 5_000,
+  });
+
+  const stats = statsQuery.data ?? { total: 0, byCategory: [] };
+  const unreadCount = stats.total;
+  const hasUnread = unreadCount > 0;
+
+  const notifs = notifQuery.data ?? [];
+
+  const invalidateNotif = () => {
+    qc.invalidateQueries({ queryKey: ['topbar.notifications.stats'] });
+    qc.invalidateQueries({ queryKey: ['topbar.notifications.list'] });
+  };
+
+  const markReadMut = useMutation({
+    mutationFn: (ids: number[]) => api!.notifications.markRead({ ids }),
+    onSuccess: invalidateNotif,
+  });
+  const markAllReadMut = useMutation({
+    mutationFn: () =>
+      api!.notifications.markRead({
+        all: true,
+        category: notifCategory === 'all' ? null : notifCategory,
+      }),
+    onSuccess: (r) => {
+      if (r.ok) toast.ok(`${r.updated}건을 모두 읽음 처리했습니다`);
+      invalidateNotif();
+    },
+    onError: (e: Error) => toast.err(e.message ?? '실패'),
+  });
+  const dismissMut = useMutation({
+    mutationFn: (ids: number[]) => api!.notifications.dismiss({ ids }),
+    onSuccess: invalidateNotif,
+  });
+  const snoozeMut = useMutation({
+    mutationFn: (p: { ids: number[]; until: string }) =>
+      api!.notifications.snooze(p),
+    onSuccess: (r) => {
+      if (r.ok) toast.info('스누즈됨');
+      invalidateNotif();
+    },
+    onError: (e: Error) => toast.err(e.message ?? '실패'),
+  });
+
+  function handleOpenNotif(n: NotificationItem) {
+    // 열자마자 읽음 처리 + 링크 이동 (링크가 있을 때만).
+    if (!n.readAt) markReadMut.mutate([n.id]);
+    setNotifOpen(false);
+    if (n.link) navigate(n.link);
+  }
+
+  function handleSnooze(n: NotificationItem, hours: number) {
+    const until = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    snoozeMut.mutate({ ids: [n.id], until });
+  }
 
   useEffect(() => {
     function onClickOutside(e: MouseEvent) {
@@ -319,55 +449,214 @@ export function TopBar() {
             type="button"
             onClick={() => setNotifOpen((v) => !v)}
             className="btn-ghost h-9 w-9 p-0 relative"
-            title="알림"
-            aria-label={`알림 ${hasUnread ? '있음' : '없음'}`}
+            title={hasUnread ? `알림 ${unreadCount}건` : '알림'}
+            aria-label={hasUnread ? `알림 ${unreadCount}건` : '알림 없음'}
           >
             <Bell size={16} />
             {hasUnread && (
-              <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-danger" />
+              <span
+                className={cn(
+                  'absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full',
+                  'bg-danger text-[10px] font-semibold text-white',
+                  'flex items-center justify-center leading-none',
+                )}
+              >
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </span>
             )}
           </button>
           {notifOpen && (
-            <div className="absolute right-0 top-full mt-1 z-40 w-80 rounded-lg border border-border bg-bg-card shadow-lg">
+            <div className="absolute right-0 top-full mt-1 z-40 w-96 rounded-lg border border-border bg-bg-card shadow-xl">
+              {/* 헤더: 제목 + 모두 읽음 */}
               <div className="flex items-center justify-between border-b border-border px-3 py-2">
-                <span className="text-xs font-semibold text-fg">최근 공지</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-fg">알림</span>
+                  {hasUnread && (
+                    <span className="chip bg-danger/10 text-danger text-[10px] px-1.5 py-0">
+                      미확인 {unreadCount}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => markAllReadMut.mutate()}
+                    disabled={!hasUnread || markAllReadMut.isPending}
+                    className="text-[11px] text-accent hover:underline disabled:text-fg-subtle disabled:no-underline"
+                    title="현재 필터 내 미확인 알림을 모두 읽음 처리"
+                  >
+                    모두 읽음
+                  </button>
+                </div>
+              </div>
+
+              {/* 카테고리 필터 탭 */}
+              <div className="flex items-center gap-1 overflow-x-auto border-b border-border px-2 py-1.5">
+                {(['all', 'approval', 'assignment', 'cs', 'tuition', 'notice', 'system'] as const).map(
+                  (cat) => {
+                    const count =
+                      cat === 'all'
+                        ? stats.total
+                        : stats.byCategory.find((c) => c.category === cat)?.count ?? 0;
+                    const active = notifCategory === cat;
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setNotifCategory(cat)}
+                        className={cn(
+                          'shrink-0 rounded px-2 py-0.5 text-[11px]',
+                          active
+                            ? 'bg-accent text-white'
+                            : 'text-fg-muted hover:bg-bg-soft',
+                        )}
+                      >
+                        {cat === 'all' ? '전체' : CATEGORY_LABEL[cat] ?? cat}
+                        {count > 0 && (
+                          <span
+                            className={cn(
+                              'ml-1',
+                              active ? 'text-white/80' : 'text-fg-subtle',
+                            )}
+                          >
+                            {count}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  },
+                )}
+              </div>
+
+              {/* 리스트 */}
+              <div className="max-h-[28rem] overflow-y-auto">
+                {notifQuery.isLoading && notifs.length === 0 ? (
+                  <div className="px-3 py-5 text-center text-xs text-fg-subtle">
+                    불러오는 중…
+                  </div>
+                ) : notifs.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-xs text-fg-subtle">
+                    새로운 알림이 없습니다.
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-border">
+                    {notifs.map((n) => {
+                      const isUnread = !n.readAt;
+                      return (
+                        <li
+                          key={n.id}
+                          className={cn(
+                            'group relative',
+                            isUnread ? 'bg-accent-soft/40' : 'bg-transparent',
+                          )}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => handleOpenNotif(n)}
+                            className="block w-full px-3 py-2 text-left hover:bg-bg-soft"
+                          >
+                            <div className="flex items-start gap-2">
+                              {isUnread && (
+                                <span className="mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
+                              )}
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <span
+                                    className={cn(
+                                      'shrink-0 rounded px-1 py-0 text-[10px]',
+                                      CATEGORY_COLOR[n.category] ??
+                                        'bg-bg-soft text-fg-muted',
+                                    )}
+                                  >
+                                    {CATEGORY_LABEL[n.category] ?? n.category}
+                                  </span>
+                                  <span
+                                    className={cn(
+                                      'truncate text-sm',
+                                      isUnread ? 'font-semibold text-fg' : 'text-fg',
+                                    )}
+                                  >
+                                    {n.title}
+                                  </span>
+                                  {n.priority >= 1 && (
+                                    <span className="shrink-0 rounded bg-danger/15 px-1 text-[10px] text-danger">
+                                      !
+                                    </span>
+                                  )}
+                                </div>
+                                {n.body && (
+                                  <div className="mt-0.5 line-clamp-2 text-[11px] text-fg-muted">
+                                    {n.body}
+                                  </div>
+                                )}
+                                <div className="mt-1 flex items-center gap-2 text-[10px] text-fg-subtle">
+                                  <span>{relative(n.createdAt)}</span>
+                                  {n.link && (
+                                    <span className="flex items-center gap-0.5">
+                                      <ExternalLink size={9} /> 이동
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </button>
+                          {/* row 액션: hover 시 노출 */}
+                          <div className="absolute right-2 top-2 hidden items-center gap-1 group-hover:flex">
+                            {isUnread && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  markReadMut.mutate([n.id]);
+                                }}
+                                className="rounded p-1 text-fg-subtle hover:bg-bg-card hover:text-fg"
+                                title="읽음으로 표시"
+                              >
+                                <CheckCheck size={12} />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleSnooze(n, 1);
+                              }}
+                              className="rounded p-1 text-fg-subtle hover:bg-bg-card hover:text-fg"
+                              title="1시간 스누즈"
+                            >
+                              <Clock size={12} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                dismissMut.mutate([n.id]);
+                              }}
+                              className="rounded p-1 text-fg-subtle hover:bg-danger/20 hover:text-danger"
+                              title="처리 완료 (드로워에서 제거)"
+                            >
+                              <BellOff size={12} />
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+
+              {/* 푸터 힌트 — 공지 아카이브로 이동 */}
+              <div className="border-t border-border px-3 py-1.5 text-right">
                 <button
                   type="button"
                   onClick={() => {
                     setNotifOpen(false);
                     navigate('/announcements');
                   }}
-                  className="text-[11px] text-accent hover:underline"
+                  className="text-[11px] text-fg-subtle hover:text-accent"
                 >
-                  전체 보기 →
+                  공지 전체 보기 →
                 </button>
-              </div>
-              <div className="max-h-80 overflow-y-auto">
-                {notices.length === 0 ? (
-                  <div className="px-3 py-5 text-center text-xs text-fg-subtle">
-                    공지가 없습니다.
-                  </div>
-                ) : (
-                  <ul className="divide-y divide-border">
-                    {notices.slice(0, 6).map((n) => (
-                      <li key={n.id}>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setNotifOpen(false);
-                            navigate('/announcements');
-                          }}
-                          className="block w-full px-3 py-2 text-left hover:bg-bg-soft"
-                        >
-                          <div className="truncate text-sm text-fg">{n.title}</div>
-                          <div className="mt-0.5 text-[11px] text-fg-subtle">
-                            {n.author_name ?? '—'} · {relative(n.published_at)}
-                          </div>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
               </div>
             </div>
           )}

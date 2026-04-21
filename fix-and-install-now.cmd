@@ -9,13 +9,13 @@ REM  as commands. English-only text avoids that entirely.
 REM
 REM  Double-click this file from inside the repo folder. It will:
 REM    1) back up the existing DB and add missing columns + deleted_records
-REM       (repair-db.js)
+REM       + schema_migrations + notifications v2 columns (repair-db.js)
 REM    2) run `npm install` if node_modules is missing
-REM    3) build the v0.1.15 EXE locally
+REM    3) build the v0.1.16 EXE locally
 REM    4) open the release\ folder in Explorer
 REM
 REM  When the explorer window pops up, double-click
-REM      EduOps-Portal-Setup-0.1.15.exe
+REM      EduOps-Portal-Setup-0.1.16.exe
 REM  to install.
 REM ---------------------------------------------------------------------------
 
@@ -50,18 +50,18 @@ if not exist node_modules (
 )
 
 echo.
-echo === [3/4] Build local EXE (v0.1.15) ===
+echo === [3/4] Build local EXE (v0.1.16) ===
 call npm run dist
 if errorlevel 1 goto FAIL
 
 echo.
 echo === [4/4] Open release folder ===
-if exist "release\EduOps-Portal-Setup-0.1.15.exe" (
+if exist "release\EduOps-Portal-Setup-0.1.16.exe" (
   echo   Installer produced:
-  dir /b release\EduOps-Portal-Setup-0.1.15.exe
+  dir /b release\EduOps-Portal-Setup-0.1.16.exe
   start "" explorer "%CD%\release"
   echo.
-  echo   In the Explorer window, double-click EduOps-Portal-Setup-0.1.15.exe
+  echo   In the Explorer window, double-click EduOps-Portal-Setup-0.1.16.exe
   echo   to install.
 ) else (
   echo   [!] Installer was not produced at the expected path.

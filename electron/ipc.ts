@@ -609,7 +609,14 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         }
         return res.changes > 0;
       });
-      return { ok: tx() };
+      const changed = tx();
+      // 상태 전이가 실제로 이뤄진 경우만 알림 발송 — 실패/노체인지는 조용히.
+      if (changed) {
+        notifyAssignmentStateChange(db, payload.id, payload.state, {
+          comment: payload.note ?? null,
+        });
+      }
+      return { ok: changed };
     },
   );
 
@@ -1303,8 +1310,28 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
             payload.assigneeId ?? null,
             payload.relatedAssignmentId ?? null,
           );
-        logActivity(db, actor.userId, 'cs.create', `cs:${info.lastInsertRowid}`, { code });
-        return { ok: true, id: Number(info.lastInsertRowid), code };
+        const ticketId = Number(info.lastInsertRowid);
+        logActivity(db, actor.userId, 'cs.create', `cs:${ticketId}`, { code });
+        // 배정된 담당자가 있으면 신규 CS 알림 — 우선순위 urgent/high 는 priority=1.
+        if (payload.assigneeId) {
+          const prio = payload.priority ?? 'normal';
+          recordNotification(db, {
+            userId: payload.assigneeId,
+            category: 'cs',
+            kind: 'cs.assigned',
+            title: `CS 배정: ${payload.subject}`,
+            body: `[${code}] ${payload.channel}${
+              payload.inquirer ? ' · ' + payload.inquirer : ''
+            }`,
+            link: `/cs?focus=${ticketId}`,
+            entityTable: 'cs_tickets',
+            entityId: ticketId,
+            dedupeKey: `cs:${ticketId}:open`,
+            priority: prio === 'urgent' || prio === 'high' ? 1 : 0,
+            payload: { code, channel: payload.channel, priority: prio },
+          });
+        }
+        return { ok: true, id: ticketId, code };
       } catch (err) {
         console.error('[ipc] cs:create error', err);
         return { ok: false, error: (err as Error).message ?? 'create_failed' };
@@ -1350,11 +1377,84 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           params.push(payload.body);
         }
         if (!sets.length) return { ok: false, error: 'nothing_to_update' };
+        // 업데이트 전에 이전 상태를 기록해서 알림 규칙에 쓰자.
+        const before = db
+          .prepare(
+            `SELECT code, subject, channel, status, priority, assignee_id
+               FROM cs_tickets WHERE id = ?`,
+          )
+          .get(payload.id) as
+          | {
+              code: string;
+              subject: string;
+              channel: string;
+              status: string;
+              priority: string;
+              assignee_id: number | null;
+            }
+          | undefined;
+
         params.push(payload.id);
         const res = db
           .prepare(`UPDATE cs_tickets SET ${sets.join(', ')} WHERE id = ?`)
           .run(...params);
         logActivity(db, actor.userId, 'cs.update', `cs:${payload.id}`, { sets: sets.length });
+
+        // --- 알림 규칙 ---
+        // (a) status 가 resolved/closed 로 전이되면 이 CS 와 연결된 모든 활성 알림 제거.
+        // (b) 담당자가 새로 지정/변경되면 신규 담당자에게 알림.
+        // (c) 우선순위가 urgent/high 로 올라가면 담당자(새 담당자 우선)에게 에스컬레이션 알림.
+        if (res.changes > 0 && before) {
+          const newStatus = payload.status ?? before.status;
+          const newPriority = payload.priority ?? before.priority;
+          const newAssignee =
+            payload.assigneeId === undefined ? before.assignee_id : payload.assigneeId;
+
+          if (
+            (newStatus === 'resolved' || newStatus === 'closed') &&
+            before.status !== newStatus
+          ) {
+            dismissEntityNotifications(db, 'cs_tickets', payload.id);
+          }
+
+          const assigneeChanged =
+            payload.assigneeId !== undefined &&
+            payload.assigneeId !== before.assignee_id;
+          if (assigneeChanged && newAssignee) {
+            recordNotification(db, {
+              userId: newAssignee,
+              category: 'cs',
+              kind: 'cs.assigned',
+              title: `CS 재배정: ${before.subject}`,
+              body: `[${before.code}] ${before.channel}`,
+              link: `/cs?focus=${payload.id}`,
+              entityTable: 'cs_tickets',
+              entityId: payload.id,
+              dedupeKey: `cs:${payload.id}:assign:${newAssignee}`,
+              priority:
+                newPriority === 'urgent' || newPriority === 'high' ? 1 : 0,
+            });
+          }
+
+          const priorityEscalated =
+            payload.priority !== undefined &&
+            (newPriority === 'urgent' || newPriority === 'high') &&
+            before.priority !== newPriority;
+          if (priorityEscalated && newAssignee) {
+            recordNotification(db, {
+              userId: newAssignee,
+              category: 'cs',
+              kind: 'cs.escalated',
+              title: `CS 우선순위 상향 (${newPriority}): ${before.subject}`,
+              body: `[${before.code}] ${before.priority} → ${newPriority}`,
+              link: `/cs?focus=${payload.id}`,
+              entityTable: 'cs_tickets',
+              entityId: payload.id,
+              dedupeKey: `cs:${payload.id}:escalated:${newPriority}`,
+              priority: 1,
+            });
+          }
+        }
         return { ok: res.changes > 0 };
       } catch (err) {
         console.error('[ipc] cs:update error', err);
@@ -1492,6 +1592,23 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         logActivity(db, payload.drafterId, 'approvals.create', `approval:${res.aid}`, {
           code: res.code,
         });
+        // 1단계 승인자에게만 먼저 알림 — 순차 결재라서 뒤 단계는 앞이 승인돼야 차례.
+        const firstApprover = payload.approverIds[0];
+        if (firstApprover) {
+          recordNotification(db, {
+            userId: firstApprover,
+            category: 'approval',
+            kind: 'approval.requested',
+            title: `결재 요청: ${payload.title}`,
+            body: `[${res.code}] ${payload.kind} · 기안자 #${payload.drafterId}`,
+            link: `/approvals?focus=${res.aid}`,
+            entityTable: 'approvals',
+            entityId: res.aid,
+            dedupeKey: `approval:${res.aid}:pending`,
+            priority: 1,
+            payload: { code: res.code, kind: payload.kind, drafterId: payload.drafterId },
+          });
+        }
         return { ok: true, id: res.aid, code: res.code };
       } catch (err) {
         console.error('[ipc] approvals:create error', err);
@@ -1575,6 +1692,61 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           decision: payload.decision,
           finalStatus: res.finalStatus,
         });
+
+        // 알림 전파 ----------------------------------------------------------
+        // 이 승인자의 미처리 "결재 요청" 알림은 처리 완료이므로 드로워에서 걷어낸다.
+        dismissEntityNotifications(db, 'approvals', payload.approvalId);
+
+        const approvalMeta = db
+          .prepare(
+            `SELECT code, title, drafter_id FROM approvals WHERE id = ?`,
+          )
+          .get(payload.approvalId) as
+          | { code: string; title: string; drafter_id: number }
+          | undefined;
+
+        if (res.finalStatus === 'pending' && approvalMeta) {
+          // 다음 단계 승인자에게 새 요청 알림.
+          const next = db
+            .prepare(
+              `SELECT approver_id FROM approval_steps
+                WHERE approval_id = ? AND state = 'pending'
+                ORDER BY step_order ASC LIMIT 1`,
+            )
+            .get(payload.approvalId) as { approver_id: number } | undefined;
+          if (next?.approver_id) {
+            recordNotification(db, {
+              userId: next.approver_id,
+              category: 'approval',
+              kind: 'approval.requested',
+              title: `결재 요청: ${approvalMeta.title}`,
+              body: `[${approvalMeta.code}] · 이전 단계 승인 완료, 귀하 차례입니다`,
+              link: `/approvals?focus=${payload.approvalId}`,
+              entityTable: 'approvals',
+              entityId: payload.approvalId,
+              dedupeKey: `approval:${payload.approvalId}:pending`,
+              priority: 1,
+            });
+          }
+        } else if (approvalMeta) {
+          // 최종 결과를 기안자에게 통지.
+          const resultKind = res.finalStatus === 'approved' ? '승인' : '반려';
+          recordNotification(db, {
+            userId: approvalMeta.drafter_id,
+            category: 'approval',
+            kind: `approval.${res.finalStatus}`,
+            title: `결재 ${resultKind}: ${approvalMeta.title}`,
+            body: payload.comment
+              ? `[${approvalMeta.code}] ${payload.comment}`
+              : `[${approvalMeta.code}]`,
+            link: `/approvals?focus=${payload.approvalId}`,
+            entityTable: 'approvals',
+            entityId: payload.approvalId,
+            dedupeKey: `approval:${payload.approvalId}:${res.finalStatus}`,
+            priority: res.finalStatus === 'rejected' ? 1 : 0,
+          });
+        }
+
         return { ok: true, finalStatus: res.finalStatus };
       } catch (err) {
         console.error('[ipc] approvals:decide error', err);
@@ -1706,6 +1878,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           stage: payload.stage,
           result: payload.result,
           nextState,
+        });
+        // QA 결과를 다음 단계/담당자에게 통지 — 본 트랜잭션은 이미 커밋되었으므로
+        // 알림 실패가 QA 결과를 롤백하지 않는다.
+        notifyAssignmentStateChange(db, payload.assignmentId, nextState, {
+          comment: payload.comment ?? null,
+          stage: payload.stage,
         });
         return { ok: true, nextState };
       } catch (err) {
@@ -2299,6 +2477,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   registerReleaseIpc(meta.version);
   registerParsingUploadsIpc();
   registerTrashIpc();
+  registerNotificationsIpc();
 }
 
 // ===========================================================================
@@ -2644,6 +2823,10 @@ function registerAdminIpc() {
           method: payload.method,
           newStatus: result.newStatus,
         });
+        // 완납이 되면 이 인보이스에 붙은 미처리 연체 알림들을 dismiss.
+        if (result.newStatus === 'paid') {
+          dismissEntityNotifications(db, 'tuition_invoices', payload.invoiceId);
+        }
         return { ok: true, paidAmount: result.newPaid, status: result.newStatus };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'record_failed' };
@@ -4937,6 +5120,216 @@ function pickLabel(table: string, row: Record<string, unknown>): string {
   return `#${row.id ?? '?'}`;
 }
 
+// ---------------------------------------------------------------------------
+// Notification producers (v0.1.16 알림 센터)
+// ---------------------------------------------------------------------------
+// 운영 이벤트(결재 요청 / 과제 반려 / QA 요청 / CS 지연 / 학원비 미납 / 휴지통
+// 복원 결과 등) 를 notifications 테이블에 멱등 삽입한다. `dedupe_key` 에
+// 자연 키를 넣으면 "같은 사용자 + 같은 키 + 아직 dismissed 안 됨" 은 DB partial
+// unique 인덱스로 중복 생성이 차단된다.
+//
+// 생산자는 **본 업무 트랜잭션 실패가 알림 실패로 번지지 않도록** 바깥에서
+// 호출한다 (DB 트랜잭션 안에 넣지 않음). 알림 삽입이 실패해도 로그만 남긴다.
+
+export type NotificationCategory =
+  | 'approval'
+  | 'assignment'
+  | 'qa'
+  | 'cs'
+  | 'tuition'
+  | 'trash'
+  | 'notice'
+  | 'system';
+
+interface RecordNotificationInput {
+  userId: number;
+  category: NotificationCategory;
+  kind: string; // 레거시 호환용 자유 문자열 (예: 'approval.requested')
+  title: string;
+  body?: string | null;
+  link?: string | null;
+  entityTable?: string | null;
+  entityId?: number | null;
+  dedupeKey?: string | null;
+  priority?: number; // -1 low, 0 normal, 1 high
+  payload?: Record<string, unknown> | null;
+}
+
+function recordNotification(
+  db: ReturnType<typeof getDb>,
+  input: RecordNotificationInput,
+): number | null {
+  try {
+    // INSERT OR IGNORE 는 UNIQUE 인덱스 충돌을 조용히 무시한다. dedup 이 걸린
+    // 알림은 "같은 유저가 이미 동일 이벤트로 미처리 알림을 가지고 있다" 는
+    // 뜻이므로 그대로 버리면 된다.
+    const stmt = db.prepare(
+      `INSERT OR IGNORE INTO notifications
+         (user_id, category, kind, title, body, link,
+          entity_table, entity_id, dedupe_key, priority, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const result = stmt.run(
+      input.userId,
+      input.category,
+      input.kind,
+      input.title,
+      input.body ?? null,
+      input.link ?? null,
+      input.entityTable ?? null,
+      input.entityId ?? null,
+      input.dedupeKey ?? null,
+      input.priority ?? 0,
+      input.payload ? JSON.stringify(input.payload) : null,
+    );
+    return result.changes > 0 ? Number(result.lastInsertRowid) : null;
+  } catch (err) {
+    console.warn(
+      `[ipc] recordNotification(user=${input.userId}, kind=${input.kind}) failed:`,
+      err,
+    );
+    return null;
+  }
+}
+
+/** 여러 명에게 한 번에. 개별 실패는 묵살. */
+function recordNotificationToMany(
+  db: ReturnType<typeof getDb>,
+  userIds: Iterable<number>,
+  input: Omit<RecordNotificationInput, 'userId'>,
+) {
+  for (const uid of userIds) {
+    if (!uid || uid <= 0) continue;
+    recordNotification(db, { ...input, userId: uid });
+  }
+}
+
+/** 해당 엔티티에 붙은 모든 미처리 알림을 dismiss — 이벤트가 해결됐을 때 호출. */
+function dismissEntityNotifications(
+  db: ReturnType<typeof getDb>,
+  entityTable: string,
+  entityId: number,
+) {
+  try {
+    db.prepare(
+      `UPDATE notifications
+          SET dismissed_at = datetime('now')
+        WHERE entity_table = ? AND entity_id = ? AND dismissed_at IS NULL`,
+    ).run(entityTable, entityId);
+  } catch (err) {
+    console.warn('[ipc] dismissEntityNotifications failed:', err);
+  }
+}
+
+/**
+ * Assignment state 변경 시 알림 대상 결정 + 발송.
+ * 새 state 에 따라 parser/qa1/qa_final 중 누구에게 알려야 하는지 고정 규칙.
+ *   - 1차QA대기        → qa1_id
+ *   - 최종QA대기       → qa_final_id
+ *   - 1차QA반려/수정요청 → parser_id
+ *   - 최종QA반려       → parser_id + qa1_id
+ *   - 승인완료         → parser_id (긍정 통지)
+ *   - 자료누락         → parser_id (블로커)
+ *   - 보류             → parser_id (저우선순위)
+ * 알림 발송 전, 해당 과제에 붙은 이전 단계의 미처리 알림들은 모두 dismiss 한다.
+ */
+function notifyAssignmentStateChange(
+  db: ReturnType<typeof getDb>,
+  assignmentId: number,
+  newState: string,
+  opts?: { comment?: string | null; stage?: string | null },
+): void {
+  try {
+    // 이전 단계에서 남은 미처리 알림은 걷어낸다 — 상태가 바뀌었으므로 더 이상 유효하지 않음.
+    dismissEntityNotifications(db, 'assignments', assignmentId);
+
+    const asn = db
+      .prepare(
+        `SELECT code, title, parser_id, qa1_id, qa_final_id
+           FROM assignments WHERE id = ?`,
+      )
+      .get(assignmentId) as
+      | {
+          code: string;
+          title: string;
+          parser_id: number | null;
+          qa1_id: number | null;
+          qa_final_id: number | null;
+        }
+      | undefined;
+    if (!asn) return;
+
+    const baseLink = `/operations?focus=${assignmentId}`;
+    const comment = opts?.comment?.trim();
+    const commentBody = comment ? ` · ${comment}` : '';
+    const defaultBody = `[${asn.code}] ${asn.title}${commentBody}`;
+
+    const send = (
+      userId: number | null,
+      kind: string,
+      title: string,
+      priority = 0,
+      body?: string,
+    ) => {
+      if (!userId) return;
+      recordNotification(db, {
+        userId,
+        category: 'assignment',
+        kind,
+        title,
+        body: body ?? defaultBody,
+        link: baseLink,
+        entityTable: 'assignments',
+        entityId: assignmentId,
+        dedupeKey: `assignment:${assignmentId}:${kind}`,
+        priority,
+      });
+    };
+
+    switch (newState) {
+      case '1차QA대기':
+        send(asn.qa1_id, 'assignment.qa1_ready', `1차 QA 요청: ${asn.title}`, 1);
+        break;
+      case '최종QA대기':
+        send(asn.qa_final_id, 'assignment.final_ready', `최종 QA 요청: ${asn.title}`, 1);
+        break;
+      case '1차QA반려':
+        send(asn.parser_id, 'assignment.qa1_rejected', `1차 QA 반려: ${asn.title}`, 1);
+        break;
+      case '최종QA반려':
+        send(asn.parser_id, 'assignment.final_rejected', `최종 QA 반려: ${asn.title}`, 1);
+        send(
+          asn.qa1_id,
+          'assignment.final_rejected_qa1',
+          `최종 QA 반려 (1차 검토분): ${asn.title}`,
+          0,
+        );
+        break;
+      case '수정요청':
+        send(
+          asn.parser_id,
+          'assignment.revision_requested',
+          `수정 요청: ${asn.title}`,
+          1,
+        );
+        break;
+      case '자료누락':
+        send(asn.parser_id, 'assignment.data_missing', `자료 누락: ${asn.title}`, 1);
+        break;
+      case '승인완료':
+        send(asn.parser_id, 'assignment.approved', `승인 완료: ${asn.title}`, 0);
+        break;
+      case '보류':
+        send(asn.parser_id, 'assignment.held', `보류됨: ${asn.title}`, -1);
+        break;
+      default:
+        break;
+    }
+  } catch (err) {
+    console.warn('[ipc] notifyAssignmentStateChange failed:', err);
+  }
+}
+
 function recordDeletion(
   db: ReturnType<typeof getDb>,
   table: string,
@@ -5725,4 +6118,218 @@ function normalizeRestoreValue(v: unknown): unknown {
   if (typeof v === 'string' || typeof v === 'number') return v;
   if (typeof v === 'boolean') return v ? 1 : 0;
   return JSON.stringify(v);
+}
+
+// ===========================================================================
+// Notifications IPC (v0.1.16)
+// ===========================================================================
+function registerNotificationsIpc() {
+  interface NotificationRow {
+    id: number;
+    user_id: number;
+    category: string;
+    kind: string;
+    title: string;
+    body: string | null;
+    link: string | null;
+    entity_table: string | null;
+    entity_id: number | null;
+    priority: number;
+    payload_json: string | null;
+    read_at: string | null;
+    snooze_until: string | null;
+    dismissed_at: string | null;
+    created_at: string;
+  }
+
+  function mapRow(row: NotificationRow) {
+    let payload: Record<string, unknown> | null = null;
+    if (row.payload_json) {
+      try {
+        payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      } catch {
+        payload = null;
+      }
+    }
+    return {
+      id: row.id,
+      userId: row.user_id,
+      category: row.category,
+      kind: row.kind,
+      title: row.title,
+      body: row.body,
+      link: row.link,
+      entityTable: row.entity_table,
+      entityId: row.entity_id,
+      priority: row.priority,
+      payload,
+      readAt: row.read_at,
+      snoozeUntil: row.snooze_until,
+      dismissedAt: row.dismissed_at,
+      createdAt: row.created_at,
+    };
+  }
+
+  // ------------------------------------------------------------------ list
+  ipcMain.handle(
+    'notifications:list',
+    (
+      event,
+      payload?: {
+        userId?: number;
+        status?: 'unread' | 'read' | 'dismissed' | 'all';
+        category?: string | null;
+        limit?: number;
+      },
+    ) => {
+      const actor = requireActor(event);
+      const db = getDb();
+      const userId = payload?.userId ?? actor.userId;
+      // 본인이 아닌 다른 사람 알림은 opsAdmin 만 조회 가능.
+      if (userId !== actor.userId) {
+        requireRole(event, ROLE_SETS.opsAdmin);
+      }
+      const status = payload?.status ?? 'all';
+      const limit = Math.max(1, Math.min(500, payload?.limit ?? 100));
+
+      const where: string[] = ['user_id = ?'];
+      const params: unknown[] = [userId];
+
+      // 스누즈 중인 알림은 스누즈 해제 전까지 드로워에서 숨긴다.
+      where.push(`(snooze_until IS NULL OR snooze_until <= datetime('now'))`);
+
+      if (status === 'unread') {
+        where.push('read_at IS NULL');
+        where.push('dismissed_at IS NULL');
+      } else if (status === 'read') {
+        where.push('read_at IS NOT NULL');
+        where.push('dismissed_at IS NULL');
+      } else if (status === 'dismissed') {
+        where.push('dismissed_at IS NOT NULL');
+      } else {
+        // 'all' 에서도 기본적으로 처리완료(dismissed) 는 제외 — 필요 시 filter 로
+        // 'dismissed' 따로 조회.
+        where.push('dismissed_at IS NULL');
+      }
+
+      if (payload?.category && payload.category !== 'all') {
+        where.push('category = ?');
+        params.push(payload.category);
+      }
+
+      params.push(limit);
+
+      const rows = db
+        .prepare(
+          `SELECT * FROM notifications
+            WHERE ${where.join(' AND ')}
+            ORDER BY priority DESC, created_at DESC
+            LIMIT ?`,
+        )
+        .all(...params) as NotificationRow[];
+
+      return rows.map(mapRow);
+    },
+  );
+
+  // ------------------------------------------------------------------ stats
+  ipcMain.handle('notifications:stats', (event, payload?: { userId?: number }) => {
+    const actor = requireActor(event);
+    const db = getDb();
+    const userId = payload?.userId ?? actor.userId;
+    if (userId !== actor.userId) requireRole(event, ROLE_SETS.opsAdmin);
+
+    const byCategory = db
+      .prepare(
+        `SELECT category, COUNT(*) AS count
+           FROM notifications
+          WHERE user_id = ?
+            AND dismissed_at IS NULL
+            AND read_at IS NULL
+            AND (snooze_until IS NULL OR snooze_until <= datetime('now'))
+          GROUP BY category`,
+      )
+      .all(userId) as Array<{ category: string; count: number }>;
+
+    const total = byCategory.reduce((acc, r) => acc + r.count, 0);
+    return { total, byCategory };
+  });
+
+  // ------------------------------------------------------------------ markRead
+  ipcMain.handle(
+    'notifications:markRead',
+    (event, payload: { ids?: number[]; all?: boolean; category?: string }) => {
+      const actor = requireActor(event);
+      const db = getDb();
+      if (payload?.all) {
+        const info =
+          payload.category && payload.category !== 'all'
+            ? db
+                .prepare(
+                  `UPDATE notifications
+                      SET read_at = datetime('now')
+                    WHERE user_id = ? AND category = ?
+                      AND read_at IS NULL AND dismissed_at IS NULL`,
+                )
+                .run(actor.userId, payload.category)
+            : db
+                .prepare(
+                  `UPDATE notifications
+                      SET read_at = datetime('now')
+                    WHERE user_id = ? AND read_at IS NULL AND dismissed_at IS NULL`,
+                )
+                .run(actor.userId);
+        return { ok: true as const, updated: info.changes };
+      }
+      const ids = Array.isArray(payload?.ids) ? payload.ids.filter((n) => Number.isInteger(n)) : [];
+      if (ids.length === 0) return { ok: true as const, updated: 0 };
+      const placeholders = ids.map(() => '?').join(',');
+      const info = db
+        .prepare(
+          `UPDATE notifications
+              SET read_at = datetime('now')
+            WHERE user_id = ? AND id IN (${placeholders}) AND read_at IS NULL`,
+        )
+        .run(actor.userId, ...ids);
+      return { ok: true as const, updated: info.changes };
+    },
+  );
+
+  // ------------------------------------------------------------------ dismiss
+  ipcMain.handle('notifications:dismiss', (event, payload: { ids: number[] }) => {
+    const actor = requireActor(event);
+    const db = getDb();
+    const ids = Array.isArray(payload?.ids) ? payload.ids.filter((n) => Number.isInteger(n)) : [];
+    if (ids.length === 0) return { ok: true as const, updated: 0 };
+    const placeholders = ids.map(() => '?').join(',');
+    const info = db
+      .prepare(
+        `UPDATE notifications
+            SET dismissed_at = datetime('now'),
+                read_at = COALESCE(read_at, datetime('now'))
+          WHERE user_id = ? AND id IN (${placeholders})`,
+      )
+      .run(actor.userId, ...ids);
+    return { ok: true as const, updated: info.changes };
+  });
+
+  // ------------------------------------------------------------------ snooze
+  ipcMain.handle(
+    'notifications:snooze',
+    (event, payload: { ids: number[]; until: string | null }) => {
+      const actor = requireActor(event);
+      const db = getDb();
+      const ids = Array.isArray(payload?.ids) ? payload.ids.filter((n) => Number.isInteger(n)) : [];
+      if (ids.length === 0) return { ok: true as const, updated: 0 };
+      const placeholders = ids.map(() => '?').join(',');
+      const info = db
+        .prepare(
+          `UPDATE notifications
+              SET snooze_until = ?
+            WHERE user_id = ? AND id IN (${placeholders})`,
+        )
+        .run(payload?.until ?? null, actor.userId, ...ids);
+      return { ok: true as const, updated: info.changes };
+    },
+  );
 }

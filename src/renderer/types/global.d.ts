@@ -988,6 +988,51 @@ interface EduOpsApi {
       { ok: true; purged: number } | { ok: false; error: string }
     >;
   };
+  notifications: {
+    list(filter?: {
+      userId?: number;
+      status?: 'unread' | 'all';
+      category?: string | null;
+      limit?: number;
+    }): Promise<
+      Array<{
+        id: number;
+        userId: number;
+        category: string;
+        kind: string;
+        title: string;
+        body: string | null;
+        link: string | null;
+        entityTable: string | null;
+        entityId: number | null;
+        dedupeKey: string | null;
+        priority: number;
+        payload: Record<string, unknown> | null;
+        createdAt: string;
+        readAt: string | null;
+        snoozeUntil: string | null;
+        dismissedAt: string | null;
+      }>
+    >;
+    stats(filter?: { userId?: number }): Promise<{
+      total: number;
+      byCategory: Array<{ category: string; count: number }>;
+    }>;
+    markRead(payload: {
+      userId?: number;
+      ids?: number[];
+      all?: boolean;
+      category?: string | null;
+    }): Promise<
+      { ok: true; updated: number } | { ok: false; error: string }
+    >;
+    dismiss(payload: { ids: number[] }): Promise<
+      { ok: true; updated: number } | { ok: false; error: string }
+    >;
+    snooze(payload: { ids: number[]; until: string }): Promise<
+      { ok: true; updated: number } | { ok: false; error: string }
+    >;
+  };
 }
 
 interface Window {

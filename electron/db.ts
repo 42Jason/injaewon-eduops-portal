@@ -40,8 +40,192 @@ function resolveSchemaPath(): string {
 
 function applySchema(db: Db) {
   const schema = fs.readFileSync(resolveSchemaPath(), 'utf8');
-  db.exec(schema);
+
+  // ──────────────────────────────────────────────────────────────────────
+  // v0.1.13 까지의 치명 버그:
+  //   schema.sql 에는 `CREATE INDEX … ON assignments(deleted_at)` 같이 구
+  //   DB에 없는 컬럼을 참조하는 문장이 섞여 있다. 기존 사용자가 가진 구
+  //   스키마에서는 `CREATE TABLE IF NOT EXISTS assignments(...)` 가 원본
+  //   테이블을 그대로 두기 때문에 `deleted_at` 컬럼이 생기지 않고, 이어서
+  //   실행되는 `CREATE INDEX` 가 `no such column: deleted_at` 로 전체 exec
+  //   를 날리면서 `openDb()` 가 실패하여 앱 구동이 막혔다.
+  //
+  // 해결 전략(double-pass):
+  //   1) 1차: schema 전체 실행을 **silently tolerate** 한다. INDEX 실패 등은
+  //      경고만 남기고 다음 단계로.
+  //   2) runMigrations — 누락된 컬럼을 ALTER ADD COLUMN 으로 보강.
+  //   3) 2차: schema 전체 재실행. 이 시점에는 컬럼이 모두 존재하므로 INDEX
+  //      도 정상 생성된다.
+  //   이렇게 하면 구 DB 도 자동 복구되고, 신규 DB 는 1차에서 바로 완성된다.
+  // ──────────────────────────────────────────────────────────────────────
+  try {
+    db.exec(schema);
+  } catch (err) {
+    console.warn(
+      '[db] 1차 schema 적용 중 일부 실패 — 마이그레이션 후 재시도:',
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // v0.1.16: schema_migrations 로그 테이블을 먼저 보장한다. 기존 imperative
+  // 마이그레이션(아래 runMigrations) 은 PRAGMA 스니핑으로 idempotent 하기
+  // 때문에 그대로 두고, 신규 마이그레이션만 runMigration(version, fn) 헬퍼로
+  // 버전 로그를 남기는 "혼합" 체계를 쓴다. baseline 마크는 이 함수 말미에서.
+  ensureMigrationsTable(db);
+
   runMigrations(db);
+
+  try {
+    db.exec(schema);
+  } catch (err) {
+    // 2차에서도 실패하면 진짜 문제. 이때는 상위로 전파해서 crash.log 에 박힌다.
+    console.error('[db] 2차 schema 적용 실패:', err);
+    throw err;
+  }
+
+  // schema.sql 을 source of truth 로 잠근 `001_baseline` 은 applySchema 가
+  // 무사히 2차까지 통과한 **바로 이 시점** 에 마크한다. 이러면 기존 DB 든
+  // 신규 DB 든 일관된 기준점에서 다음 마이그레이션이 시작된다.
+  markApplied(db, '001_baseline');
+
+  // v0.1.16 부터는 버전 로그 기반 마이그레이션을 여기 순서대로 등록한다.
+  runMigration(db, '002_notifications_v2', migration_002_notifications_v2);
+}
+
+// ---------------------------------------------------------------------------
+// 번호 기반 마이그레이션 인프라 (v0.1.16~)
+// ---------------------------------------------------------------------------
+
+interface MigrationRow {
+  version: string;
+  applied_at: string;
+}
+
+function ensureMigrationsTable(db: Db) {
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       version     TEXT    PRIMARY KEY,
+       applied_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+     )`,
+  );
+}
+
+function isApplied(db: Db, version: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 FROM schema_migrations WHERE version = ? LIMIT 1`)
+    .get(version) as { 1: number } | undefined;
+  return !!row;
+}
+
+function markApplied(db: Db, version: string) {
+  db.prepare(
+    `INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)`,
+  ).run(version);
+}
+
+/**
+ * 신규 마이그레이션 실행기.
+ *
+ * - 이미 적용되어 있으면 즉시 return — 멱등.
+ * - `fn` 실행 중 예외가 나면 해당 버전은 **마크하지 않는다** — 다음 실행에서
+ *   재시도.
+ * - 기존 imperative runMigrations() 블록은 그대로 두고, 앞으로 추가되는
+ *   변경만 이 헬퍼로 관리한다.
+ */
+function runMigration(db: Db, version: string, fn: (db: Db) => void) {
+  if (isApplied(db, version)) return;
+  try {
+    fn(db);
+    markApplied(db, version);
+    console.log(`[db] migration applied: ${version}`);
+  } catch (err) {
+    console.error(`[db] migration failed: ${version} —`, err);
+    // baseline 이후 마이그레이션 실패는 상위로 전파해 crash.log 에 박는다.
+    // 기존 runMigrations 처럼 silently skip 하면 개발자가 릴리스 뒤에야
+    // 발견하는 v0.1.11-14 재현이 된다.
+    throw err;
+  }
+}
+
+/**
+ * 감사용: 지금까지 적용된 마이그레이션 목록. 진단 IPC 나 릴리스 페이지에서
+ * 사용할 수 있다.
+ */
+export function listAppliedMigrations(db: Db): MigrationRow[] {
+  ensureMigrationsTable(db);
+  return db
+    .prepare(`SELECT version, applied_at FROM schema_migrations ORDER BY version`)
+    .all() as MigrationRow[];
+}
+
+// ---------------------------------------------------------------------------
+// 002_notifications_v2 — 알림 센터 확장
+// ---------------------------------------------------------------------------
+// 기존 notifications 테이블은 공지 뿌리기용으로 설계되어 있었고 (kind/title/
+// body/link/read_at) dedup·snooze·entity 참조·처리 상태가 없어 "진짜 알림함"
+// 으로는 쓸 수 없었다. 이 마이그레이션은 같은 테이블을 확장해서 기존 row 는
+// 그대로 보존하되 새 컬럼만 추가한다:
+//
+//   category         — 'approval' | 'assignment' | 'qa' | 'cs' | 'tuition'
+//                      | 'trash' | 'notice' | 'system' (기존 kind 와 별개의
+//                      의미론적 분류. UI 필터/아이콘에 사용)
+//   entity_table     — 연결된 엔티티 테이블명 (예: 'approvals')
+//   entity_id        — 엔티티 row id
+//   dedupe_key       — 동일 이벤트 중복 억제용 자연키.
+//                      partial unique (dismissed_at IS NULL, dedupe_key IS NOT NULL)
+//   priority         — 0=normal, 1=high, -1=low
+//   snooze_until     — 이 시각까지 드로워에서 숨김
+//   dismissed_at     — 처리 완료로 드로워에서 제거된 시각 (읽음과 별개)
+//   payload_json     — 추가 메타(예: 학원비 금액, 결재 단계)
+//
+// 기존 컬럼(kind/title/body/link/read_at) 은 유지 — TopBar 공지 흐름 하위호환.
+// 생산자 코드는 category 를 채우고 kind 도 병행 채우는 전환기 가짐.
+
+function migration_002_notifications_v2(db: Db) {
+  const cols = new Set(
+    (db.prepare(`PRAGMA table_info(notifications)`).all() as Array<{ name: string }>).map(
+      (r) => r.name,
+    ),
+  );
+  if (cols.size === 0) {
+    // 스키마 단계에서 CREATE 됐어야 함. 여기 왔다면 상위에서 잡혀야 한다.
+    throw new Error('notifications 테이블이 존재하지 않음 — schema.sql 적용 상태 이상');
+  }
+
+  const addIfMissing = (col: string, ddl: string) => {
+    if (!cols.has(col)) db.exec(`ALTER TABLE notifications ADD COLUMN ${ddl}`);
+  };
+  addIfMissing('category', `category TEXT NOT NULL DEFAULT 'notice'`);
+  addIfMissing('entity_table', `entity_table TEXT`);
+  addIfMissing('entity_id', `entity_id INTEGER`);
+  addIfMissing('dedupe_key', `dedupe_key TEXT`);
+  addIfMissing('priority', `priority INTEGER NOT NULL DEFAULT 0`);
+  addIfMissing('snooze_until', `snooze_until TEXT`);
+  addIfMissing('dismissed_at', `dismissed_at TEXT`);
+  addIfMissing('payload_json', `payload_json TEXT`);
+
+  // 읽지 않은·처리 안 된 알림을 빠르게 집계하기 위한 인덱스.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_notifications_user_active
+       ON notifications(user_id, dismissed_at, read_at, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_notifications_user_category
+       ON notifications(user_id, category, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_notifications_entity
+       ON notifications(entity_table, entity_id)`,
+  );
+
+  // dedup: "같은 사용자 + 같은 dedupe_key + 아직 처리 안 된" 알림이 2개 이상
+  // 생성되는 걸 DB 레벨에서 차단. dedupe_key 가 NULL 이면 제외 — 공지 같은
+  // 일반 알림은 중복 허용. NULL 인 row 를 인덱스에서 빼기 위해 partial.
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedupe_active
+       ON notifications(user_id, dedupe_key)
+       WHERE dedupe_key IS NOT NULL AND dismissed_at IS NULL`,
+  );
 }
 
 /**
@@ -491,6 +675,40 @@ function runMigrations(db: Db) {
     );
   } catch (err) {
     console.warn('[db] parsed_excel_uploads 생성 skipped:', err);
+  }
+
+  // --- deleted_records: 통합 휴지통 (v0.1.15) ------------------------------
+  // 모든 hard-DELETE 직전에 원본 row 를 JSON 으로 여기 남긴다. 복원은 JSON 을
+  // 다시 INSERT 하면 된다. 구 DB 에도 추가되도록 여기서 CREATE IF NOT EXISTS.
+  try {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS deleted_records (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         table_name    TEXT    NOT NULL,
+         row_id        INTEGER,
+         category      TEXT    NOT NULL DEFAULT 'other',
+         label         TEXT,
+         payload_json  TEXT    NOT NULL,
+         reason        TEXT,
+         deleted_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         deleted_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+         purged_at     TEXT
+       )`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_deleted_records_category
+         ON deleted_records(category, deleted_at DESC)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_deleted_records_table
+         ON deleted_records(table_name, deleted_at DESC)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_deleted_records_active
+         ON deleted_records(purged_at)`,
+    );
+  } catch (err) {
+    console.warn('[db] deleted_records 생성 skipped:', err);
   }
 }
 

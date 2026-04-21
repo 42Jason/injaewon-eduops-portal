@@ -319,17 +319,43 @@ CREATE TABLE IF NOT EXISTS documents (
 -- Notifications / activity / admin settings
 -- ---------------------------------------------------------------------------
 
+-- notifications (v0.1.16 확장: 알림 센터)
+--   * kind       — 레거시 자유 문자열 (공지 뿌리기용, 하위호환)
+--   * category   — 의미론적 분류 (UI 필터/아이콘). approval/assignment/qa/cs/
+--                  tuition/trash/notice/system
+--   * dedupe_key — "같은 사용자 + 같은 키 + 아직 dismissed 안 됨" 인 알림은
+--                  DB 레벨에서 중복 불허 (partial unique index)
+--   * priority   — 0=normal, 1=high, -1=low
+--   * snooze_until / dismissed_at — 3상태 (unread / read / dismissed) + 스누즈
+--   * entity_table / entity_id    — 바로 이동할 엔티티 역참조
 CREATE TABLE IF NOT EXISTS notifications (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  kind       TEXT    NOT NULL,
-  title      TEXT    NOT NULL,
-  body       TEXT,
-  link       TEXT,
-  read_at    TEXT,
-  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind          TEXT    NOT NULL,
+  category      TEXT    NOT NULL DEFAULT 'notice',
+  title         TEXT    NOT NULL,
+  body          TEXT,
+  link          TEXT,
+  entity_table  TEXT,
+  entity_id     INTEGER,
+  dedupe_key    TEXT,
+  priority      INTEGER NOT NULL DEFAULT 0,
+  payload_json  TEXT,
+  read_at       TEXT,
+  snooze_until  TEXT,
+  dismissed_at  TEXT,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_active
+  ON notifications(user_id, dismissed_at, read_at, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_category
+  ON notifications(user_id, category, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_entity
+  ON notifications(entity_table, entity_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedupe_active
+  ON notifications(user_id, dedupe_key)
+  WHERE dedupe_key IS NOT NULL AND dismissed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS activity_logs (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -704,3 +730,34 @@ CREATE INDEX IF NOT EXISTS idx_parsed_uploads_status   ON parsed_excel_uploads(s
 CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploader ON parsed_excel_uploads(uploader_user_id);
 CREATE INDEX IF NOT EXISTS idx_parsed_uploads_uploaded ON parsed_excel_uploads(uploaded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_parsed_uploads_student  ON parsed_excel_uploads(student_code);
+
+-- ===========================================================================
+-- deleted_records — 통합 휴지통 (tombstone log)
+-- ===========================================================================
+-- 모든 hard-DELETE 직전에 이 테이블에 원본 행을 JSON 으로 스냅샷한다.
+-- "복원" = payload_json 을 원본 테이블에 INSERT, "영구 삭제" = 이 행 제거.
+--
+-- table_name 별로 복원 가능한 항목이 다르므로 category 컬럼으로 UI 탭 분류:
+--   'operations' : assignments
+--   'students'   : students, student_grades, student_counseling_logs,
+--                  student_report_topics, student_archive_files
+--   'cs'         : cs_tickets
+--   'admin'      : recurring_subscriptions, corporate_card_transactions
+--   'knowledge'  : manual_pages, notices
+--   'org'        : work_logs, leave_requests, approvals, users
+--   'parsing'    : parsed_excel_uploads
+CREATE TABLE IF NOT EXISTS deleted_records (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name    TEXT    NOT NULL,
+  row_id        INTEGER,                                    -- 복원 후 새 id 와 비교용 (원본 id)
+  category      TEXT    NOT NULL DEFAULT 'other',
+  label         TEXT,                                        -- UI 에 보여줄 짧은 이름 (예: 과제 코드/학생명/업무일지 요약)
+  payload_json  TEXT    NOT NULL,                            -- 행 전체 JSON.stringify
+  reason        TEXT,                                         -- 삭제 사유(선택)
+  deleted_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  purged_at     TEXT                                          -- 복원/영구삭제 후 이 row 를 마킹하고 싶을 때
+);
+CREATE INDEX IF NOT EXISTS idx_deleted_records_category ON deleted_records(category, deleted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deleted_records_table    ON deleted_records(table_name, deleted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deleted_records_active   ON deleted_records(purged_at);
