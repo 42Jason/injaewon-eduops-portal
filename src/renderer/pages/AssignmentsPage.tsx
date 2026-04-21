@@ -1,14 +1,16 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   ClipboardList, Filter, Search, AlertTriangle, Check, X, RotateCcw,
   User as UserIcon, Clock, Sparkles, Info, FileText, Inbox,
+  Plus, Edit3, Trash2, CheckSquare, Square, Users as UsersIcon,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { useToast } from '@/stores/toast';
 import { getApi } from '@/hooks/useApi';
 import { MOCK_ASSIGNMENTS } from '@shared/mock/assignments';
 import type { AssignmentState, Risk } from '@shared/types/assignment';
+import { ASSIGNMENT_STATES } from '@shared/types/assignment';
 import {
   stateChipClass,
   riskChipClass,
@@ -22,6 +24,8 @@ import { useMutationWithToast } from '@/hooks/useMutationWithToast';
 import { useConfirm } from '@/components/ui/ConfirmDialog';
 import { LoadingPanel, Spinner } from '@/components/ui/Spinner';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { Modal } from '@/components/ui/Modal';
+import { FormField, SelectInput, TextInput, Textarea } from '@/components/ui/FormField';
 
 /** The shape we actually render — union of DB row and mock. */
 interface AssignmentRow {
@@ -140,6 +144,15 @@ export function AssignmentsPage() {
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
 
+  // --- CRUD + bulk state ---------------------------------------------------
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(() => new Set());
+  const [bulkMenu, setBulkMenu] = useState<'state' | 'assign' | null>(null);
+
+  // 권한: 리더십(CEO/CTO/OPS_MANAGER)만 CRUD/일괄작업 사용
+  const canManage = Boolean(user?.perms.isLeadership);
+
   // --- queries -------------------------------------------------------------
   const listQuery = useQuery({
     queryKey: ['assignments.list', stateFilter, mineOnly ? user?.id : null],
@@ -246,6 +259,137 @@ export function AssignmentsPage() {
     setStateMut.mutate({ state: next });
   }
 
+  // --- single delete + bulk mutations -------------------------------------
+  const deleteMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    { id: number }
+  >({
+    mutationFn: (payload) =>
+      api!.assignments.softDelete({ id: payload.id, actorId: user!.id }),
+    successMessage: '과제를 삭제(보관)했습니다',
+    errorMessage: '과제 삭제에 실패했습니다',
+    invalidates: [['assignments.list'], ['home.stats'], ['board.list'], ['board.summary']],
+    onSuccess: () => {
+      setSelectedId(null);
+    },
+  });
+
+  const bulkStateMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    { ids: number[]; state: AssignmentState }
+  >({
+    mutationFn: (p) =>
+      api!.assignments.bulkSetState({ ids: p.ids, state: p.state, actorId: user!.id }),
+    successMessage: false,
+    errorMessage: '일괄 상태 변경에 실패했습니다',
+    invalidates: [['assignments.list'], ['home.stats'], ['board.list'], ['board.summary']],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건을 "${vars.state}" 상태로 변경했습니다`);
+        setCheckedIds(new Set());
+        setBulkMenu(null);
+      }
+    },
+  });
+
+  const bulkAssignMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    {
+      ids: number[];
+      parserId?: number | null;
+      qa1Id?: number | null;
+      qaFinalId?: number | null;
+    }
+  >({
+    mutationFn: (p) =>
+      api!.assignments.bulkAssign({
+        ids: p.ids,
+        parserId: p.parserId,
+        qa1Id: p.qa1Id,
+        qaFinalId: p.qaFinalId,
+        actorId: user!.id,
+      }),
+    successMessage: false,
+    errorMessage: '일괄 담당자 지정에 실패했습니다',
+    invalidates: [['assignments.list'], ['board.list']],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건 담당자를 업데이트했습니다`);
+        setCheckedIds(new Set());
+        setBulkMenu(null);
+      }
+    },
+  });
+
+  const bulkDeleteMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    { ids: number[] }
+  >({
+    mutationFn: (p) => api!.assignments.bulkDelete({ ids: p.ids, actorId: user!.id }),
+    successMessage: false,
+    errorMessage: '일괄 삭제에 실패했습니다',
+    invalidates: [['assignments.list'], ['home.stats'], ['board.list'], ['board.summary']],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건을 삭제(보관)했습니다`);
+        setCheckedIds(new Set());
+        setSelectedId(null);
+      }
+    },
+  });
+
+  async function handleDeleteOne() {
+    if (!selected || !live || !user) return;
+    const ok = await confirm({
+      title: '이 과제를 삭제할까요?',
+      description: `"${rowTitle(selected)}" (${selected.code}) 을(를) 소프트 삭제합니다. 목록에서는 보이지 않지만 DB에는 남아있어 복구가 가능합니다.`,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    deleteMut.mutate({ id: selected.id });
+  }
+
+  async function handleBulkDelete() {
+    if (checkedIds.size === 0 || !live || !user) return;
+    const ok = await confirm({
+      title: `${checkedIds.size}건의 과제를 일괄 삭제할까요?`,
+      description: '선택한 과제를 소프트 삭제합니다. DB에는 남아있어 복구가 가능합니다.',
+      confirmLabel: '일괄 삭제',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    bulkDeleteMut.mutate({ ids: Array.from(checkedIds) });
+  }
+
+  // --- selection helpers --------------------------------------------------
+  function toggleCheck(id: number) {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleCheckAll(ids: number[]) {
+    setCheckedIds((prev) => {
+      const allSelected = ids.length > 0 && ids.every((id) => prev.has(id));
+      if (allSelected) {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      }
+      const next = new Set(prev);
+      ids.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
   // --- derived: counts for filter pills ------------------------------------
   const counts = useMemo(() => {
     const byState = new Map<AssignmentState, number>();
@@ -275,6 +419,15 @@ export function AssignmentsPage() {
           </span>
         </div>
         <div className="flex items-center gap-2 text-xs">
+          {canManage && live && (
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              className="btn-primary inline-flex items-center gap-1 text-xs"
+            >
+              <Plus size={12} /> 과제 추가
+            </button>
+          )}
           <span
             className={cn(
               'inline-flex items-center gap-1 rounded-full px-2 py-0.5',
@@ -288,6 +441,24 @@ export function AssignmentsPage() {
           </span>
         </div>
       </div>
+
+      {/* ---- bulk toolbar (appears when rows are checked) ---- */}
+      {canManage && live && checkedIds.size > 0 && (
+        <BulkToolbar
+          count={checkedIds.size}
+          bulkMenu={bulkMenu}
+          setBulkMenu={setBulkMenu}
+          onBulkState={(s) => bulkStateMut.mutate({ ids: Array.from(checkedIds), state: s })}
+          onBulkAssign={(assignments) =>
+            bulkAssignMut.mutate({ ids: Array.from(checkedIds), ...assignments })
+          }
+          onBulkDelete={handleBulkDelete}
+          onClear={() => setCheckedIds(new Set())}
+          pending={
+            bulkStateMut.isPending || bulkAssignMut.isPending || bulkDeleteMut.isPending
+          }
+        />
+      )}
 
       {/* ---- filter bar ---- */}
       <div className="card flex flex-wrap items-center gap-2 py-2">
@@ -377,7 +548,28 @@ export function AssignmentsPage() {
         {/* LEFT — list */}
         <div className="col-span-4 flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-bg-soft/30">
           <div className="flex items-center justify-between border-b border-border px-3 py-1.5 text-[11px] text-fg-subtle">
-            <span>과제 목록 ({filteredRows.length})</span>
+            <span className="flex items-center gap-2">
+              {canManage && live && filteredRows.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => toggleCheckAll(filteredRows.map((r) => r.id))}
+                  aria-label="전체 선택 토글"
+                  className="inline-flex items-center text-fg-muted hover:text-fg"
+                >
+                  {filteredRows.every((r) => checkedIds.has(r.id)) ? (
+                    <CheckSquare size={12} className="text-accent" />
+                  ) : (
+                    <Square size={12} />
+                  )}
+                </button>
+              )}
+              <span>과제 목록 ({filteredRows.length})</span>
+              {checkedIds.size > 0 && (
+                <span className="rounded-full bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
+                  선택 {checkedIds.size}
+                </span>
+              )}
+            </span>
             {listQuery.isFetching && (
               <span className="inline-flex items-center gap-1" aria-live="polite">
                 <Spinner size={10} /> 불러오는 중…
@@ -423,46 +615,71 @@ export function AssignmentsPage() {
               filteredRows.map((r) => {
                 const due = formatDueLabel(rowDue(r));
                 const isSel = selected?.id === r.id;
+                const isChecked = checkedIds.has(r.id);
                 return (
-                  <button
+                  <div
                     key={r.id}
-                    type="button"
-                    onClick={() => setSelectedId(r.id)}
-                    aria-pressed={isSel}
                     className={cn(
-                      'w-full text-left px-3 py-2.5 hover:bg-bg-soft/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                      'flex items-stretch hover:bg-bg-soft/60 transition-colors',
                       isSel && 'bg-accent/10 border-l-2 border-l-accent',
                     )}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="font-mono text-[10px] text-fg-subtle shrink-0">{r.code}</span>
-                        <span className={cn('inline-flex shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight', stateChipClass(r.state))}>
-                          {r.state}
+                    {canManage && live && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleCheck(r.id);
+                        }}
+                        aria-label={isChecked ? '선택 해제' : '선택'}
+                        aria-pressed={isChecked}
+                        className="px-2 flex items-center justify-center text-fg-muted hover:text-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        {isChecked ? (
+                          <CheckSquare size={14} className="text-accent" />
+                        ) : (
+                          <Square size={14} />
+                        )}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setSelectedId(r.id)}
+                      aria-pressed={isSel}
+                      className={cn(
+                        'flex-1 text-left px-3 py-2.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-mono text-[10px] text-fg-subtle shrink-0">{r.code}</span>
+                          <span className={cn('inline-flex shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight', stateChipClass(r.state))}>
+                            {r.state}
+                          </span>
+                        </div>
+                        <span
+                          className={cn(
+                            'shrink-0 text-[10px]',
+                            due.tone === 'danger'  && 'text-rose-300',
+                            due.tone === 'warning' && 'text-amber-300',
+                            due.tone === 'ok'      && 'text-fg-muted',
+                            due.tone === 'muted'   && 'text-fg-subtle',
+                          )}
+                        >
+                          {due.label}
                         </span>
                       </div>
-                      <span
-                        className={cn(
-                          'shrink-0 text-[10px]',
-                          due.tone === 'danger'  && 'text-rose-300',
-                          due.tone === 'warning' && 'text-amber-300',
-                          due.tone === 'ok'      && 'text-fg-muted',
-                          due.tone === 'muted'   && 'text-fg-subtle',
-                        )}
-                      >
-                        {due.label}
-                      </span>
-                    </div>
-                    <div className="mt-1 line-clamp-1 text-xs font-medium text-fg">{rowTitle(r)}</div>
-                    <div className="mt-0.5 flex items-center gap-2 text-[10px] text-fg-subtle">
-                      <span>{r.subject}</span>
-                      {r.publisher && <span>· {r.publisher}</span>}
-                      <span>· {rowStudent(r)}</span>
-                      <span className={cn('ml-auto rounded px-1 py-0.5', riskChipClass(r.risk))}>
-                        {riskLabel(r.risk)}
-                      </span>
-                    </div>
-                  </button>
+                      <div className="mt-1 line-clamp-1 text-xs font-medium text-fg">{rowTitle(r)}</div>
+                      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-fg-subtle">
+                        <span>{r.subject}</span>
+                        {r.publisher && <span>· {r.publisher}</span>}
+                        <span>· {rowStudent(r)}</span>
+                        <span className={cn('ml-auto rounded px-1 py-0.5', riskChipClass(r.risk))}>
+                          {riskLabel(r.risk)}
+                        </span>
+                      </div>
+                    </button>
+                  </div>
                 );
               })
             )}
@@ -481,10 +698,33 @@ export function AssignmentsPage() {
           ) : (
             <>
               <div className="border-b border-border px-4 py-3">
-                <div className="flex items-center gap-2 text-[11px] text-fg-subtle">
-                  <span className="font-mono">{selected.code}</span>
-                  <span className={cn('rounded px-1.5 py-0.5', stateChipClass(selected.state))}>{selected.state}</span>
-                  <span className={cn('rounded px-1.5 py-0.5', riskChipClass(selected.risk))}>{riskLabel(selected.risk)}</span>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-[11px] text-fg-subtle min-w-0">
+                    <span className="font-mono">{selected.code}</span>
+                    <span className={cn('rounded px-1.5 py-0.5', stateChipClass(selected.state))}>{selected.state}</span>
+                    <span className={cn('rounded px-1.5 py-0.5', riskChipClass(selected.risk))}>{riskLabel(selected.risk)}</span>
+                  </div>
+                  {canManage && live && (
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setEditing(true)}
+                        className="btn-outline inline-flex items-center gap-1 text-[11px] px-2 py-1"
+                        aria-label="과제 수정"
+                      >
+                        <Edit3 size={11} /> 수정
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDeleteOne}
+                        disabled={deleteMut.isPending}
+                        className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 text-[11px] px-2 py-1 disabled:opacity-50"
+                        aria-label="과제 삭제"
+                      >
+                        <Trash2 size={11} /> 삭제
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <h3 className="mt-1 text-[15px] font-semibold text-fg">{rowTitle(selected)}</h3>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-fg-muted">
@@ -647,6 +887,27 @@ export function AssignmentsPage() {
           )}
         </div>
       </div>
+
+      {/* ---- Create / Edit modals ---- */}
+      {canManage && live && user && (
+        <>
+          <AssignmentEditModal
+            open={creating}
+            mode="create"
+            initial={null}
+            currentUserId={user.id}
+            onClose={() => setCreating(false)}
+            onCreated={(id) => setSelectedId(id)}
+          />
+          <AssignmentEditModal
+            open={editing && !!selected}
+            mode="edit"
+            initial={selected ?? null}
+            currentUserId={user.id}
+            onClose={() => setEditing(false)}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -827,5 +1088,695 @@ function ActionButtons({
         );
       })}
     </div>
+  );
+}
+
+// =============================================================================
+// Bulk toolbar (appears when rows are checked)
+// =============================================================================
+
+interface UserOption {
+  id: number;
+  name: string;
+  role: string;
+}
+
+export function BulkToolbar({
+  count,
+  bulkMenu,
+  setBulkMenu,
+  onBulkState,
+  onBulkAssign,
+  onBulkDelete,
+  onClear,
+  pending,
+}: {
+  count: number;
+  bulkMenu: 'state' | 'assign' | null;
+  setBulkMenu: (m: 'state' | 'assign' | null) => void;
+  onBulkState: (state: AssignmentState) => void;
+  onBulkAssign: (a: {
+    parserId?: number | null;
+    qa1Id?: number | null;
+    qaFinalId?: number | null;
+  }) => void;
+  onBulkDelete: () => void;
+  onClear: () => void;
+  pending: boolean;
+}) {
+  const api = getApi();
+  const usersQuery = useQuery({
+    queryKey: ['users.list'],
+    queryFn: () => api!.users.list() as unknown as Promise<UserOption[]>,
+    enabled: !!api && bulkMenu === 'assign',
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const [parserId, setParserId] = useState<number | ''>('');
+  const [qa1Id, setQa1Id] = useState<number | ''>('');
+  const [qaFinalId, setQaFinalId] = useState<number | ''>('');
+
+  useEffect(() => {
+    if (bulkMenu !== 'assign') {
+      setParserId('');
+      setQa1Id('');
+      setQaFinalId('');
+    }
+  }, [bulkMenu]);
+
+  return (
+    <div className="card flex flex-wrap items-center gap-2 px-3 py-2">
+      <span className="text-xs font-medium text-fg">
+        선택 <span className="text-accent tabular-nums">{count}</span> 건
+      </span>
+      <div className="mx-1 h-4 w-px bg-border" />
+
+      {/* --- state menu --- */}
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setBulkMenu(bulkMenu === 'state' ? null : 'state')}
+          disabled={pending}
+          className="btn-outline text-xs inline-flex items-center gap-1"
+          aria-expanded={bulkMenu === 'state'}
+        >
+          <RotateCcw size={11} /> 일괄 상태 변경
+        </button>
+        {bulkMenu === 'state' && (
+          <div
+            className="absolute z-20 mt-1 max-h-64 w-44 overflow-y-auto rounded-md border border-border bg-bg shadow-lg"
+            role="menu"
+          >
+            {ASSIGNMENT_STATES.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => onBulkState(s)}
+                disabled={pending}
+                className={cn(
+                  'block w-full px-3 py-1.5 text-left text-[11px] hover:bg-bg-soft',
+                )}
+                role="menuitem"
+              >
+                <span className={cn('rounded px-1.5 py-0.5 mr-1.5', stateChipClass(s))}>
+                  {s}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* --- assign menu --- */}
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setBulkMenu(bulkMenu === 'assign' ? null : 'assign')}
+          disabled={pending}
+          className="btn-outline text-xs inline-flex items-center gap-1"
+          aria-expanded={bulkMenu === 'assign'}
+        >
+          <UsersIcon size={11} /> 일괄 담당자 지정
+        </button>
+        {bulkMenu === 'assign' && (
+          <div className="absolute z-20 mt-1 w-80 rounded-md border border-border bg-bg p-3 shadow-lg">
+            <div className="space-y-2 text-[11px]">
+              <AssignSelect
+                label="파싱 담당"
+                value={parserId}
+                onChange={setParserId}
+                users={usersQuery.data ?? []}
+              />
+              <AssignSelect
+                label="1차 QA"
+                value={qa1Id}
+                onChange={setQa1Id}
+                users={usersQuery.data ?? []}
+              />
+              <AssignSelect
+                label="최종 QA"
+                value={qaFinalId}
+                onChange={setQaFinalId}
+                users={usersQuery.data ?? []}
+              />
+              <div className="text-[10px] text-fg-subtle">
+                비워두면 해당 역할은 변경하지 않습니다. "미배정"을 선택하면 해당 역할을 비웁니다.
+              </div>
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setBulkMenu(null)}
+                  className="btn-ghost text-[11px]"
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // -1 sentinel → null (unassign), '' → undefined (no change)
+                    const norm = (v: number | '') =>
+                      v === '' ? undefined : v === -1 ? null : v;
+                    onBulkAssign({
+                      parserId: norm(parserId),
+                      qa1Id: norm(qa1Id),
+                      qaFinalId: norm(qaFinalId),
+                    });
+                  }}
+                  disabled={
+                    pending ||
+                    (parserId === '' && qa1Id === '' && qaFinalId === '')
+                  }
+                  className="btn-primary text-[11px]"
+                >
+                  적용
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* --- bulk delete --- */}
+      <button
+        type="button"
+        onClick={onBulkDelete}
+        disabled={pending}
+        className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-300 hover:bg-rose-500/20 disabled:opacity-50"
+      >
+        <Trash2 size={11} /> 일괄 삭제
+      </button>
+
+      <button
+        type="button"
+        onClick={onClear}
+        className="ml-auto text-[11px] text-fg-subtle hover:text-fg underline underline-offset-2"
+      >
+        선택 해제
+      </button>
+    </div>
+  );
+}
+
+function AssignSelect({
+  label,
+  value,
+  onChange,
+  users,
+}: {
+  label: string;
+  value: number | '';
+  onChange: (v: number | '') => void;
+  users: UserOption[];
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <label className="w-16 shrink-0 text-fg-muted">{label}</label>
+      <select
+        value={value === '' ? '' : value}
+        onChange={(e) => {
+          const v = e.target.value;
+          onChange(v === '' ? '' : Number(v));
+        }}
+        className="input flex-1 h-7 text-[11px]"
+      >
+        <option value="">변경하지 않음</option>
+        <option value="-1">(미배정으로 비우기)</option>
+        {users.map((u) => (
+          <option key={u.id} value={u.id}>
+            {u.name} · {u.role}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// =============================================================================
+// Assignment create / edit modal
+// =============================================================================
+
+interface StudentOption {
+  id: number;
+  name: string;
+  student_code: string;
+  grade?: string | null;
+}
+
+/** Shared initial-row shape for the edit modal (accepts both snake + camel fields). */
+export type AssignmentEditInitial = AssignmentRow;
+
+export function AssignmentEditModal({
+  open,
+  mode,
+  initial,
+  currentUserId,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  mode: 'create' | 'edit';
+  initial: AssignmentEditInitial | null;
+  currentUserId: number;
+  onClose: () => void;
+  onCreated?: (id: number) => void;
+}) {
+  const api = getApi()!;
+  const isEditing = mode === 'edit' && !!initial;
+
+  const [subject, setSubject] = useState('');
+  const [title, setTitle] = useState('');
+  const [publisher, setPublisher] = useState('');
+  const [studentCode, setStudentCode] = useState('');
+  const [studentId, setStudentId] = useState<number | ''>('');
+  const [scope, setScope] = useState('');
+  const [lengthReq, setLengthReq] = useState('');
+  const [outline, setOutline] = useState('');
+  const [rubric, setRubric] = useState('');
+  const [teacherReq, setTeacherReq] = useState('');
+  const [studentReq, setStudentReq] = useState('');
+  const [state, setState] = useState<AssignmentState>('신규접수');
+  const [risk, setRisk] = useState<Risk>('medium');
+  const [parserId, setParserId] = useState<number | ''>('');
+  const [qa1Id, setQa1Id] = useState<number | ''>('');
+  const [qaFinalId, setQaFinalId] = useState<number | ''>('');
+  const [dueAt, setDueAt] = useState('');
+  const [touched, setTouched] = useState(false);
+
+  const usersQuery = useQuery({
+    queryKey: ['users.list'],
+    queryFn: () => api.users.list() as unknown as Promise<UserOption[]>,
+    enabled: open,
+    staleTime: 5 * 60 * 1000,
+  });
+  const studentsQuery = useQuery({
+    queryKey: ['students.list', 'modal'],
+    queryFn: () => api.students.list({ limit: 500 }) as unknown as Promise<StudentOption[]>,
+    enabled: open,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    if (isEditing && initial) {
+      setSubject(initial.subject ?? '');
+      setTitle(rowTitle(initial) === '-' ? '' : rowTitle(initial));
+      setPublisher(initial.publisher ?? '');
+      setStudentCode(rowStudent(initial) === '-' ? '' : rowStudent(initial));
+      setStudentId('');
+      setScope(rowScope(initial) ?? '');
+      setLengthReq(
+        (pick<string>(initial, 'lengthRequirement', 'length_requirement') as string) ?? '',
+      );
+      setOutline(initial.outline ?? '');
+      setRubric(initial.rubric ?? '');
+      setTeacherReq(
+        (pick<string>(initial, 'teacherRequirements', 'teacher_requirements') as string) ?? '',
+      );
+      setStudentReq(
+        (pick<string>(initial, 'studentRequests', 'student_requests') as string) ?? '',
+      );
+      setState(initial.state);
+      setRisk(initial.risk);
+      setParserId(
+        (pick<number>(initial, 'parserId', 'parser_id') as number | undefined) ?? '',
+      );
+      setQa1Id((pick<number>(initial, 'qa1Id', 'qa1_id') as number | undefined) ?? '');
+      setQaFinalId(
+        (pick<number>(initial, 'qaFinalId', 'qa_final_id') as number | undefined) ?? '',
+      );
+      const due = rowDue(initial);
+      setDueAt(due ? due.slice(0, 10) : '');
+    } else {
+      setSubject('');
+      setTitle('');
+      setPublisher('');
+      setStudentCode('');
+      setStudentId('');
+      setScope('');
+      setLengthReq('');
+      setOutline('');
+      setRubric('');
+      setTeacherReq('');
+      setStudentReq('');
+      setState('신규접수');
+      setRisk('medium');
+      setParserId('');
+      setQa1Id('');
+      setQaFinalId('');
+      setDueAt('');
+    }
+    setTouched(false);
+  }, [open, isEditing, initial]);
+
+  const subjectErr = touched && !subject.trim() ? '과목은 필수입니다' : null;
+  const titleErr = touched && !title.trim() ? '제목은 필수입니다' : null;
+
+  const createMut = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.assignments.create>[0]) =>
+      api.assignments.create(payload),
+    successMessage: '과제를 추가했습니다',
+    errorMessage: '과제 추가에 실패했습니다',
+    invalidates: [
+      ['assignments.list'],
+      ['home.stats'],
+      ['board.list'],
+      ['board.summary'],
+    ],
+    onSuccess: (res) => {
+      if (res?.ok && typeof res.id === 'number' && onCreated) {
+        onCreated(res.id);
+      }
+      onClose();
+    },
+  });
+
+  const updateMut = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.assignments.update>[0]) =>
+      api.assignments.update(payload),
+    successMessage: '과제 정보를 수정했습니다',
+    errorMessage: '과제 수정에 실패했습니다',
+    invalidates: [
+      ['assignments.list'],
+      ['assignments.reviews', initial?.id],
+      ['home.stats'],
+      ['board.list'],
+    ],
+    onSuccess: () => onClose(),
+  });
+
+  function numOrUndef(v: number | ''): number | undefined {
+    return v === '' ? undefined : v;
+  }
+
+  function submit() {
+    setTouched(true);
+    if (!subject.trim() || !title.trim()) return;
+
+    const dueIso = dueAt.trim() ? new Date(`${dueAt}T23:59:59`).toISOString() : null;
+
+    if (isEditing && initial) {
+      updateMut.mutate({
+        id: initial.id,
+        actorId: currentUserId,
+        subject: subject.trim(),
+        title: title.trim(),
+        publisher: publisher.trim() || null,
+        studentId: studentId === '' ? null : studentId,
+        studentCode: studentCode.trim() || null,
+        scope: scope.trim() || null,
+        lengthReq: lengthReq.trim() || null,
+        outline: outline.trim() || null,
+        rubric: rubric.trim() || null,
+        teacherReq: teacherReq.trim() || null,
+        studentReq: studentReq.trim() || null,
+        state,
+        risk,
+        parserId: parserId === '' ? null : parserId,
+        qa1Id: qa1Id === '' ? null : qa1Id,
+        qaFinalId: qaFinalId === '' ? null : qaFinalId,
+        dueAt: dueIso,
+      });
+    } else {
+      createMut.mutate({
+        actorId: currentUserId,
+        subject: subject.trim(),
+        title: title.trim(),
+        studentId: studentId === '' ? null : studentId,
+        studentCode: studentCode.trim() || null,
+        publisher: publisher.trim() || null,
+        scope: scope.trim() || null,
+        lengthReq: lengthReq.trim() || null,
+        outline: outline.trim() || null,
+        rubric: rubric.trim() || null,
+        teacherReq: teacherReq.trim() || null,
+        studentReq: studentReq.trim() || null,
+        state,
+        risk,
+        parserId: numOrUndef(parserId) ?? null,
+        qa1Id: numOrUndef(qa1Id) ?? null,
+        qaFinalId: numOrUndef(qaFinalId) ?? null,
+        dueAt: dueIso,
+      });
+    }
+  }
+
+  const saving = createMut.isPending || updateMut.isPending;
+  const users = usersQuery.data ?? [];
+  const students = studentsQuery.data ?? [];
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={isEditing ? '과제 수정' : '새 과제 추가'}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+            취소
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            onClick={submit}
+            disabled={saving}
+          >
+            {saving ? '저장 중…' : '저장'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <FormField label="과목" required error={subjectErr}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              placeholder="예: 국어"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="출판사">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={publisher}
+              onChange={(e) => setPublisher(e.target.value)}
+              placeholder="예: 천재교육"
+              maxLength={80}
+            />
+          )}
+        </FormField>
+        <FormField label="수행평가명" required error={titleErr} className="md:col-span-2">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="예: 1학기 중간 수행평가 - 독후감"
+              maxLength={200}
+            />
+          )}
+        </FormField>
+        <FormField label="학생 (DB)">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={studentId === '' ? '' : studentId}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === '') {
+                  setStudentId('');
+                } else {
+                  const id = Number(v);
+                  setStudentId(id);
+                  const s = students.find((x) => x.id === id);
+                  if (s) setStudentCode(s.student_code);
+                }
+              }}
+            >
+              <option value="">직접 코드 입력</option>
+              {students.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} · {s.student_code}
+                  {s.grade ? ` · ${s.grade}` : ''}
+                </option>
+              ))}
+            </SelectInput>
+          )}
+        </FormField>
+        <FormField label="학생 코드 (수동)">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={studentCode}
+              onChange={(e) => setStudentCode(e.target.value)}
+              placeholder="예: M-2510091530-ABCD"
+              maxLength={60}
+            />
+          )}
+        </FormField>
+        <FormField label="수행 범위" className="md:col-span-2">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={scope}
+              onChange={(e) => setScope(e.target.value)}
+              placeholder="예: 1단원 ~ 3단원"
+              maxLength={200}
+            />
+          )}
+        </FormField>
+        <FormField label="분량 요구">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={lengthReq}
+              onChange={(e) => setLengthReq(e.target.value)}
+              placeholder="예: A4 2매 / 1500자"
+              maxLength={80}
+            />
+          )}
+        </FormField>
+        <FormField label="마감일">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              type="date"
+              value={dueAt}
+              onChange={(e) => setDueAt(e.target.value)}
+            />
+          )}
+        </FormField>
+        <FormField label="개요" className="md:col-span-2">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={outline}
+              onChange={(e) => setOutline(e.target.value)}
+              rows={2}
+              placeholder="과제 개요 / 주제"
+            />
+          )}
+        </FormField>
+        <FormField label="평가 기준" className="md:col-span-2">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={rubric}
+              onChange={(e) => setRubric(e.target.value)}
+              rows={2}
+              placeholder="루브릭 / 채점 기준"
+            />
+          )}
+        </FormField>
+        <FormField label="교사 요구">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={teacherReq}
+              onChange={(e) => setTeacherReq(e.target.value)}
+              rows={2}
+              placeholder="예: 근거 3가지 이상"
+            />
+          )}
+        </FormField>
+        <FormField label="학생 요구">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={studentReq}
+              onChange={(e) => setStudentReq(e.target.value)}
+              rows={2}
+              placeholder="학생이 요청한 사항"
+            />
+          )}
+        </FormField>
+        <FormField label="상태">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={state}
+              onChange={(e) => setState(e.target.value as AssignmentState)}
+            >
+              {ASSIGNMENT_STATES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </SelectInput>
+          )}
+        </FormField>
+        <FormField label="위험도">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={risk}
+              onChange={(e) => setRisk(e.target.value as Risk)}
+            >
+              <option value="low">낮음</option>
+              <option value="medium">보통</option>
+              <option value="high">높음</option>
+            </SelectInput>
+          )}
+        </FormField>
+        <FormField label="파싱 담당">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={parserId === '' ? '' : parserId}
+              onChange={(e) =>
+                setParserId(e.target.value === '' ? '' : Number(e.target.value))
+              }
+            >
+              <option value="">미배정</option>
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.name} · {u.role}
+                </option>
+              ))}
+            </SelectInput>
+          )}
+        </FormField>
+        <FormField label="1차 QA">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={qa1Id === '' ? '' : qa1Id}
+              onChange={(e) =>
+                setQa1Id(e.target.value === '' ? '' : Number(e.target.value))
+              }
+            >
+              <option value="">미배정</option>
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.name} · {u.role}
+                </option>
+              ))}
+            </SelectInput>
+          )}
+        </FormField>
+        <FormField label="최종 QA" className="md:col-span-2">
+          {(slot) => (
+            <SelectInput
+              {...slot}
+              value={qaFinalId === '' ? '' : qaFinalId}
+              onChange={(e) =>
+                setQaFinalId(e.target.value === '' ? '' : Number(e.target.value))
+              }
+            >
+              <option value="">미배정</option>
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.name} · {u.role}
+                </option>
+              ))}
+            </SelectInput>
+          )}
+        </FormField>
+      </div>
+    </Modal>
   );
 }

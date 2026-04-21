@@ -49,15 +49,19 @@ CREATE INDEX IF NOT EXISTS idx_users_department ON users(department_id);
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS students (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  student_code TEXT    NOT NULL UNIQUE,   -- 학원 내부 학생 코드
-  name         TEXT    NOT NULL,
-  grade        TEXT,                      -- e.g. '중3', '고2'
-  school       TEXT,
-  guardian     TEXT,
-  memo         TEXT,
-  created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-  deleted_at   TEXT
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_code   TEXT    NOT NULL UNIQUE,   -- 학원 내부 학생 코드
+  name           TEXT    NOT NULL,
+  grade          TEXT,                      -- e.g. '중3', '고2'
+  school         TEXT,
+  school_no      TEXT,                      -- 학번 (학교 내부)
+  phone          TEXT,                      -- 학생 연락처
+  guardian       TEXT,                      -- 학부모 이름
+  guardian_phone TEXT,                      -- 학부모 연락처
+  grade_memo     TEXT,                      -- 내신 한 줄 메모 ('수학1등급, 국어2등급')
+  memo           TEXT,                      -- 일반 메모
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  deleted_at     TEXT
 );
 
 -- ---------------------------------------------------------------------------
@@ -107,10 +111,12 @@ CREATE TABLE IF NOT EXISTS assignments (
   due_at          TEXT,
   received_at     TEXT    NOT NULL DEFAULT (datetime('now')),
   completed_at    TEXT,
+  deleted_at      TEXT,                            -- 소프트 삭제 (NULL 이면 활성)
   created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_assignments_state     ON assignments(state);
+CREATE INDEX IF NOT EXISTS idx_assignments_deleted   ON assignments(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_assignments_due       ON assignments(due_at);
 CREATE INDEX IF NOT EXISTS idx_assignments_parser    ON assignments(parser_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_qa1       ON assignments(qa1_id);
@@ -623,3 +629,42 @@ CREATE TABLE IF NOT EXISTS student_archive_files (
 CREATE INDEX IF NOT EXISTS idx_student_archive_files_student ON student_archive_files(student_id);
 CREATE INDEX IF NOT EXISTS idx_student_archive_files_topic   ON student_archive_files(topic_id);
 CREATE INDEX IF NOT EXISTS idx_student_archive_files_source  ON student_archive_files(source_assignment_id);
+
+-- ===========================================================================
+-- Student grades (내신 성적) — 학기/과목 단위 구조화 저장
+--   한 학생 × 한 학기 × 한 과목 = 한 행. 동일 3개 키 UNIQUE.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS student_grades (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  grade_level   TEXT    NOT NULL,                 -- '중3', '고1', '고2', ...
+  semester      TEXT    NOT NULL,                 -- '1학기','2학기','중간','기말' 등 자유 텍스트
+  subject       TEXT    NOT NULL,                 -- '수학', '국어', ...
+  score         TEXT,                              -- '1등급', '95점', 'A+' 자유 텍스트
+  raw_score     REAL,                              -- 원점수 (선택, 숫자로 기록하고 싶을 때)
+  memo          TEXT,
+  created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (student_id, grade_level, semester, subject)
+);
+CREATE INDEX IF NOT EXISTS idx_student_grades_student ON student_grades(student_id);
+CREATE INDEX IF NOT EXISTS idx_student_grades_term    ON student_grades(student_id, grade_level, semester);
+
+-- ===========================================================================
+-- Student counseling logs (상담 이력) — 날짜/제목/본문의 타임라인
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS student_counseling_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  log_date      TEXT    NOT NULL,                 -- YYYY-MM-DD
+  title         TEXT    NOT NULL,
+  body          TEXT,
+  category      TEXT,                              -- '학부모','학생','진로','성적','행동' 등 자유
+  created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_student_counseling_student ON student_counseling_logs(student_id, log_date DESC);

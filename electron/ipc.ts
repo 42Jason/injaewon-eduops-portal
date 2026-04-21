@@ -35,51 +35,496 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle('auth:logout', () => ({ ok: true }));
 
   // -- assignments ------------------------------------------------------------
-  ipcMain.handle('assignments:list', (_e, filter?: { state?: string; assignee?: number }) => {
-    const db = getDb();
-    const where: string[] = [];
-    const params: unknown[] = [];
-    if (filter?.state) {
-      where.push('a.state = ?');
-      params.push(filter.state);
-    }
-    if (filter?.assignee) {
-      where.push('(a.parser_id = ? OR a.qa1_id = ? OR a.qa_final_id = ?)');
-      params.push(filter.assignee, filter.assignee, filter.assignee);
-    }
-    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
-    const rows = db
-      .prepare(
-        `SELECT a.id, a.code, a.subject, a.publisher, a.student_code, a.title,
-                a.scope, a.state, a.risk, a.parser_id, a.qa1_id, a.qa_final_id,
-                a.due_at, a.received_at, a.completed_at,
-                up.name AS parser_name, uq.name AS qa1_name, uf.name AS qa_final_name
-           FROM assignments a
-           LEFT JOIN users up ON up.id = a.parser_id
-           LEFT JOIN users uq ON uq.id = a.qa1_id
-           LEFT JOIN users uf ON uf.id = a.qa_final_id
-           ${whereSql}
-          ORDER BY a.due_at ASC, a.id DESC
-          LIMIT 200`,
-      )
-      .all(...params);
-    return rows;
-  });
+  ipcMain.handle(
+    'assignments:list',
+    (
+      _e,
+      filter?: {
+        state?: string;
+        assignee?: number;
+        search?: string;
+        includeDeleted?: boolean;
+        onlyDeleted?: boolean;
+      },
+    ) => {
+      const db = getDb();
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (filter?.onlyDeleted) {
+        where.push('a.deleted_at IS NOT NULL');
+      } else if (!filter?.includeDeleted) {
+        where.push('a.deleted_at IS NULL');
+      }
+      if (filter?.state) {
+        where.push('a.state = ?');
+        params.push(filter.state);
+      }
+      if (filter?.assignee) {
+        where.push('(a.parser_id = ? OR a.qa1_id = ? OR a.qa_final_id = ?)');
+        params.push(filter.assignee, filter.assignee, filter.assignee);
+      }
+      if (filter?.search) {
+        const q = `%${filter.search}%`;
+        where.push(
+          '(a.code LIKE ? OR a.title LIKE ? OR a.subject LIKE ? OR a.student_code LIKE ?)',
+        );
+        params.push(q, q, q, q);
+      }
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const rows = db
+        .prepare(
+          `SELECT a.id, a.code, a.subject, a.publisher, a.student_code, a.title,
+                  a.scope, a.state, a.risk, a.parser_id, a.qa1_id, a.qa_final_id,
+                  a.due_at, a.received_at, a.completed_at, a.deleted_at,
+                  up.name AS parser_name, uq.name AS qa1_name, uf.name AS qa_final_name
+             FROM assignments a
+             LEFT JOIN users up ON up.id = a.parser_id
+             LEFT JOIN users uq ON uq.id = a.qa1_id
+             LEFT JOIN users uf ON uf.id = a.qa_final_id
+             ${whereSql}
+            ORDER BY a.due_at ASC, a.id DESC
+            LIMIT 300`,
+        )
+        .all(...params);
+      return rows;
+    },
+  );
 
-  ipcMain.handle('assignments:get', (_e, id: number) => {
-    const db = getDb();
+  ipcMain.handle(
+    'assignments:get',
+    (_e, payload: number | { id: number; includeDeleted?: boolean }) => {
+      const db = getDb();
+      const id = typeof payload === 'number' ? payload : payload.id;
+      const includeDeleted =
+        typeof payload === 'number' ? false : !!payload.includeDeleted;
+      const deletedGuard = includeDeleted ? '' : 'AND a.deleted_at IS NULL';
+      const row = db
+        .prepare(
+          `SELECT a.*, up.name AS parser_name, uq.name AS qa1_name, uf.name AS qa_final_name
+             FROM assignments a
+             LEFT JOIN users up ON up.id = a.parser_id
+             LEFT JOIN users uq ON uq.id = a.qa1_id
+             LEFT JOIN users uf ON uf.id = a.qa_final_id
+            WHERE a.id = ? ${deletedGuard}`,
+        )
+        .get(id);
+      return row ?? null;
+    },
+  );
+
+  // -- assignments CRUD (수동 추가 / 편집 / 소프트 삭제 / 복원 / 일괄) -----------
+  const ASSIGNMENT_STATES = [
+    '신규접수',
+    '자료누락',
+    '파싱대기',
+    '파싱진행중',
+    '파싱완료',
+    '파싱확인필요',
+    '1차QA대기',
+    '1차QA진행중',
+    '1차QA반려',
+    '최종QA대기',
+    '최종QA진행중',
+    '최종QA반려',
+    '승인완료',
+    '수정요청',
+    '완료',
+    '보류',
+  ] as const;
+  const ASSIGNMENT_RISKS = ['low', 'medium', 'high'] as const;
+
+  function nextAssignmentCode(db: ReturnType<typeof getDb>): string {
+    interface MaxRow {
+      max_num: number | null;
+    }
     const row = db
       .prepare(
-        `SELECT a.*, up.name AS parser_name, uq.name AS qa1_name, uf.name AS qa_final_name
-           FROM assignments a
-           LEFT JOIN users up ON up.id = a.parser_id
-           LEFT JOIN users uq ON uq.id = a.qa1_id
-           LEFT JOIN users uf ON uf.id = a.qa_final_id
-          WHERE a.id = ?`,
+        `SELECT COALESCE(MAX(CAST(SUBSTR(code, 3) AS INTEGER)), 0) AS max_num
+           FROM assignments
+          WHERE code LIKE 'A-%'`,
       )
-      .get(id);
-    return row ?? null;
-  });
+      .get() as MaxRow;
+    const next = (row?.max_num ?? 0) + 1;
+    return `A-${String(next).padStart(4, '0')}`;
+  }
+
+  ipcMain.handle(
+    'assignments:create',
+    (
+      _e,
+      payload: {
+        actorId: number | null;
+        subject: string;
+        title: string;
+        studentId?: number | null;
+        studentCode?: string | null;
+        publisher?: string | null;
+        scope?: string | null;
+        lengthReq?: string | null;
+        outline?: string | null;
+        rubric?: string | null;
+        teacherReq?: string | null;
+        studentReq?: string | null;
+        state?: string;
+        risk?: string;
+        parserId?: number | null;
+        qa1Id?: number | null;
+        qaFinalId?: number | null;
+        dueAt?: string | null;
+      },
+    ) => {
+      try {
+        const db = getDb();
+        if (!payload?.subject?.trim() || !payload?.title?.trim()) {
+          return { ok: false, error: 'missing_required' };
+        }
+        const state = payload.state && ASSIGNMENT_STATES.includes(payload.state as typeof ASSIGNMENT_STATES[number])
+          ? payload.state
+          : '신규접수';
+        const risk = payload.risk && ASSIGNMENT_RISKS.includes(payload.risk as typeof ASSIGNMENT_RISKS[number])
+          ? payload.risk
+          : 'low';
+
+        // Resolve student_code — prefer explicit, fallback to students table lookup.
+        let studentCode = payload.studentCode ?? null;
+        if (!studentCode && payload.studentId) {
+          const s = db
+            .prepare('SELECT student_code FROM students WHERE id = ?')
+            .get(payload.studentId) as { student_code: string } | undefined;
+          studentCode = s?.student_code ?? null;
+        }
+        if (!studentCode) {
+          // 필수 NOT NULL 이지만 학생 미연결일 수도 있음 → sentinel 값 사용
+          studentCode = '-';
+        }
+
+        const code = nextAssignmentCode(db);
+
+        const info = db
+          .prepare(
+            `INSERT INTO assignments (
+                code, subject, publisher, student_id, student_code,
+                title, scope, length_req, outline, rubric,
+                teacher_req, student_req, state, risk,
+                parser_id, qa1_id, qa_final_id, due_at
+              ) VALUES (?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?,
+                        ?, ?, ?, ?)`,
+          )
+          .run(
+            code,
+            payload.subject.trim(),
+            payload.publisher ?? null,
+            payload.studentId ?? null,
+            studentCode,
+            payload.title.trim(),
+            payload.scope ?? null,
+            payload.lengthReq ?? null,
+            payload.outline ?? null,
+            payload.rubric ?? null,
+            payload.teacherReq ?? null,
+            payload.studentReq ?? null,
+            state,
+            risk,
+            payload.parserId ?? null,
+            payload.qa1Id ?? null,
+            payload.qaFinalId ?? null,
+            payload.dueAt ?? null,
+          );
+
+        const id = Number(info.lastInsertRowid);
+        logActivity(db, payload.actorId, 'assignments.create', `assignment:${id}`, {
+          code,
+          title: payload.title,
+          subject: payload.subject,
+          state,
+        });
+        return { ok: true, id, code };
+      } catch (err) {
+        console.error('[ipc] assignments:create failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:update',
+    (
+      _e,
+      payload: {
+        id: number;
+        actorId: number | null;
+        subject?: string;
+        title?: string;
+        publisher?: string | null;
+        studentId?: number | null;
+        studentCode?: string | null;
+        scope?: string | null;
+        lengthReq?: string | null;
+        outline?: string | null;
+        rubric?: string | null;
+        teacherReq?: string | null;
+        studentReq?: string | null;
+        state?: string;
+        risk?: string;
+        parserId?: number | null;
+        qa1Id?: number | null;
+        qaFinalId?: number | null;
+        dueAt?: string | null;
+      },
+    ) => {
+      try {
+        const db = getDb();
+        const map: Array<[keyof typeof payload, string]> = [
+          ['subject', 'subject'],
+          ['title', 'title'],
+          ['publisher', 'publisher'],
+          ['studentId', 'student_id'],
+          ['studentCode', 'student_code'],
+          ['scope', 'scope'],
+          ['lengthReq', 'length_req'],
+          ['outline', 'outline'],
+          ['rubric', 'rubric'],
+          ['teacherReq', 'teacher_req'],
+          ['studentReq', 'student_req'],
+          ['state', 'state'],
+          ['risk', 'risk'],
+          ['parserId', 'parser_id'],
+          ['qa1Id', 'qa1_id'],
+          ['qaFinalId', 'qa_final_id'],
+          ['dueAt', 'due_at'],
+        ];
+        const sets: string[] = [];
+        const params: unknown[] = [];
+        for (const [key, col] of map) {
+          if (Object.prototype.hasOwnProperty.call(payload, key)) {
+            sets.push(`${col} = ?`);
+            params.push((payload as Record<string, unknown>)[key] ?? null);
+          }
+        }
+        if (sets.length === 0) return { ok: false, error: 'no_fields' };
+        sets.push("updated_at = datetime('now')");
+        params.push(payload.id);
+        const info = db
+          .prepare(`UPDATE assignments SET ${sets.join(', ')} WHERE id = ?`)
+          .run(...params);
+        if (info.changes === 0) return { ok: false, error: 'not_found' };
+        logActivity(db, payload.actorId, 'assignments.update', `assignment:${payload.id}`, {
+          keys: Object.keys(payload).filter(
+            (k) => k !== 'id' && k !== 'actorId',
+          ),
+        });
+        // state 변경 시 보관함 동기화
+        if (payload.state) {
+          syncAssignmentArchive(db, payload.id, payload.state, payload.actorId);
+        }
+        return { ok: true };
+      } catch (err) {
+        console.error('[ipc] assignments:update failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:softDelete',
+    (_e, payload: { id: number; actorId: number | null }) => {
+      try {
+        const db = getDb();
+        const tx = db.transaction(() => {
+          const info = db
+            .prepare(
+              `UPDATE assignments
+                  SET deleted_at = datetime('now'),
+                      updated_at = datetime('now')
+                WHERE id = ? AND deleted_at IS NULL`,
+            )
+            .run(payload.id);
+          if (info.changes > 0) {
+            // 승인완료 상태였다면 자동 보관함 링크도 회수
+            syncAssignmentArchive(db, payload.id, '보류', payload.actorId);
+          }
+          return info.changes;
+        });
+        const changes = tx();
+        if (changes === 0) return { ok: false, error: 'not_found_or_already_deleted' };
+        logActivity(db, payload.actorId, 'assignments.softDelete', `assignment:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        console.error('[ipc] assignments:softDelete failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:restore',
+    (_e, payload: { id: number; actorId: number | null }) => {
+      try {
+        const db = getDb();
+        const info = db
+          .prepare(
+            `UPDATE assignments
+                SET deleted_at = NULL,
+                    updated_at = datetime('now')
+              WHERE id = ? AND deleted_at IS NOT NULL`,
+          )
+          .run(payload.id);
+        if (info.changes === 0) return { ok: false, error: 'not_found_or_active' };
+        logActivity(db, payload.actorId, 'assignments.restore', `assignment:${payload.id}`, {});
+        return { ok: true };
+      } catch (err) {
+        console.error('[ipc] assignments:restore failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:bulkSetState',
+    (
+      _e,
+      payload: { ids: number[]; state: string; actorId: number | null },
+    ) => {
+      try {
+        if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
+          return { ok: false, error: 'empty_ids' };
+        }
+        if (!ASSIGNMENT_STATES.includes(payload.state as typeof ASSIGNMENT_STATES[number])) {
+          return { ok: false, error: 'invalid_state' };
+        }
+        const db = getDb();
+        const now = new Date().toISOString();
+        const completedMark = ['완료', '승인완료'].includes(payload.state);
+        let changed = 0;
+        const tx = db.transaction(() => {
+          const stmt = db.prepare(
+            `UPDATE assignments
+                SET state = ?,
+                    updated_at = ?,
+                    completed_at = CASE WHEN ? = 1 THEN ? ELSE completed_at END
+              WHERE id = ? AND deleted_at IS NULL`,
+          );
+          for (const id of payload.ids) {
+            const res = stmt.run(payload.state, now, completedMark ? 1 : 0, now, id);
+            if (res.changes > 0) {
+              changed += 1;
+              syncAssignmentArchive(db, id, payload.state, payload.actorId);
+            }
+          }
+        });
+        tx();
+        logActivity(db, payload.actorId, 'assignments.bulkSetState', 'assignment:bulk', {
+          ids: payload.ids,
+          state: payload.state,
+          changed,
+        });
+        return { ok: true, changed };
+      } catch (err) {
+        console.error('[ipc] assignments:bulkSetState failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:bulkAssign',
+    (
+      _e,
+      payload: {
+        ids: number[];
+        parserId?: number | null;
+        qa1Id?: number | null;
+        qaFinalId?: number | null;
+        actorId: number | null;
+      },
+    ) => {
+      try {
+        if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
+          return { ok: false, error: 'empty_ids' };
+        }
+        const sets: string[] = [];
+        const baseParams: unknown[] = [];
+        if (Object.prototype.hasOwnProperty.call(payload, 'parserId')) {
+          sets.push('parser_id = ?');
+          baseParams.push(payload.parserId ?? null);
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, 'qa1Id')) {
+          sets.push('qa1_id = ?');
+          baseParams.push(payload.qa1Id ?? null);
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, 'qaFinalId')) {
+          sets.push('qa_final_id = ?');
+          baseParams.push(payload.qaFinalId ?? null);
+        }
+        if (sets.length === 0) return { ok: false, error: 'no_fields' };
+        sets.push("updated_at = datetime('now')");
+        const db = getDb();
+        let changed = 0;
+        const tx = db.transaction(() => {
+          const stmt = db.prepare(
+            `UPDATE assignments
+                SET ${sets.join(', ')}
+              WHERE id = ? AND deleted_at IS NULL`,
+          );
+          for (const id of payload.ids) {
+            const res = stmt.run(...baseParams, id);
+            if (res.changes > 0) changed += 1;
+          }
+        });
+        tx();
+        logActivity(db, payload.actorId, 'assignments.bulkAssign', 'assignment:bulk', {
+          ids: payload.ids,
+          parserId: payload.parserId,
+          qa1Id: payload.qa1Id,
+          qaFinalId: payload.qaFinalId,
+          changed,
+        });
+        return { ok: true, changed };
+      } catch (err) {
+        console.error('[ipc] assignments:bulkAssign failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'assignments:bulkDelete',
+    (_e, payload: { ids: number[]; actorId: number | null }) => {
+      try {
+        if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
+          return { ok: false, error: 'empty_ids' };
+        }
+        const db = getDb();
+        let changed = 0;
+        const tx = db.transaction(() => {
+          const stmt = db.prepare(
+            `UPDATE assignments
+                SET deleted_at = datetime('now'),
+                    updated_at = datetime('now')
+              WHERE id = ? AND deleted_at IS NULL`,
+          );
+          for (const id of payload.ids) {
+            const res = stmt.run(id);
+            if (res.changes > 0) {
+              changed += 1;
+              syncAssignmentArchive(db, id, '보류', payload.actorId);
+            }
+          }
+        });
+        tx();
+        logActivity(db, payload.actorId, 'assignments.bulkDelete', 'assignment:bulk', {
+          ids: payload.ids,
+          changed,
+        });
+        return { ok: true, changed };
+      } catch (err) {
+        console.error('[ipc] assignments:bulkDelete failed', err);
+        return { ok: false, error: 'server_error', message: String(err) };
+      }
+    },
+  );
 
   /**
    * Transition an assignment to a new state.
@@ -3094,25 +3539,33 @@ function registerStudentArchiveIpc() {
   // ---- students listing --------------------------------------------------
   ipcMain.handle(
     'students:list',
-    (_e, filter?: { q?: string; limit?: number }) => {
+    (_e, filter?: { q?: string; limit?: number; includeDeleted?: boolean }) => {
       const db = getDb();
-      const where: string[] = ['s.deleted_at IS NULL'];
+      const where: string[] = [];
+      if (!filter?.includeDeleted) where.push('s.deleted_at IS NULL');
       const params: unknown[] = [];
       if (filter?.q && filter.q.trim()) {
-        where.push('(s.name LIKE ? OR s.student_code LIKE ? OR s.school LIKE ? OR s.guardian LIKE ?)');
+        where.push(
+          '(s.name LIKE ? OR s.student_code LIKE ? OR s.school LIKE ? OR s.school_no LIKE ? OR s.guardian LIKE ? OR s.phone LIKE ? OR s.guardian_phone LIKE ?)',
+        );
         const like = `%${filter.q.trim()}%`;
-        params.push(like, like, like, like);
+        params.push(like, like, like, like, like, like, like);
       }
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
       const lim = Math.min(Math.max(filter?.limit ?? 500, 1), 2000);
       return db
         .prepare(
-          `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.guardian, s.memo,
-                  s.created_at,
-                  (SELECT COUNT(*) FROM assignments a WHERE a.student_id = s.id) AS assignment_count,
+          `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.school_no,
+                  s.phone, s.guardian, s.guardian_phone, s.grade_memo, s.memo,
+                  s.notion_page_id, s.notion_source, s.notion_synced_at,
+                  s.created_at, s.deleted_at,
+                  (SELECT COUNT(*) FROM assignments a WHERE a.student_id = s.id AND a.deleted_at IS NULL) AS assignment_count,
                   (SELECT COUNT(*) FROM student_report_topics t WHERE t.student_id = s.id) AS topic_count,
-                  (SELECT COUNT(*) FROM student_archive_files f WHERE f.student_id = s.id) AS file_count
+                  (SELECT COUNT(*) FROM student_archive_files f WHERE f.student_id = s.id) AS file_count,
+                  (SELECT COUNT(*) FROM student_grades g WHERE g.student_id = s.id) AS grade_count,
+                  (SELECT COUNT(*) FROM student_counseling_logs c WHERE c.student_id = s.id) AS counseling_count
              FROM students s
-            WHERE ${where.join(' AND ')}
+            ${whereSql}
             ORDER BY s.name ASC, s.student_code ASC
             LIMIT ${lim}`,
         )
@@ -3124,14 +3577,396 @@ function registerStudentArchiveIpc() {
     const db = getDb();
     const row = db
       .prepare(
-        `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.guardian, s.memo,
-                s.monthly_fee, s.billing_day, s.billing_active, s.created_at
+        `SELECT s.id, s.student_code, s.name, s.grade, s.school, s.school_no,
+                s.phone, s.guardian, s.guardian_phone, s.grade_memo, s.memo,
+                s.monthly_fee, s.billing_day, s.billing_active,
+                s.notion_page_id, s.notion_source, s.notion_synced_at,
+                s.created_at, s.deleted_at
            FROM students s
-          WHERE s.id = ? AND s.deleted_at IS NULL`,
+          WHERE s.id = ?`,
       )
       .get(studentId);
     return row ?? null;
   });
+
+  // ---- students CRUD -----------------------------------------------------
+  // 수동 학생 추가. student_code 는 비워오면 'M-<타임스탬프>' 자동 발급.
+  ipcMain.handle(
+    'students:create',
+    (
+      _e,
+      payload: {
+        studentCode?: string | null;
+        name: string;
+        grade?: string | null;
+        school?: string | null;
+        schoolNo?: string | null;
+        phone?: string | null;
+        guardian?: string | null;
+        guardianPhone?: string | null;
+        gradeMemo?: string | null;
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const name = payload.name?.trim();
+        if (!name) return { ok: false, error: 'name_required' };
+        let code = payload.studentCode?.trim();
+        if (!code) {
+          // 'M-<yyMMddHHmm>-<rand>' 형태로 충돌 최소화
+          const d = new Date();
+          const pad = (n: number) => n.toString().padStart(2, '0');
+          const stamp = `${d.getFullYear().toString().slice(-2)}${pad(d.getMonth() + 1)}${pad(
+            d.getDate(),
+          )}${pad(d.getHours())}${pad(d.getMinutes())}`;
+          code = `M-${stamp}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+        }
+        // UNIQUE 충돌 시 재발급
+        const existing = db
+          .prepare(`SELECT id FROM students WHERE student_code = ?`)
+          .get(code);
+        if (existing) {
+          return { ok: false, error: 'code_conflict', message: `학생 코드 "${code}" 가 이미 존재합니다.` };
+        }
+        const info = db
+          .prepare(
+            `INSERT INTO students (
+               student_code, name, grade, school, school_no,
+               phone, guardian, guardian_phone, grade_memo, memo
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            code,
+            name,
+            payload.grade ?? null,
+            payload.school ?? null,
+            payload.schoolNo ?? null,
+            payload.phone ?? null,
+            payload.guardian ?? null,
+            payload.guardianPhone ?? null,
+            payload.gradeMemo ?? null,
+            payload.memo ?? null,
+          );
+        logActivity(db, payload.actorId, 'students.create', `student:${info.lastInsertRowid}`, {
+          studentCode: code,
+          name,
+        });
+        return { ok: true, id: Number(info.lastInsertRowid), studentCode: code };
+      } catch (err) {
+        console.error('[ipc] students:create error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:update',
+    (
+      _e,
+      payload: {
+        id: number;
+        name?: string;
+        grade?: string | null;
+        school?: string | null;
+        schoolNo?: string | null;
+        phone?: string | null;
+        guardian?: string | null;
+        guardianPhone?: string | null;
+        gradeMemo?: string | null;
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const fields: string[] = [];
+        const params: unknown[] = [];
+        const map: Array<[keyof typeof payload, string]> = [
+          ['name', 'name'],
+          ['grade', 'grade'],
+          ['school', 'school'],
+          ['schoolNo', 'school_no'],
+          ['phone', 'phone'],
+          ['guardian', 'guardian'],
+          ['guardianPhone', 'guardian_phone'],
+          ['gradeMemo', 'grade_memo'],
+          ['memo', 'memo'],
+        ];
+        for (const [key, col] of map) {
+          const v = payload[key];
+          if (v !== undefined) {
+            fields.push(`${col} = ?`);
+            params.push(v);
+          }
+        }
+        if (fields.length === 0) return { ok: false, error: 'no_fields' };
+        params.push(payload.id);
+        const res = db
+          .prepare(`UPDATE students SET ${fields.join(', ')} WHERE id = ?`)
+          .run(...params);
+        logActivity(db, payload.actorId, 'students.update', `student:${payload.id}`, {
+          changed: fields.length,
+        });
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        console.error('[ipc] students:update error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:softDelete',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        const res = db
+          .prepare(
+            `UPDATE students SET deleted_at = datetime('now')
+              WHERE id = ? AND deleted_at IS NULL`,
+          )
+          .run(payload.id);
+        logActivity(db, payload.actorId, 'students.softDelete', `student:${payload.id}`, {});
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        console.error('[ipc] students:softDelete error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:restore',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      try {
+        const res = db
+          .prepare(`UPDATE students SET deleted_at = NULL WHERE id = ?`)
+          .run(payload.id);
+        logActivity(db, payload.actorId, 'students.restore', `student:${payload.id}`, {});
+        return { ok: res.changes > 0 };
+      } catch (err) {
+        console.error('[ipc] students:restore error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  // ---- student grades (내신) --------------------------------------------
+  ipcMain.handle('students:listGrades', (_e, studentId: number) => {
+    const db = getDb();
+    return db
+      .prepare(
+        `SELECT g.id, g.student_id, g.grade_level, g.semester, g.subject,
+                g.score, g.raw_score, g.memo,
+                g.created_by, g.created_at, g.updated_at,
+                u.name AS created_by_name
+           FROM student_grades g
+           LEFT JOIN users u ON u.id = g.created_by
+          WHERE g.student_id = ?
+          ORDER BY g.grade_level DESC, g.semester DESC, g.subject ASC`,
+      )
+      .all(studentId);
+  });
+
+  ipcMain.handle(
+    'students:upsertGrade',
+    (
+      _e,
+      payload: {
+        id?: number;
+        studentId: number;
+        gradeLevel: string;
+        semester: string;
+        subject: string;
+        score?: string | null;
+        rawScore?: number | null;
+        memo?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        if (!payload.gradeLevel?.trim() || !payload.semester?.trim() || !payload.subject?.trim()) {
+          return { ok: false, error: 'missing_key' };
+        }
+        if (payload.id) {
+          const res = db
+            .prepare(
+              `UPDATE student_grades
+                  SET grade_level = ?, semester = ?, subject = ?,
+                      score = ?, raw_score = ?, memo = ?,
+                      updated_at = datetime('now')
+                WHERE id = ?`,
+            )
+            .run(
+              payload.gradeLevel.trim(),
+              payload.semester.trim(),
+              payload.subject.trim(),
+              payload.score ?? null,
+              payload.rawScore ?? null,
+              payload.memo ?? null,
+              payload.id,
+            );
+          logActivity(db, payload.actorId, 'students.updateGrade', `grade:${payload.id}`, {
+            studentId: payload.studentId,
+          });
+          return { ok: res.changes > 0, id: payload.id };
+        }
+        // insert with ON CONFLICT → treat as update on UNIQUE violation
+        try {
+          const info = db
+            .prepare(
+              `INSERT INTO student_grades (
+                 student_id, grade_level, semester, subject,
+                 score, raw_score, memo, created_by
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              payload.studentId,
+              payload.gradeLevel.trim(),
+              payload.semester.trim(),
+              payload.subject.trim(),
+              payload.score ?? null,
+              payload.rawScore ?? null,
+              payload.memo ?? null,
+              payload.actorId,
+            );
+          logActivity(db, payload.actorId, 'students.addGrade', `grade:${info.lastInsertRowid}`, {
+            studentId: payload.studentId,
+          });
+          return { ok: true, id: Number(info.lastInsertRowid) };
+        } catch (err: unknown) {
+          const msg = (err as Error).message ?? '';
+          if (msg.includes('UNIQUE')) {
+            // fallback: update existing row
+            const res = db
+              .prepare(
+                `UPDATE student_grades
+                    SET score = ?, raw_score = ?, memo = ?,
+                        updated_at = datetime('now')
+                  WHERE student_id = ? AND grade_level = ?
+                    AND semester = ? AND subject = ?`,
+              )
+              .run(
+                payload.score ?? null,
+                payload.rawScore ?? null,
+                payload.memo ?? null,
+                payload.studentId,
+                payload.gradeLevel.trim(),
+                payload.semester.trim(),
+                payload.subject.trim(),
+              );
+            return { ok: res.changes > 0, merged: true };
+          }
+          throw err;
+        }
+      } catch (err) {
+        console.error('[ipc] students:upsertGrade error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:deleteGrade',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      const res = db.prepare(`DELETE FROM student_grades WHERE id = ?`).run(payload.id);
+      logActivity(db, payload.actorId, 'students.deleteGrade', `grade:${payload.id}`, {});
+      return { ok: res.changes > 0 };
+    },
+  );
+
+  // ---- student counseling logs (상담 이력) ------------------------------
+  ipcMain.handle('students:listCounseling', (_e, studentId: number) => {
+    const db = getDb();
+    return db
+      .prepare(
+        `SELECT c.id, c.student_id, c.log_date, c.title, c.body, c.category,
+                c.created_by, c.created_at, c.updated_at,
+                u.name AS created_by_name
+           FROM student_counseling_logs c
+           LEFT JOIN users u ON u.id = c.created_by
+          WHERE c.student_id = ?
+          ORDER BY c.log_date DESC, c.id DESC
+          LIMIT 500`,
+      )
+      .all(studentId);
+  });
+
+  ipcMain.handle(
+    'students:upsertCounseling',
+    (
+      _e,
+      payload: {
+        id?: number;
+        studentId: number;
+        logDate: string;
+        title: string;
+        body?: string | null;
+        category?: string | null;
+        actorId: number;
+      },
+    ) => {
+      const db = getDb();
+      try {
+        const title = payload.title?.trim();
+        const logDate = payload.logDate?.trim();
+        if (!title) return { ok: false, error: 'title_required' };
+        if (!logDate) return { ok: false, error: 'log_date_required' };
+        if (payload.id) {
+          const res = db
+            .prepare(
+              `UPDATE student_counseling_logs
+                  SET log_date = ?, title = ?, body = ?, category = ?,
+                      updated_at = datetime('now')
+                WHERE id = ?`,
+            )
+            .run(logDate, title, payload.body ?? null, payload.category ?? null, payload.id);
+          logActivity(db, payload.actorId, 'students.updateCounseling', `counseling:${payload.id}`, {
+            studentId: payload.studentId,
+          });
+          return { ok: res.changes > 0, id: payload.id };
+        }
+        const info = db
+          .prepare(
+            `INSERT INTO student_counseling_logs (
+               student_id, log_date, title, body, category, created_by
+             ) VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            payload.studentId,
+            logDate,
+            title,
+            payload.body ?? null,
+            payload.category ?? null,
+            payload.actorId,
+          );
+        logActivity(db, payload.actorId, 'students.addCounseling', `counseling:${info.lastInsertRowid}`, {
+          studentId: payload.studentId,
+        });
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (err) {
+        console.error('[ipc] students:upsertCounseling error', err);
+        return { ok: false, error: (err as Error).message || 'server_error' };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    'students:deleteCounseling',
+    (_e, payload: { id: number; actorId: number }) => {
+      const db = getDb();
+      const res = db
+        .prepare(`DELETE FROM student_counseling_logs WHERE id = ?`)
+        .run(payload.id);
+      logActivity(db, payload.actorId, 'students.deleteCounseling', `counseling:${payload.id}`, {});
+      return { ok: res.changes > 0 };
+    },
+  );
 
   // ---- combined history: assignments + parsing_results ------------------
   ipcMain.handle('students:history', (_e, studentId: number) => {

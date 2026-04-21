@@ -37,8 +37,16 @@ interface EduOpsApi {
     logout(): Promise<{ ok: boolean }>;
   };
   assignments: {
-    list(filter?: { state?: string; assignee?: number }): Promise<Array<Record<string, unknown>>>;
-    get(id: number): Promise<Record<string, unknown> | null>;
+    list(filter?: {
+      state?: string;
+      assignee?: number;
+      search?: string;
+      includeDeleted?: boolean;
+      onlyDeleted?: boolean;
+    }): Promise<Array<Record<string, unknown>>>;
+    get(
+      payload: number | { id: number; includeDeleted?: boolean },
+    ): Promise<Record<string, unknown> | null>;
     setState(payload: {
       id: number;
       state: string;
@@ -47,6 +55,77 @@ interface EduOpsApi {
     }): Promise<{ ok: boolean; error?: string }>;
     parsingResult(assignmentId: number): Promise<Record<string, unknown> | null>;
     qaReviews(assignmentId: number): Promise<Array<Record<string, unknown>>>;
+    create(payload: {
+      actorId: number | null;
+      subject: string;
+      title: string;
+      studentId?: number | null;
+      studentCode?: string | null;
+      publisher?: string | null;
+      scope?: string | null;
+      lengthReq?: string | null;
+      outline?: string | null;
+      rubric?: string | null;
+      teacherReq?: string | null;
+      studentReq?: string | null;
+      state?: string;
+      risk?: 'low' | 'medium' | 'high';
+      parserId?: number | null;
+      qa1Id?: number | null;
+      qaFinalId?: number | null;
+      dueAt?: string | null;
+    }): Promise<{
+      ok: boolean;
+      error?: string;
+      id?: number;
+      code?: string;
+      message?: string;
+    }>;
+    update(payload: {
+      id: number;
+      actorId: number | null;
+      subject?: string;
+      title?: string;
+      publisher?: string | null;
+      studentId?: number | null;
+      studentCode?: string | null;
+      scope?: string | null;
+      lengthReq?: string | null;
+      outline?: string | null;
+      rubric?: string | null;
+      teacherReq?: string | null;
+      studentReq?: string | null;
+      state?: string;
+      risk?: 'low' | 'medium' | 'high';
+      parserId?: number | null;
+      qa1Id?: number | null;
+      qaFinalId?: number | null;
+      dueAt?: string | null;
+    }): Promise<{ ok: boolean; error?: string; message?: string }>;
+    softDelete(payload: {
+      id: number;
+      actorId: number | null;
+    }): Promise<{ ok: boolean; error?: string }>;
+    restore(payload: {
+      id: number;
+      actorId: number | null;
+    }): Promise<{ ok: boolean; error?: string }>;
+    bulkSetState(payload: {
+      ids: number[];
+      state: string;
+      actorId: number | null;
+    }): Promise<{ ok: boolean; error?: string; changed?: number }>;
+    bulkAssign(payload: {
+      ids: number[];
+      parserId?: number | null;
+      qa1Id?: number | null;
+      qaFinalId?: number | null;
+      actorId: number | null;
+    }): Promise<{ ok: boolean; error?: string; changed?: number }>;
+    bulkDelete(payload: {
+      ids: number[];
+      actorId: number | null;
+    }): Promise<{ ok: boolean; error?: string; changed?: number }>;
   };
   notices: {
     list(): Promise<Array<Record<string, unknown>>>;
@@ -500,8 +579,87 @@ interface EduOpsApi {
     monthlySummary(period: string): Promise<Array<Record<string, unknown>>>;
   };
   students: {
-    list(filter?: { q?: string; limit?: number }): Promise<Array<Record<string, unknown>>>;
+    list(filter?: {
+      q?: string;
+      limit?: number;
+      includeDeleted?: boolean;
+    }): Promise<Array<Record<string, unknown>>>;
     get(studentId: number): Promise<Record<string, unknown> | null>;
+    create(payload: {
+      studentCode?: string | null;
+      name: string;
+      grade?: string | null;
+      school?: string | null;
+      schoolNo?: string | null;
+      phone?: string | null;
+      guardian?: string | null;
+      guardianPhone?: string | null;
+      gradeMemo?: string | null;
+      memo?: string | null;
+      actorId: number;
+    }): Promise<{
+      ok: boolean;
+      error?: string;
+      id?: number;
+      studentCode?: string;
+      message?: string;
+    }>;
+    update(payload: {
+      id: number;
+      name?: string;
+      grade?: string | null;
+      school?: string | null;
+      schoolNo?: string | null;
+      phone?: string | null;
+      guardian?: string | null;
+      guardianPhone?: string | null;
+      gradeMemo?: string | null;
+      memo?: string | null;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
+    softDelete(payload: {
+      id: number;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
+    restore(payload: {
+      id: number;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
+    listGrades(studentId: number): Promise<Array<Record<string, unknown>>>;
+    upsertGrade(payload: {
+      id?: number;
+      studentId: number;
+      gradeLevel: string;
+      semester: string;
+      subject: string;
+      score?: string | null;
+      rawScore?: number | null;
+      memo?: string | null;
+      actorId: number;
+    }): Promise<{
+      ok: boolean;
+      error?: string;
+      id?: number;
+      merged?: boolean;
+    }>;
+    deleteGrade(payload: {
+      id: number;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
+    listCounseling(studentId: number): Promise<Array<Record<string, unknown>>>;
+    upsertCounseling(payload: {
+      id?: number;
+      studentId: number;
+      logDate: string;
+      title: string;
+      body?: string | null;
+      category?: string | null;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string; id?: number }>;
+    deleteCounseling(payload: {
+      id: number;
+      actorId: number;
+    }): Promise<{ ok: boolean; error?: string }>;
     history(studentId: number): Promise<{
       assignments: Array<Record<string, unknown>>;
       parsings: Array<Record<string, unknown>>;

@@ -17,6 +17,12 @@ import {
   RefreshCw,
   FileSearch,
   X,
+  GraduationCap,
+  MessageSquare,
+  Phone,
+  Hash,
+  Globe,
+  StickyNote,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
@@ -40,8 +46,15 @@ interface StudentListRow {
   name: string;
   grade?: string | null;
   school?: string | null;
+  school_no?: string | null;
+  phone?: string | null;
   guardian?: string | null;
+  guardian_phone?: string | null;
+  grade_memo?: string | null;
   memo?: string | null;
+  notion_page_id?: string | null;
+  notion_source?: string | null;
+  deleted_at?: string | null;
   created_at: string;
   assignment_count: number;
   topic_count: number;
@@ -54,12 +67,48 @@ interface StudentDetail {
   name: string;
   grade?: string | null;
   school?: string | null;
+  school_no?: string | null;
+  phone?: string | null;
   guardian?: string | null;
+  guardian_phone?: string | null;
+  grade_memo?: string | null;
   memo?: string | null;
   monthly_fee?: number;
   billing_day?: number;
   billing_active?: number;
+  notion_page_id?: string | null;
+  notion_source?: string | null;
+  notion_synced_at?: string | null;
   created_at: string;
+  deleted_at?: string | null;
+}
+
+interface GradeRow {
+  id: number;
+  student_id: number;
+  grade_level: string;
+  semester: string;
+  subject: string;
+  score?: string | null;
+  raw_score?: number | null;
+  memo?: string | null;
+  created_by?: number | null;
+  created_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface CounselingLogRow {
+  id: number;
+  student_id: number;
+  log_date: string;
+  title: string;
+  body?: string | null;
+  category?: string | null;
+  created_by?: number | null;
+  created_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface AssignmentRow {
@@ -193,7 +242,7 @@ function fmtConfidence(c?: number | null): string {
 // Main page
 // -----------------------------------------------------------------------------
 
-type Tab = 'overview' | 'parsing' | 'topics' | 'files';
+type Tab = 'overview' | 'grades' | 'counseling' | 'parsing' | 'topics' | 'files';
 
 export function StudentArchivePage() {
   const { user } = useSession();
@@ -204,6 +253,7 @@ export function StudentArchivePage() {
   const [debounced, setDebounced] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>('overview');
+  const [creating, setCreating] = useState(false);
 
   // debounce search
   useMemoDebounce(search, setDebounced, 200);
@@ -244,13 +294,22 @@ export function StudentArchivePage() {
             학생별로 그동안의 파싱 결과와 수행평가/보고서 주제, 파일을 한 곳에 모아 둡니다.
           </p>
         </div>
-        <button
-          type="button"
-          className="btn-outline text-xs flex items-center gap-1"
-          onClick={() => studentsQuery.refetch()}
-        >
-          <RefreshCw size={12} /> 새로고침
-        </button>
+        <div className="inline-flex items-center gap-2">
+          <button
+            type="button"
+            className="btn-primary text-xs flex items-center gap-1"
+            onClick={() => setCreating(true)}
+          >
+            <Plus size={12} /> 학생 추가
+          </button>
+          <button
+            type="button"
+            className="btn-outline text-xs flex items-center gap-1"
+            onClick={() => studentsQuery.refetch()}
+          >
+            <RefreshCw size={12} /> 새로고침
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-[320px_1fr] gap-4">
@@ -349,10 +408,23 @@ export function StudentArchivePage() {
               tab={tab}
               setTab={setTab}
               currentUserId={user!.id}
+              onDeleted={() => setSelectedId(null)}
             />
           )}
         </main>
       </div>
+
+      <StudentEditModal
+        open={creating}
+        mode="create"
+        initial={null}
+        currentUserId={user!.id}
+        onClose={() => setCreating(false)}
+        onCreated={(id) => {
+          setSelectedId(id);
+          setTab('overview');
+        }}
+      />
     </div>
   );
 }
@@ -366,17 +438,35 @@ function StudentDetailPanel({
   tab,
   setTab,
   currentUserId,
+  onDeleted,
 }: {
   studentId: number;
   tab: Tab;
   setTab: (t: Tab) => void;
   currentUserId: number;
+  onDeleted?: () => void;
 }) {
   const api = getApi()!;
+  const confirm = useConfirm();
+  const [editing, setEditing] = useState(false);
 
   const studentQuery = useQuery({
     queryKey: ['students.get', studentId],
     queryFn: () => api.students.get(studentId) as unknown as Promise<StudentDetail | null>,
+  });
+
+  const deleteMutation = useMutationWithToast({
+    mutationFn: (id: number) =>
+      api.students.softDelete({ id, actorId: currentUserId }),
+    successMessage: '학생을 삭제했습니다',
+    errorMessage: '학생 삭제에 실패했습니다',
+    invalidates: [
+      ['students.list'],
+      ['students.get', studentId],
+    ],
+    onSuccess: () => {
+      if (onDeleted) onDeleted();
+    },
   });
 
   if (studentQuery.isLoading) {
@@ -395,12 +485,32 @@ function StudentDetailPanel({
     );
   }
 
+  async function handleDelete(s: StudentDetail) {
+    const ok = await confirm({
+      title: '학생 삭제',
+      description: `"${s.name}" 학생을 삭제할까요? 학생 데이터(과제·파싱·주제·파일·내신·상담)는 그대로 보존되며 목록에서만 숨겨집니다.`,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (ok) deleteMutation.mutate(s.id);
+  }
+
   return (
     <div className="space-y-3">
-      <StudentHeader student={student} />
-      <nav className="card p-1 flex items-center gap-1 text-xs">
+      <StudentHeader
+        student={student}
+        onEdit={() => setEditing(true)}
+        onDelete={() => handleDelete(student)}
+      />
+      <nav className="card p-1 flex items-center gap-1 text-xs flex-wrap">
         <TabButton active={tab === 'overview'} onClick={() => setTab('overview')}>
           기본 정보
+        </TabButton>
+        <TabButton active={tab === 'grades'} onClick={() => setTab('grades')}>
+          내신 성적
+        </TabButton>
+        <TabButton active={tab === 'counseling'} onClick={() => setTab('counseling')}>
+          상담 이력
         </TabButton>
         <TabButton active={tab === 'parsing'} onClick={() => setTab('parsing')}>
           파싱 이력
@@ -414,6 +524,12 @@ function StudentDetailPanel({
       </nav>
 
       {tab === 'overview' && <OverviewTab studentId={studentId} student={student} />}
+      {tab === 'grades' && (
+        <GradesTab studentId={studentId} currentUserId={currentUserId} />
+      )}
+      {tab === 'counseling' && (
+        <CounselingTab studentId={studentId} currentUserId={currentUserId} />
+      )}
       {tab === 'parsing' && <ParsingTab studentId={studentId} />}
       {tab === 'topics' && (
         <TopicsTab studentId={studentId} currentUserId={currentUserId} />
@@ -421,20 +537,55 @@ function StudentDetailPanel({
       {tab === 'files' && (
         <FilesTab studentId={studentId} currentUserId={currentUserId} />
       )}
+
+      <StudentEditModal
+        open={editing}
+        mode="edit"
+        initial={student}
+        currentUserId={currentUserId}
+        onClose={() => setEditing(false)}
+      />
     </div>
   );
 }
 
-function StudentHeader({ student }: { student: StudentDetail }) {
+function StudentHeader({
+  student,
+  onEdit,
+  onDelete,
+}: {
+  student: StudentDetail;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const fromNotion = Boolean(student.notion_page_id);
   return (
     <header className="card p-4">
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2 text-xl font-semibold text-fg">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2 text-xl font-semibold text-fg">
             {student.name}
             <span className="rounded border border-border bg-bg-soft px-2 py-0.5 text-[11px] font-normal text-fg-muted tabular-nums">
               {student.student_code}
             </span>
+            {fromNotion && (
+              <span
+                className="inline-flex items-center gap-1 rounded border border-indigo-500/30 bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-normal text-indigo-300"
+                title={
+                  student.notion_synced_at
+                    ? `노션 동기화: ${fmtDateTime(student.notion_synced_at)}`
+                    : '노션에서 동기화된 학생입니다.'
+                }
+              >
+                <Globe size={10} /> 노션
+                {student.notion_source ? ` · ${student.notion_source}` : ''}
+              </span>
+            )}
+            {student.deleted_at && (
+              <span className="rounded border border-rose-500/30 bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-normal text-rose-300">
+                삭제됨
+              </span>
+            )}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-subtle">
             {student.grade && (
@@ -447,21 +598,70 @@ function StudentHeader({ student }: { student: StudentDetail }) {
                 <School size={11} /> {student.school}
               </span>
             )}
+            {student.school_no && (
+              <span className="inline-flex items-center gap-1">
+                <Hash size={11} /> 학번 {student.school_no}
+              </span>
+            )}
+            {student.phone && (
+              <span className="inline-flex items-center gap-1">
+                <Phone size={11} /> 학생 {student.phone}
+              </span>
+            )}
             {student.guardian && (
               <span className="inline-flex items-center gap-1">
                 <User2 size={11} /> 보호자 {student.guardian}
               </span>
             )}
+            {student.guardian_phone && (
+              <span className="inline-flex items-center gap-1">
+                <Phone size={11} /> 보호자 {student.guardian_phone}
+              </span>
+            )}
           </div>
         </div>
-        <div className="text-[11px] text-fg-subtle">
-          등록: {fmtDate(student.created_at)}
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <div className="inline-flex items-center gap-1">
+            <button
+              type="button"
+              className="btn-outline text-xs inline-flex items-center gap-1"
+              onClick={onEdit}
+            >
+              <Edit3 size={12} /> 수정
+            </button>
+            <button
+              type="button"
+              className="btn-outline text-xs text-rose-300 inline-flex items-center gap-1"
+              onClick={onDelete}
+              disabled={Boolean(student.deleted_at)}
+              title={student.deleted_at ? '이미 삭제된 학생입니다.' : undefined}
+            >
+              <Trash2 size={12} /> 삭제
+            </button>
+          </div>
+          <div className="text-[11px] text-fg-subtle">
+            등록: {fmtDate(student.created_at)}
+          </div>
         </div>
       </div>
-      {student.memo && (
-        <p className="mt-3 border-t border-border pt-3 text-xs text-fg-muted whitespace-pre-line">
-          {student.memo}
-        </p>
+      {(student.grade_memo || student.memo) && (
+        <div className="mt-3 space-y-2 border-t border-border pt-3 text-xs text-fg-muted">
+          {student.grade_memo && (
+            <p className="flex gap-2">
+              <StickyNote size={12} className="mt-0.5 shrink-0 text-amber-300" />
+              <span className="whitespace-pre-line">
+                <span className="text-[10px] text-fg-subtle mr-1">[내신]</span>
+                {student.grade_memo}
+              </span>
+            </p>
+          )}
+          {student.memo && (
+            <p className="flex gap-2">
+              <StickyNote size={12} className="mt-0.5 shrink-0" />
+              <span className="whitespace-pre-line">{student.memo}</span>
+            </p>
+          )}
+        </div>
       )}
     </header>
   );
@@ -1746,4 +1946,873 @@ function useMemoResetFileModal(
     setters.setDescription('');
     setters.setTouched(false);
   }, [open, defaultTopicId, setters]);
+}
+
+// -----------------------------------------------------------------------------
+// Student create / edit modal
+// -----------------------------------------------------------------------------
+
+function StudentEditModal({
+  open,
+  mode,
+  initial,
+  currentUserId,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  mode: 'create' | 'edit';
+  initial: StudentDetail | null;
+  currentUserId: number;
+  onClose: () => void;
+  onCreated?: (id: number) => void;
+}) {
+  const api = getApi()!;
+
+  const [studentCode, setStudentCode] = useState('');
+  const [name, setName] = useState('');
+  const [grade, setGrade] = useState('');
+  const [school, setSchool] = useState('');
+  const [schoolNo, setSchoolNo] = useState('');
+  const [phone, setPhone] = useState('');
+  const [guardian, setGuardian] = useState('');
+  const [guardianPhone, setGuardianPhone] = useState('');
+  const [gradeMemo, setGradeMemo] = useState('');
+  const [memo, setMemo] = useState('');
+  const [touched, setTouched] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    if (mode === 'edit' && initial) {
+      setStudentCode(initial.student_code);
+      setName(initial.name);
+      setGrade(initial.grade ?? '');
+      setSchool(initial.school ?? '');
+      setSchoolNo(initial.school_no ?? '');
+      setPhone(initial.phone ?? '');
+      setGuardian(initial.guardian ?? '');
+      setGuardianPhone(initial.guardian_phone ?? '');
+      setGradeMemo(initial.grade_memo ?? '');
+      setMemo(initial.memo ?? '');
+    } else {
+      setStudentCode('');
+      setName('');
+      setGrade('');
+      setSchool('');
+      setSchoolNo('');
+      setPhone('');
+      setGuardian('');
+      setGuardianPhone('');
+      setGradeMemo('');
+      setMemo('');
+    }
+    setTouched(false);
+  }, [open, mode, initial]);
+
+  const nameErr = touched && firstError<string>([required('이름은 필수입니다')])(name);
+  const isEditing = mode === 'edit' && initial !== null;
+  const fromNotion = isEditing && Boolean(initial?.notion_page_id);
+
+  const createMutation = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.students.create>[0]) =>
+      api.students.create(payload),
+    successMessage: '학생을 추가했습니다',
+    errorMessage: '학생 추가에 실패했습니다',
+    invalidates: [['students.list']],
+    onSuccess: (res) => {
+      if (res?.ok && typeof res.id === 'number' && onCreated) {
+        onCreated(res.id);
+      }
+      onClose();
+    },
+  });
+
+  const updateMutation = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.students.update>[0]) =>
+      api.students.update(payload),
+    successMessage: '학생 정보를 수정했습니다',
+    errorMessage: '학생 정보 수정에 실패했습니다',
+    invalidates: initial
+      ? [['students.list'], ['students.get', initial.id] as const]
+      : [['students.list']],
+    onSuccess: () => onClose(),
+  });
+
+  function submit() {
+    setTouched(true);
+    if (nameErr) return;
+    if (isEditing && initial) {
+      updateMutation.mutate({
+        id: initial.id,
+        name: name.trim(),
+        grade: grade.trim() || null,
+        school: school.trim() || null,
+        schoolNo: schoolNo.trim() || null,
+        phone: phone.trim() || null,
+        guardian: guardian.trim() || null,
+        guardianPhone: guardianPhone.trim() || null,
+        gradeMemo: gradeMemo.trim() || null,
+        memo: memo.trim() || null,
+        actorId: currentUserId,
+      });
+    } else {
+      createMutation.mutate({
+        studentCode: studentCode.trim() || null,
+        name: name.trim(),
+        grade: grade.trim() || null,
+        school: school.trim() || null,
+        schoolNo: schoolNo.trim() || null,
+        phone: phone.trim() || null,
+        guardian: guardian.trim() || null,
+        guardianPhone: guardianPhone.trim() || null,
+        gradeMemo: gradeMemo.trim() || null,
+        memo: memo.trim() || null,
+        actorId: currentUserId,
+      });
+    }
+  }
+
+  const saving = createMutation.isPending || updateMutation.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={isEditing ? '학생 정보 수정' : '새 학생 추가'}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+            취소
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            onClick={submit}
+            disabled={saving}
+          >
+            {saving ? '저장 중…' : '저장'}
+          </button>
+        </>
+      }
+    >
+      {fromNotion && (
+        <div className="mb-3 rounded border border-indigo-500/30 bg-indigo-500/10 p-2 text-[11px] text-indigo-200">
+          이 학생은 노션에서 동기화되었습니다. 여기서 바꾼 내용은 로컬 DB에만 저장되며, 다음 노션 동기화 시 노션 값으로 덮어쓰일 수 있습니다.
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <FormField
+          label="학생 코드"
+          hint={
+            isEditing
+              ? '학생 코드는 최초 등록 시에만 지정합니다.'
+              : '비워두면 M-YYMMDDHHmm-XXXX 형태로 자동 발급됩니다.'
+          }
+        >
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={studentCode}
+              onChange={(e) => setStudentCode(e.target.value)}
+              placeholder={isEditing ? '' : '예: 2025-SC-001 (선택)'}
+              maxLength={60}
+              disabled={isEditing}
+            />
+          )}
+        </FormField>
+        <FormField label="이름" required error={nameErr || null}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="예: 홍길동"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="학년/학기">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={grade}
+              onChange={(e) => setGrade(e.target.value)}
+              placeholder="예: 고1 / 중3"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="학교">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={school}
+              onChange={(e) => setSchool(e.target.value)}
+              placeholder="예: 한빛고등학교"
+              maxLength={80}
+            />
+          )}
+        </FormField>
+        <FormField label="학번">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={schoolNo}
+              onChange={(e) => setSchoolNo(e.target.value)}
+              placeholder="예: 1학년 3반 12번"
+              maxLength={60}
+            />
+          )}
+        </FormField>
+        <FormField label="학생 연락처">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="010-1234-5678"
+              maxLength={30}
+            />
+          )}
+        </FormField>
+        <FormField label="보호자">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={guardian}
+              onChange={(e) => setGuardian(e.target.value)}
+              placeholder="예: 홍부모"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="보호자 연락처">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={guardianPhone}
+              onChange={(e) => setGuardianPhone(e.target.value)}
+              placeholder="010-9876-5432"
+              maxLength={30}
+            />
+          )}
+        </FormField>
+        <FormField label="내신 메모" className="md:col-span-2" hint="자유 텍스트. 예: 2025-1 전 과목 1등급, 수학 약함 등">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={gradeMemo}
+              onChange={(e) => setGradeMemo(e.target.value)}
+              placeholder="학생의 내신 상태·경향을 자유롭게 기록합니다."
+              rows={3}
+              maxLength={2000}
+            />
+          )}
+        </FormField>
+        <FormField label="일반 메모" className="md:col-span-2">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={memo}
+              onChange={(e) => setMemo(e.target.value)}
+              placeholder="특이사항, 주의점, 상담 포인트 등"
+              rows={3}
+              maxLength={2000}
+            />
+          )}
+        </FormField>
+      </div>
+    </Modal>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Tab: Grades (내신 성적)
+// -----------------------------------------------------------------------------
+
+function GradesTab({
+  studentId,
+  currentUserId,
+}: {
+  studentId: number;
+  currentUserId: number;
+}) {
+  const api = getApi()!;
+  const confirm = useConfirm();
+  const [editing, setEditing] = useState<GradeRow | 'new' | null>(null);
+
+  const gradesQuery = useQuery({
+    queryKey: ['students.grades', studentId],
+    queryFn: () =>
+      api.students.listGrades(studentId) as unknown as Promise<GradeRow[]>,
+  });
+
+  const grades = gradesQuery.data ?? [];
+
+  // Group by grade_level/semester for readability.
+  const grouped = useMemo(() => {
+    const groups = new Map<string, GradeRow[]>();
+    for (const g of grades) {
+      const key = `${g.grade_level} / ${g.semester}`;
+      const arr = groups.get(key) ?? [];
+      arr.push(g);
+      groups.set(key, arr);
+    }
+    return Array.from(groups.entries());
+  }, [grades]);
+
+  const deleteMutation = useMutationWithToast({
+    mutationFn: (id: number) =>
+      api.students.deleteGrade({ id, actorId: currentUserId }),
+    successMessage: '내신 성적을 삭제했습니다',
+    errorMessage: '삭제에 실패했습니다',
+    invalidates: [['students.grades', studentId]],
+  });
+
+  async function handleDelete(g: GradeRow) {
+    const ok = await confirm({
+      title: '내신 성적 삭제',
+      description: `${g.grade_level} ${g.semester} · ${g.subject} 기록을 삭제할까요?`,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (ok) deleteMutation.mutate(g.id);
+  }
+
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-fg flex items-center gap-1.5">
+          <GraduationCap size={14} /> 내신 성적
+        </h3>
+        <button
+          type="button"
+          className="btn-primary text-xs flex items-center gap-1"
+          onClick={() => setEditing('new')}
+        >
+          <Plus size={12} /> 내신 추가
+        </button>
+      </div>
+
+      {gradesQuery.isLoading ? (
+        <LoadingPanel label="내신 성적을 불러오는 중…" />
+      ) : grades.length === 0 ? (
+        <div className="card">
+          <EmptyState
+            icon={GraduationCap}
+            title="등록된 내신 성적이 없습니다"
+            hint="'내신 추가' 버튼으로 학년/학기/과목별 성적을 기록합니다."
+          />
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {grouped.map(([key, rows]) => (
+            <div key={key} className="card p-0 overflow-hidden">
+              <header className="flex items-center justify-between gap-2 border-b border-border px-4 py-2 bg-bg-soft/30">
+                <h4 className="text-xs font-semibold text-fg">{key}</h4>
+                <span className="text-[11px] text-fg-subtle">{rows.length}과목</span>
+              </header>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-bg-soft/50 text-fg-muted">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-medium">과목</th>
+                      <th className="px-3 py-2 text-left font-medium">등급</th>
+                      <th className="px-3 py-2 text-left font-medium">원점수</th>
+                      <th className="px-3 py-2 text-left font-medium">메모</th>
+                      <th className="px-3 py-2 text-left font-medium">입력자</th>
+                      <th className="px-3 py-2 text-right font-medium">액션</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {rows.map((g) => (
+                      <tr key={g.id} className="hover:bg-bg-soft/40">
+                        <td className="px-3 py-2 font-medium text-fg">{g.subject}</td>
+                        <td className="px-3 py-2 text-fg-muted">{g.score ?? '—'}</td>
+                        <td className="px-3 py-2 tabular-nums text-fg-subtle">
+                          {g.raw_score === null || g.raw_score === undefined ? '—' : g.raw_score}
+                        </td>
+                        <td className="px-3 py-2 text-fg-muted max-w-[260px] truncate">
+                          {g.memo ?? '—'}
+                        </td>
+                        <td className="px-3 py-2 text-fg-subtle">{g.created_by_name ?? '—'}</td>
+                        <td className="px-3 py-2 text-right">
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              className="btn-ghost text-xs flex items-center gap-1"
+                              onClick={() => setEditing(g)}
+                            >
+                              <Edit3 size={12} /> 수정
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-ghost text-xs text-rose-300 flex items-center gap-1"
+                              onClick={() => handleDelete(g)}
+                            >
+                              <Trash2 size={12} /> 삭제
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <GradeModal
+        studentId={studentId}
+        currentUserId={currentUserId}
+        initial={editing}
+        onClose={() => setEditing(null)}
+      />
+    </section>
+  );
+}
+
+function GradeModal({
+  studentId,
+  currentUserId,
+  initial,
+  onClose,
+}: {
+  studentId: number;
+  currentUserId: number;
+  initial: GradeRow | 'new' | null;
+  onClose: () => void;
+}) {
+  const api = getApi()!;
+  const open = initial !== null;
+  const editing = initial && initial !== 'new' ? initial : null;
+
+  const [gradeLevel, setGradeLevel] = useState('');
+  const [semester, setSemester] = useState('');
+  const [subject, setSubject] = useState('');
+  const [score, setScore] = useState('');
+  const [rawScore, setRawScore] = useState('');
+  const [memo, setMemo] = useState('');
+  const [touched, setTouched] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    if (editing) {
+      setGradeLevel(editing.grade_level);
+      setSemester(editing.semester);
+      setSubject(editing.subject);
+      setScore(editing.score ?? '');
+      setRawScore(
+        editing.raw_score === null || editing.raw_score === undefined
+          ? ''
+          : String(editing.raw_score),
+      );
+      setMemo(editing.memo ?? '');
+    } else {
+      setGradeLevel('');
+      setSemester('');
+      setSubject('');
+      setScore('');
+      setRawScore('');
+      setMemo('');
+    }
+    setTouched(false);
+  }, [open, editing]);
+
+  const gradeLevelErr =
+    touched && firstError<string>([required('학년은 필수입니다')])(gradeLevel);
+  const semesterErr =
+    touched && firstError<string>([required('학기는 필수입니다')])(semester);
+  const subjectErr =
+    touched && firstError<string>([required('과목은 필수입니다')])(subject);
+
+  const save = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.students.upsertGrade>[0]) =>
+      api.students.upsertGrade(payload),
+    successMessage: editing ? '내신 성적을 수정했습니다' : '내신 성적을 추가했습니다',
+    errorMessage: '내신 저장에 실패했습니다',
+    invalidates: [['students.grades', studentId]],
+    onSuccess: () => onClose(),
+  });
+
+  function submit() {
+    setTouched(true);
+    if (gradeLevelErr || semesterErr || subjectErr) return;
+    const rawNum = rawScore.trim() === '' ? null : Number(rawScore);
+    if (rawNum !== null && Number.isNaN(rawNum)) return;
+    save.mutate({
+      id: editing?.id,
+      studentId,
+      gradeLevel: gradeLevel.trim(),
+      semester: semester.trim(),
+      subject: subject.trim(),
+      score: score.trim() || null,
+      rawScore: rawNum,
+      memo: memo.trim() || null,
+      actorId: currentUserId,
+    });
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={editing ? '내신 성적 수정' : '내신 성적 추가'}
+      size="md"
+      footer={
+        <>
+          <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+            취소
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            onClick={submit}
+            disabled={save.isPending}
+          >
+            {save.isPending ? '저장 중…' : '저장'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <FormField label="학년" required error={gradeLevelErr || null}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={gradeLevel}
+              onChange={(e) => setGradeLevel(e.target.value)}
+              placeholder="예: 고1 / 중3"
+              maxLength={20}
+            />
+          )}
+        </FormField>
+        <FormField label="학기" required error={semesterErr || null}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={semester}
+              onChange={(e) => setSemester(e.target.value)}
+              placeholder="예: 1학기 / 2학기"
+              maxLength={20}
+            />
+          )}
+        </FormField>
+        <FormField label="과목" required error={subjectErr || null} className="md:col-span-2">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              placeholder="예: 수학 / 국어 / 영어 …"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="등급 / 표기" hint="예: 1등급, A, 상위 10%">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={score}
+              onChange={(e) => setScore(e.target.value)}
+              placeholder="예: 1등급"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="원점수" hint="숫자만 입력. 예: 92.5">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              type="number"
+              step="0.1"
+              value={rawScore}
+              onChange={(e) => setRawScore(e.target.value)}
+              placeholder="예: 92.5"
+            />
+          )}
+        </FormField>
+        <FormField label="메모" className="md:col-span-2">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={memo}
+              onChange={(e) => setMemo(e.target.value)}
+              placeholder="시험 범위·단원, 기억할 점, 피드백 등"
+              rows={3}
+              maxLength={1000}
+            />
+          )}
+        </FormField>
+      </div>
+    </Modal>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Tab: Counseling logs (상담 이력)
+// -----------------------------------------------------------------------------
+
+function CounselingTab({
+  studentId,
+  currentUserId,
+}: {
+  studentId: number;
+  currentUserId: number;
+}) {
+  const api = getApi()!;
+  const confirm = useConfirm();
+  const [editing, setEditing] = useState<CounselingLogRow | 'new' | null>(null);
+
+  const logsQuery = useQuery({
+    queryKey: ['students.counseling', studentId],
+    queryFn: () =>
+      api.students.listCounseling(studentId) as unknown as Promise<CounselingLogRow[]>,
+  });
+
+  const logs = logsQuery.data ?? [];
+
+  const deleteMutation = useMutationWithToast({
+    mutationFn: (id: number) =>
+      api.students.deleteCounseling({ id, actorId: currentUserId }),
+    successMessage: '상담 기록을 삭제했습니다',
+    errorMessage: '삭제에 실패했습니다',
+    invalidates: [['students.counseling', studentId]],
+  });
+
+  async function handleDelete(log: CounselingLogRow) {
+    const ok = await confirm({
+      title: '상담 기록 삭제',
+      description: `"${log.title}" 상담 기록을 삭제할까요?`,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (ok) deleteMutation.mutate(log.id);
+  }
+
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-fg flex items-center gap-1.5">
+          <MessageSquare size={14} /> 상담 이력
+        </h3>
+        <button
+          type="button"
+          className="btn-primary text-xs flex items-center gap-1"
+          onClick={() => setEditing('new')}
+        >
+          <Plus size={12} /> 상담 기록 추가
+        </button>
+      </div>
+
+      {logsQuery.isLoading ? (
+        <LoadingPanel label="상담 이력을 불러오는 중…" />
+      ) : logs.length === 0 ? (
+        <div className="card">
+          <EmptyState
+            icon={MessageSquare}
+            title="등록된 상담 기록이 없습니다"
+            hint="'상담 기록 추가'로 학생/학부모 상담 내역을 기록합니다."
+          />
+        </div>
+      ) : (
+        <ol className="space-y-2">
+          {logs.map((log) => (
+            <li key={log.id} className="card p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 text-sm text-fg">
+                    <span className="tabular-nums text-fg-subtle text-xs">
+                      {fmtDate(log.log_date)}
+                    </span>
+                    <span className="font-semibold">{log.title}</span>
+                    {log.category && (
+                      <span className="rounded border border-border bg-bg-soft px-1.5 py-0.5 text-[10px] text-fg-muted">
+                        {log.category}
+                      </span>
+                    )}
+                  </div>
+                  {log.body && (
+                    <p className="mt-1 text-xs text-fg-muted whitespace-pre-line">
+                      {log.body}
+                    </p>
+                  )}
+                  <div className="mt-1 text-[10px] text-fg-subtle">
+                    작성 {log.created_by_name ?? '—'} · {fmtDateTime(log.updated_at)}
+                  </div>
+                </div>
+                <div className="inline-flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    className="btn-ghost text-xs flex items-center gap-1"
+                    onClick={() => setEditing(log)}
+                  >
+                    <Edit3 size={12} /> 수정
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost text-xs text-rose-300 flex items-center gap-1"
+                    onClick={() => handleDelete(log)}
+                  >
+                    <Trash2 size={12} /> 삭제
+                  </button>
+                </div>
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <CounselingModal
+        studentId={studentId}
+        currentUserId={currentUserId}
+        initial={editing}
+        onClose={() => setEditing(null)}
+      />
+    </section>
+  );
+}
+
+function CounselingModal({
+  studentId,
+  currentUserId,
+  initial,
+  onClose,
+}: {
+  studentId: number;
+  currentUserId: number;
+  initial: CounselingLogRow | 'new' | null;
+  onClose: () => void;
+}) {
+  const api = getApi()!;
+  const open = initial !== null;
+  const editing = initial && initial !== 'new' ? initial : null;
+
+  const [logDate, setLogDate] = useState('');
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [category, setCategory] = useState('');
+  const [touched, setTouched] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    if (editing) {
+      setLogDate(editing.log_date ? editing.log_date.slice(0, 10) : '');
+      setTitle(editing.title);
+      setBody(editing.body ?? '');
+      setCategory(editing.category ?? '');
+    } else {
+      const today = new Date();
+      const pad = (n: number) => n.toString().padStart(2, '0');
+      setLogDate(
+        `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`,
+      );
+      setTitle('');
+      setBody('');
+      setCategory('');
+    }
+    setTouched(false);
+  }, [open, editing]);
+
+  const logDateErr =
+    touched && firstError<string>([required('상담 일자는 필수입니다')])(logDate);
+  const titleErr =
+    touched && firstError<string>([required('제목은 필수입니다')])(title);
+
+  const save = useMutationWithToast({
+    mutationFn: (payload: Parameters<typeof api.students.upsertCounseling>[0]) =>
+      api.students.upsertCounseling(payload),
+    successMessage: editing ? '상담 기록을 수정했습니다' : '상담 기록을 추가했습니다',
+    errorMessage: '상담 저장에 실패했습니다',
+    invalidates: [['students.counseling', studentId]],
+    onSuccess: () => onClose(),
+  });
+
+  function submit() {
+    setTouched(true);
+    if (logDateErr || titleErr) return;
+    save.mutate({
+      id: editing?.id,
+      studentId,
+      logDate,
+      title: title.trim(),
+      body: body.trim() || null,
+      category: category.trim() || null,
+      actorId: currentUserId,
+    });
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={editing ? '상담 기록 수정' : '상담 기록 추가'}
+      size="md"
+      footer={
+        <>
+          <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+            취소
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            onClick={submit}
+            disabled={save.isPending}
+          >
+            {save.isPending ? '저장 중…' : '저장'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <FormField label="상담 일자" required error={logDateErr || null}>
+          {(slot) => (
+            <TextInput
+              {...slot}
+              type="date"
+              value={logDate}
+              onChange={(e) => setLogDate(e.target.value)}
+            />
+          )}
+        </FormField>
+        <FormField label="분류" hint="예: 학부모, 학생, 진로, 학습 등">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              placeholder="(선택) 학부모 / 학생 / 진로 …"
+              maxLength={40}
+            />
+          )}
+        </FormField>
+        <FormField label="제목" required error={titleErr || null} className="md:col-span-2">
+          {(slot) => (
+            <TextInput
+              {...slot}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="예: 2025-1 수행평가 일정 조정 요청"
+              maxLength={120}
+            />
+          )}
+        </FormField>
+        <FormField label="내용" className="md:col-span-2">
+          {(slot) => (
+            <Textarea
+              {...slot}
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder="상담 내용·결정 사항·후속 조치 등을 자유롭게 기록합니다."
+              rows={6}
+              maxLength={4000}
+            />
+          )}
+        </FormField>
+      </div>
+    </Modal>
+  );
 }

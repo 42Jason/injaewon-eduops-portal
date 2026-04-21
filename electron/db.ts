@@ -176,6 +176,92 @@ function runMigrations(db: Db) {
   } catch (err) {
     console.warn('[db] notion_sync_runs 생성 skipped:', err);
   }
+
+  // --- students: 연락처·학번·내신 메모 컬럼 --------------------------------
+  try {
+    const cols = columns('students');
+    if (cols.size > 0) {
+      if (!cols.has('school_no')) {
+        db.exec(`ALTER TABLE students ADD COLUMN school_no TEXT`);
+      }
+      if (!cols.has('phone')) {
+        db.exec(`ALTER TABLE students ADD COLUMN phone TEXT`);
+      }
+      if (!cols.has('guardian_phone')) {
+        db.exec(`ALTER TABLE students ADD COLUMN guardian_phone TEXT`);
+      }
+      if (!cols.has('grade_memo')) {
+        db.exec(`ALTER TABLE students ADD COLUMN grade_memo TEXT`);
+      }
+    }
+  } catch (err) {
+    console.warn('[db] students 연락처/내신 컬럼 skipped:', err);
+  }
+
+  // --- assignments: 소프트 삭제 컬럼 ---------------------------------------
+  try {
+    const cols = columns('assignments');
+    if (cols.size > 0 && !cols.has('deleted_at')) {
+      db.exec(`ALTER TABLE assignments ADD COLUMN deleted_at TEXT`);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_assignments_deleted ON assignments(deleted_at)`,
+      );
+    }
+  } catch (err) {
+    console.warn('[db] assignments.deleted_at 추가 skipped:', err);
+  }
+
+  // --- student_grades: 내신 성적 테이블 -----------------------------------
+  try {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS student_grades (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+         grade_level   TEXT    NOT NULL,
+         semester      TEXT    NOT NULL,
+         subject       TEXT    NOT NULL,
+         score         TEXT,
+         raw_score     REAL,
+         memo          TEXT,
+         created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+         updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+         UNIQUE (student_id, grade_level, semester, subject)
+       )`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_student_grades_student ON student_grades(student_id)`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_student_grades_term
+         ON student_grades(student_id, grade_level, semester)`,
+    );
+  } catch (err) {
+    console.warn('[db] student_grades 생성 skipped:', err);
+  }
+
+  // --- student_counseling_logs: 상담 이력 테이블 --------------------------
+  try {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS student_counseling_logs (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         student_id    INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+         log_date      TEXT    NOT NULL,
+         title         TEXT    NOT NULL,
+         body          TEXT,
+         category      TEXT,
+         created_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+         updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+       )`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_student_counseling_student
+         ON student_counseling_logs(student_id, log_date DESC)`,
+    );
+  } catch (err) {
+    console.warn('[db] student_counseling_logs 생성 skipped:', err);
+  }
 }
 
 /**

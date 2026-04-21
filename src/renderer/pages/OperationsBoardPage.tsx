@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   LayoutGrid, AlertTriangle, Clock, User as UserIcon, Filter, RefreshCcw,
+  Plus, Edit3, Trash2, CheckSquare, Square,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
@@ -18,6 +19,11 @@ import { useToast } from '@/stores/toast';
 import { useConfirm } from '@/components/ui/ConfirmDialog';
 import { LoadingPanel, Spinner } from '@/components/ui/Spinner';
 import { EmptyState } from '@/components/ui/EmptyState';
+import {
+  AssignmentEditModal,
+  BulkToolbar,
+  type AssignmentEditInitial,
+} from './AssignmentsPage';
 
 interface BoardRow {
   id: number;
@@ -103,6 +109,14 @@ export function OperationsBoardPage() {
   const [mineOnly, setMineOnly] = useState(false);
   const [overdueOnly, setOverdueOnly] = useState(false);
 
+  // CRUD state
+  const [creating, setCreating] = useState(false);
+  const [editingRow, setEditingRow] = useState<BoardRow | null>(null);
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(() => new Set());
+  const [bulkMenu, setBulkMenu] = useState<'state' | 'assign' | null>(null);
+
+  const canManage = Boolean(user?.perms.isLeadership);
+
   const listQuery = useQuery({
     queryKey: ['board.list', mineOnly ? user?.id : null],
     queryFn: async () => {
@@ -167,6 +181,133 @@ export function OperationsBoardPage() {
     },
   });
 
+  // --- CRUD / bulk mutations ----------------------------------------------
+  const deleteMut = useMutationWithToast<
+    { ok: boolean; error?: string },
+    Error,
+    { id: number }
+  >({
+    mutationFn: (p) =>
+      api!.assignments.softDelete({ id: p.id, actorId: user!.id }),
+    successMessage: '과제를 삭제(보관)했습니다',
+    errorMessage: '과제 삭제에 실패했습니다',
+    invalidates: [
+      ['board.list'],
+      ['board.summary'],
+      ['assignments.list'],
+      ['home.stats'],
+    ],
+  });
+
+  const bulkStateMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    { ids: number[]; state: AssignmentState }
+  >({
+    mutationFn: (p) =>
+      api!.assignments.bulkSetState({ ids: p.ids, state: p.state, actorId: user!.id }),
+    successMessage: false,
+    errorMessage: '일괄 상태 변경에 실패했습니다',
+    invalidates: [
+      ['board.list'],
+      ['board.summary'],
+      ['assignments.list'],
+      ['home.stats'],
+    ],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건을 "${vars.state}" 상태로 변경했습니다`);
+        setCheckedIds(new Set());
+        setBulkMenu(null);
+      }
+    },
+  });
+
+  const bulkAssignMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    {
+      ids: number[];
+      parserId?: number | null;
+      qa1Id?: number | null;
+      qaFinalId?: number | null;
+    }
+  >({
+    mutationFn: (p) =>
+      api!.assignments.bulkAssign({
+        ids: p.ids,
+        parserId: p.parserId,
+        qa1Id: p.qa1Id,
+        qaFinalId: p.qaFinalId,
+        actorId: user!.id,
+      }),
+    successMessage: false,
+    errorMessage: '일괄 담당자 지정에 실패했습니다',
+    invalidates: [['board.list'], ['assignments.list']],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건 담당자를 업데이트했습니다`);
+        setCheckedIds(new Set());
+        setBulkMenu(null);
+      }
+    },
+  });
+
+  const bulkDeleteMut = useMutationWithToast<
+    { ok: boolean; error?: string; changed?: number },
+    Error,
+    { ids: number[] }
+  >({
+    mutationFn: (p) => api!.assignments.bulkDelete({ ids: p.ids, actorId: user!.id }),
+    successMessage: false,
+    errorMessage: '일괄 삭제에 실패했습니다',
+    invalidates: [
+      ['board.list'],
+      ['board.summary'],
+      ['assignments.list'],
+      ['home.stats'],
+    ],
+    onSuccess: (res, vars) => {
+      if (res.ok) {
+        toast.ok(`${res.changed ?? vars.ids.length}건을 삭제(보관)했습니다`);
+        setCheckedIds(new Set());
+      }
+    },
+  });
+
+  async function handleDeleteRow(row: BoardRow) {
+    if (!live || !user) return;
+    const ok = await confirm({
+      title: '이 과제를 삭제할까요?',
+      description: `"${rowTitle(row)}" (${row.code}) 을(를) 소프트 삭제합니다.`,
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    deleteMut.mutate({ id: row.id });
+  }
+
+  async function handleBulkDelete() {
+    if (!live || !user || checkedIds.size === 0) return;
+    const ok = await confirm({
+      title: `${checkedIds.size}건 과제를 일괄 삭제할까요?`,
+      description: '선택한 과제를 소프트 삭제합니다. DB에는 남아있어 복구 가능합니다.',
+      confirmLabel: '일괄 삭제',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    bulkDeleteMut.mutate({ ids: Array.from(checkedIds) });
+  }
+
+  function toggleCheck(id: number) {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   /** Gate destructive transitions behind a confirm dialog. */
   async function requestTransition(id: number, next: AssignmentState) {
     if (DESTRUCTIVE.includes(next)) {
@@ -211,20 +352,51 @@ export function OperationsBoardPage() {
             과제 16단계 상태를 5개 칸반 컬럼으로 그룹핑 — 카드의 상태를 바로 전환할 수 있습니다.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            qc.invalidateQueries({ queryKey: ['board.list'] });
-            qc.invalidateQueries({ queryKey: ['board.summary'] });
-          }}
-          disabled={listQuery.isFetching}
-          aria-label="새로고침"
-          className="btn-outline text-sm flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent/40 disabled:opacity-60"
-        >
-          {listQuery.isFetching ? <Spinner size={14} /> : <RefreshCcw size={14} />}
-          새로고침
-        </button>
+        <div className="flex items-center gap-2">
+          {canManage && live && (
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              className="btn-primary text-sm flex items-center gap-1.5"
+            >
+              <Plus size={14} /> 과제 추가
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              qc.invalidateQueries({ queryKey: ['board.list'] });
+              qc.invalidateQueries({ queryKey: ['board.summary'] });
+            }}
+            disabled={listQuery.isFetching}
+            aria-label="새로고침"
+            className="btn-outline text-sm flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent/40 disabled:opacity-60"
+          >
+            {listQuery.isFetching ? <Spinner size={14} /> : <RefreshCcw size={14} />}
+            새로고침
+          </button>
+        </div>
       </div>
+
+      {/* Bulk toolbar */}
+      {canManage && live && checkedIds.size > 0 && (
+        <BulkToolbar
+          count={checkedIds.size}
+          bulkMenu={bulkMenu}
+          setBulkMenu={setBulkMenu}
+          onBulkState={(s) =>
+            bulkStateMut.mutate({ ids: Array.from(checkedIds), state: s })
+          }
+          onBulkAssign={(a) =>
+            bulkAssignMut.mutate({ ids: Array.from(checkedIds), ...a })
+          }
+          onBulkDelete={handleBulkDelete}
+          onClear={() => setCheckedIds(new Set())}
+          pending={
+            bulkStateMut.isPending || bulkAssignMut.isPending || bulkDeleteMut.isPending
+          }
+        />
+      )}
 
       {/* Summary Pills */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -381,6 +553,12 @@ export function OperationsBoardPage() {
                         row={r}
                         onChangeState={(next) => requestTransition(r.id, next)}
                         pending={setStateMut.isPending}
+                        canManage={canManage}
+                        checked={checkedIds.has(r.id)}
+                        onToggleCheck={() => toggleCheck(r.id)}
+                        onEdit={() => setEditingRow(r)}
+                        onDelete={() => handleDeleteRow(r)}
+                        deleting={deleteMut.isPending}
                       />
                     ))
                   )}
@@ -389,6 +567,26 @@ export function OperationsBoardPage() {
             );
           })}
         </div>
+      )}
+
+      {/* Create/Edit modals — reuse AssignmentsPage's modal */}
+      {canManage && live && user && (
+        <>
+          <AssignmentEditModal
+            open={creating}
+            mode="create"
+            initial={null}
+            currentUserId={user.id}
+            onClose={() => setCreating(false)}
+          />
+          <AssignmentEditModal
+            open={!!editingRow}
+            mode="edit"
+            initial={editingRow as unknown as AssignmentEditInitial}
+            currentUserId={user.id}
+            onClose={() => setEditingRow(null)}
+          />
+        </>
       )}
     </div>
   );
@@ -472,10 +670,22 @@ function BoardCard({
   row,
   onChangeState,
   pending,
+  canManage,
+  checked,
+  onToggleCheck,
+  onEdit,
+  onDelete,
+  deleting,
 }: {
   row: BoardRow;
   onChangeState: (next: AssignmentState) => void;
   pending: boolean;
+  canManage?: boolean;
+  checked?: boolean;
+  onToggleCheck?: () => void;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  deleting?: boolean;
 }) {
   const overdue = isOverdue(row);
   const due = formatDueLabel(row.due_at ?? null);
@@ -494,14 +704,52 @@ function BoardCard({
       className={cn(
         'rounded-md border bg-bg p-2.5 space-y-2 text-xs',
         'focus-within:ring-2 focus-within:ring-accent/40',
-        overdue ? 'border-rose-500/50' : 'border-border',
+        checked ? 'border-accent/60 ring-1 ring-accent/30' : overdue ? 'border-rose-500/50' : 'border-border',
       )}
     >
-      <div className="flex items-center justify-between">
-        <span className="font-mono text-[10px] text-fg-subtle">{row.code}</span>
-        <span className={cn('px-1.5 py-0.5 rounded text-[10px]', riskChipClass(row.risk))}>
-          {riskLabel(row.risk)}
-        </span>
+      <div className="flex items-center justify-between gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
+          {canManage && onToggleCheck && (
+            <button
+              type="button"
+              onClick={onToggleCheck}
+              aria-pressed={!!checked}
+              aria-label={checked ? '선택 해제' : '선택'}
+              className="text-fg-subtle hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 rounded"
+            >
+              {checked ? <CheckSquare size={13} /> : <Square size={13} />}
+            </button>
+          )}
+          <span className="font-mono text-[10px] text-fg-subtle truncate">{row.code}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className={cn('px-1.5 py-0.5 rounded text-[10px]', riskChipClass(row.risk))}>
+            {riskLabel(row.risk)}
+          </span>
+          {canManage && onEdit && (
+            <button
+              type="button"
+              onClick={onEdit}
+              aria-label="과제 수정"
+              title="수정"
+              className="text-fg-subtle hover:text-fg p-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+            >
+              <Edit3 size={11} />
+            </button>
+          )}
+          {canManage && onDelete && (
+            <button
+              type="button"
+              onClick={onDelete}
+              disabled={deleting}
+              aria-label="과제 삭제"
+              title="삭제"
+              className="text-fg-subtle hover:text-rose-300 p-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40 disabled:opacity-50"
+            >
+              <Trash2 size={11} />
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="text-fg font-medium text-sm leading-snug line-clamp-2">
