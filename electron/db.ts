@@ -157,7 +157,7 @@ function runMigrations(db: Db) {
     db.exec(
       `CREATE TABLE IF NOT EXISTS notion_sync_runs (
          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-         kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe')),
+         kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe','assignments')),
          started_at    TEXT    NOT NULL DEFAULT (datetime('now')),
          finished_at   TEXT,
          ok            INTEGER NOT NULL DEFAULT 0,
@@ -175,6 +175,82 @@ function runMigrations(db: Db) {
     );
   } catch (err) {
     console.warn('[db] notion_sync_runs 생성 skipped:', err);
+  }
+
+  // --- notion_sync_runs.kind CHECK 확장 ('assignments' 추가) ---------------
+  // SQLite 는 컬럼 CHECK 제약 변경을 직접 지원하지 않으므로, 이전 버전 DB 에서는
+  // 테이블 통째로 재생성한다. 현재 CHECK 정의를 sqlite_master 에서 읽어
+  // 'assignments' 문자열이 있는지 스니핑 — 없으면 리빌드.
+  try {
+    const defRow = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notion_sync_runs'`)
+      .get() as { sql: string } | undefined;
+    const currentSql = defRow?.sql ?? '';
+    if (currentSql && !currentSql.includes("'assignments'")) {
+      db.exec('BEGIN');
+      try {
+        db.exec(
+          `CREATE TABLE notion_sync_runs__new (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe','assignments')),
+             started_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+             finished_at   TEXT,
+             ok            INTEGER NOT NULL DEFAULT 0,
+             inserted      INTEGER NOT NULL DEFAULT 0,
+             updated       INTEGER NOT NULL DEFAULT 0,
+             skipped       INTEGER NOT NULL DEFAULT 0,
+             errors        INTEGER NOT NULL DEFAULT 0,
+             message       TEXT,
+             triggered_by  INTEGER REFERENCES users(id) ON DELETE SET NULL
+           )`,
+        );
+        db.exec(
+          `INSERT INTO notion_sync_runs__new
+             (id, kind, started_at, finished_at, ok, inserted, updated, skipped, errors, message, triggered_by)
+           SELECT id, kind, started_at, finished_at, ok, inserted, updated, skipped, errors, message, triggered_by
+             FROM notion_sync_runs`,
+        );
+        db.exec(`DROP TABLE notion_sync_runs`);
+        db.exec(`ALTER TABLE notion_sync_runs__new RENAME TO notion_sync_runs`);
+        db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_notion_sync_runs_kind
+             ON notion_sync_runs(kind, started_at DESC)`,
+        );
+        db.exec('COMMIT');
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      }
+    }
+  } catch (err) {
+    console.warn('[db] notion_sync_runs CHECK 확장 skipped:', err);
+  }
+
+  // --- assignments: Notion 연동 컬럼 --------------------------------------
+  // "컨설팅 과제 의뢰" DB 에서 끌어온 과제 페이지를 notion_page_id 기준으로
+  // 멱등 upsert 하기 위한 컬럼. 기존 DB 에도 추가로 칠해준다.
+  try {
+    const cols = columns('assignments');
+    if (cols.size > 0) {
+      if (!cols.has('notion_page_id')) {
+        db.exec(`ALTER TABLE assignments ADD COLUMN notion_page_id TEXT`);
+      }
+      if (!cols.has('notion_source')) {
+        db.exec(`ALTER TABLE assignments ADD COLUMN notion_source TEXT`);
+      }
+      if (!cols.has('notion_synced_at')) {
+        db.exec(`ALTER TABLE assignments ADD COLUMN notion_synced_at TEXT`);
+      }
+      if (!cols.has('notion_extra')) {
+        db.exec(`ALTER TABLE assignments ADD COLUMN notion_extra TEXT`);
+      }
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_assignments_notion_page
+           ON assignments(notion_page_id)`,
+      );
+    }
+  } catch (err) {
+    console.warn('[db] assignments Notion 컬럼 추가 skipped:', err);
   }
 
   // --- students: 연락처·학번·내신 메모 컬럼 --------------------------------

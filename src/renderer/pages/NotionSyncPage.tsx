@@ -34,7 +34,7 @@ interface NotionDbCfg {
 
 interface SyncRun {
   id: number;
-  kind: 'students' | 'staff' | 'probe';
+  kind: 'students' | 'staff' | 'probe' | 'assignments';
   started_at: string;
   finished_at: string | null;
   ok: number;
@@ -50,12 +50,14 @@ const KIND_LABEL: Record<SyncRun['kind'], string> = {
   students: '학생',
   staff: '직원',
   probe: '연결 확인',
+  assignments: '과제',
 };
 
 const KIND_TONE: Record<SyncRun['kind'], string> = {
   students: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
   staff: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
   probe: 'bg-bg-soft text-fg-subtle border-border',
+  assignments: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
 };
 
 // -----------------------------------------------------------------------------

@@ -238,3 +238,4 @@ export function flattenProperties(properties: NotionPageProperties): Record<stri
   }
   return out;
 }
+

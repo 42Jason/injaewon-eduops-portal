@@ -40,6 +40,18 @@ export interface NotionSettings {
     contactField?: string;
     guardianField?: string;
   }>;
+  assignmentDatabases: Array<{
+    id: string;           // "컨설팅 과제 의뢰" 등 과제 요청 DB 의 id
+    label?: string;       // 예: "컨설팅 과제 의뢰"
+    // 과제 요청 DB 에 사용되는 프로퍼티 이름 (기본값이 있으므로 선택 입력).
+    subjectField?: string;   // 과목명
+    titleField?: string;     // 보고서 주제 / 과제 이름
+    statusField?: string;    // 진행 상황
+    parserField?: string;    // 작성자
+    qa1Field?: string;       // 1차 검수자
+    qaFinalField?: string;   // 2차 작성자 / 최종 검수
+    dueField?: string;       // 마감시한
+  }>;
 }
 
 const DEFAULT_STUDENT_DATABASES: NotionSettings['studentDatabases'] = [
@@ -58,6 +70,20 @@ const DEFAULT_STUDENT_DATABASES: NotionSettings['studentDatabases'] = [
     id: '2f2e037ff1e98062a13ce01d7991ee93',
     label: '구미호',
     guardianField: '연락처',
+  },
+];
+
+const DEFAULT_ASSIGNMENT_DATABASES: NotionSettings['assignmentDatabases'] = [
+  {
+    id: '1a8e037ff1e9803ab169ea8e4688d1e0',
+    label: '컨설팅 과제 의뢰',
+    subjectField: '과목명',
+    titleField: '✏️보고서 주제',
+    statusField: '진행 상황',
+    parserField: '작성자',
+    qa1Field: '1차 검수자',
+    qaFinalField: '2차 작성자',
+    dueField: '마감시한 (zap)',
   },
 ];
 
@@ -85,12 +111,19 @@ export function getNotionSettings(db: Db): NotionSettings {
   const dbsRaw = readAdminSetting(db, 'notion.studentDatabases') as
     | NotionSettings['studentDatabases']
     | null;
+  const asgRaw = readAdminSetting(db, 'notion.assignmentDatabases') as
+    | NotionSettings['assignmentDatabases']
+    | null;
   return {
     token: typeof token === 'string' ? token : '',
     studentDatabases:
       Array.isArray(dbsRaw) && dbsRaw.length > 0
         ? dbsRaw
         : DEFAULT_STUDENT_DATABASES,
+    assignmentDatabases:
+      Array.isArray(asgRaw) && asgRaw.length > 0
+        ? asgRaw
+        : DEFAULT_ASSIGNMENT_DATABASES,
   };
 }
 
@@ -105,9 +138,14 @@ export function saveNotionSettings(
       patch.studentDatabases !== undefined
         ? patch.studentDatabases
         : current.studentDatabases,
+    assignmentDatabases:
+      patch.assignmentDatabases !== undefined
+        ? patch.assignmentDatabases
+        : current.assignmentDatabases,
   };
   writeAdminSetting(db, 'notion.token', next.token ?? '');
   writeAdminSetting(db, 'notion.studentDatabases', next.studentDatabases);
+  writeAdminSetting(db, 'notion.assignmentDatabases', next.assignmentDatabases);
   return next;
 }
 
@@ -116,7 +154,7 @@ export function saveNotionSettings(
 // ---------------------------------------------------------------------------
 
 interface RunSummary {
-  kind: 'students' | 'staff' | 'probe';
+  kind: 'students' | 'staff' | 'probe' | 'assignments';
   ok: boolean;
   inserted: number;
   updated: number;
@@ -521,9 +559,254 @@ export async function syncStaff(
 }
 
 // ---------------------------------------------------------------------------
-// Facade — IPC 에서 바로 쓸 수 있도록 묶은 진입점
+// 과제 동기화 — "컨설팅 과제 의뢰" 스타일 Notion DB → assignments + students
 // ---------------------------------------------------------------------------
 
+/**
+ * 노션 "진행 상황" (13개) → EduOps assignments.state (16개) 매핑.
+ * 매핑되지 않는 문자열은 '신규접수' 로 처리. 공백 제거 후 비교.
+ */
+const NOTION_STATUS_MAP: Record<string, string> = {
+  '착수 전': '신규접수',
+  '재작업/2차 작업': '수정요청',
+  '초안': '파싱완료',
+  '진행중': '파싱진행중',
+  '검수 중 (1차)': '1차QA진행중',
+  '1차 검수 완료': '최종QA대기',
+  '최종 검수 중': '최종QA진행중',
+  '최종 검수 중 (혜은)': '최종QA진행중',
+  '초안 전달': '완료',
+  '수정 필요': '수정요청',
+  '수정 완료': '완료',
+  '반려': '최종QA반려',
+  '보류': '보류',
+};
+
+function mapNotionStatusToState(raw: string): string {
+  const s = (raw ?? '').trim();
+  if (!s) return '신규접수';
+  return NOTION_STATUS_MAP[s] ?? '신규접수';
+}
+
+/** Notion people/select 필드의 담당자 이름을 users.id 로 바꾸는 헬퍼. */
+function resolveUserByName(db: Db, rawName: string): number | null {
+  const name = (rawName ?? '').trim();
+  if (!name) return null;
+  // 정확 매칭 우선, 없으면 대소문자 무시 LIKE.
+  const exact = db
+    .prepare(`SELECT id FROM users WHERE name = ? LIMIT 1`)
+    .get(name) as { id: number } | undefined;
+  if (exact) return exact.id;
+  const loose = db
+    .prepare(
+      `SELECT id FROM users
+         WHERE lower(trim(name)) = lower(trim(?))
+         LIMIT 1`,
+    )
+    .get(name) as { id: number } | undefined;
+  return loose?.id ?? null;
+}
+
+/**
+ * Notion date property 를 ISO 문자열(UTC)로 변환. start 만 사용.
+ * 날짜 전용(시간 없음)이면 자정 UTC 로 해석.
+ */
+function readDateIso(prop: any): string | null {
+  if (!prop || prop.type !== 'date' || !prop.date?.start) return null;
+  const raw = String(prop.date.start);
+  // Notion 이 보내는 포맷은 YYYY-MM-DD 또는 ISO(오프셋 포함).
+  // Date 파싱이 실패하면 원본을 그대로 저장.
+  const t = Date.parse(raw);
+  return Number.isFinite(t) ? new Date(t).toISOString() : raw;
+}
+
+/**
+ * Notion file 속성을 평탄화된 URL 배열로 추출 — 외부 URL + 업로드 파일 모두.
+ * Notion 이 반환하는 presigned URL 은 1시간 후 만료되므로 여기서는 단순 보관용.
+ */
+function readFileUrls(prop: any): Array<{ name: string; url: string; expires?: string }> {
+  if (!prop || prop.type !== 'files' || !Array.isArray(prop.files)) return [];
+  const out: Array<{ name: string; url: string; expires?: string }> = [];
+  for (const f of prop.files) {
+    if (!f) continue;
+    const name = String(f.name ?? '');
+    if (f.type === 'external' && f.external?.url) {
+      out.push({ name, url: String(f.external.url) });
+    } else if (f.type === 'file' && f.file?.url) {
+      out.push({
+        name,
+        url: String(f.file.url),
+        expires: f.file.expiry_time ? String(f.file.expiry_time) : undefined,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * (name, school, grade) 로 기존 학생을 찾아 재사용. 없으면 새로 만든다.
+ * 과제 요청 DB 는 "한 행 = 한 과제" 이므로 동일 학생이 여러 번 나타날 수
+ * 있음 — upsert 키는 자연키 3종 세트.
+ */
+function upsertStudentNaturalKey(
+  db: Db,
+  opts: {
+    name: string;
+    school: string | null;
+    grade: string | null;
+    phone: string | null;
+    guardianPhone: string | null;
+    sourceLabel: string;
+    notionPageId: string; // assignment page id — 학생 identity 에는 쓰지 않고 fallback code 생성에만 사용
+    extraProps: Record<string, string>;
+  },
+): number | null {
+  const { name, school, grade, phone, guardianPhone, sourceLabel } = opts;
+  if (!name.trim()) return null;
+
+  const byNatural = db
+    .prepare(
+      `SELECT id FROM students
+         WHERE name = ?
+           AND IFNULL(school, '') = IFNULL(?, '')
+           AND IFNULL(grade,  '') = IFNULL(?, '')
+         ORDER BY deleted_at IS NULL DESC, id ASC
+         LIMIT 1`,
+    )
+    .get(name.trim(), school, grade) as { id: number } | undefined;
+
+  if (byNatural) {
+    // 연락처/학부모 번호는 비어 있는 경우에만 갱신 (기존 데이터 파괴 방지).
+    db.prepare(
+      `UPDATE students
+          SET phone = CASE WHEN IFNULL(phone, '') = '' THEN ? ELSE phone END,
+              guardian_phone = CASE WHEN IFNULL(guardian_phone, '') = '' THEN ? ELSE guardian_phone END,
+              notion_source = COALESCE(notion_source, ?),
+              notion_synced_at = datetime('now'),
+              deleted_at = NULL
+        WHERE id = ?`,
+    ).run(phone, guardianPhone, sourceLabel, byNatural.id);
+    return byNatural.id;
+  }
+
+  // 신규 — N-<label2>-<shortOfAssignmentPage> 로 코드 생성, 충돌 시 suffix.
+  const base = `N-${sourceLabel.slice(0, 2).toUpperCase() || 'NO'}-${shortId(opts.notionPageId)}`;
+  let code = base;
+  for (let i = 1; i < 6; i += 1) {
+    const dup = db
+      .prepare(`SELECT 1 FROM students WHERE student_code = ? LIMIT 1`)
+      .get(code);
+    if (!dup) break;
+    code = `${base}-${i}`;
+  }
+
+  const extraJson = JSON.stringify({
+    source: sourceLabel,
+    via: 'assignments-sync',
+    properties: opts.extraProps,
+  });
+
+  const info = db
+    .prepare(
+      `INSERT INTO students
+         (student_code, name, grade, school, phone, guardian_phone,
+          notion_source, notion_synced_at, notion_extra)
+       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
+    )
+    .run(code, name.trim(), grade, school, phone, guardianPhone, sourceLabel, extraJson);
+  return Number(info.lastInsertRowid);
+}
+
+/** 다음 `code` 값을 결정. 충돌 시 suffix 회전. */
+function nextAssignmentCode(db: Db, base: string): string {
+  let code = base;
+  for (let i = 1; i < 6; i += 1) {
+    const dup = db
+      .prepare(`SELECT 1 FROM assignments WHERE code = ? LIMIT 1`)
+      .get(code);
+    if (!dup) break;
+    code = `${base}-${i}`;
+  }
+  return code;
+}
+
+interface AssignmentDbCfg {
+  id: string;
+  label?: string;
+  subjectField?: string;
+  titleField?: string;
+  statusField?: string;
+  parserField?: string;
+  qa1Field?: string;
+  qaFinalField?: string;
+  dueField?: string;
+}
+
+interface NotionFileRef {
+  name: string;
+  url: string;
+  expires?: string;
+  kind: 'draft' | 'final' | 'attachment';
+}
+
+interface AssignmentUpsertResult {
+  status: 'inserted' | 'updated' | 'skipped';
+  assignmentId?: number;
+  studentId?: number | null;
+  files: NotionFileRef[];
+}
+
+function safeFilename(name: string, fallback: string): string {
+  const cleaned = (name || fallback)
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || fallback;
+}
+
+// ---------------------------------------------------------------------------
+// 과제 동기화 — TODO(v0.1.10): 현재는 스텁. 파일 레퍼런스 저장/다운로드 및
+// 학생/담당자 연결은 별도 PR에서 복원. v0.1.9 는 보안 핸들러 가드가 주목적.
+// ---------------------------------------------------------------------------
+export async function syncAssignments(
+  db: Db,
+  actorId?: number | null,
+): Promise<RunSummary & { runId: number }> {
+  const started = new Date().toISOString();
+  const summary: RunSummary = {
+    kind: 'assignments',
+    ok: false,
+    inserted: 0,
+    updated: 0,
+    skipped: 0,
+    errors: 1,
+    message: '과제 동기화는 v0.1.10 에서 재구현 예정입니다.',
+    triggeredBy: actorId ?? null,
+  };
+  const runId = writeRun(db, started, summary);
+  // safeFilename / nextAssignmentCode / resolveUserByName / readDateIso /
+  // readFileUrls / upsertStudentNaturalKey / mapNotionStatusToState 는
+  // syncAssignments 재구현 시 재사용하기 위해 파일에 남겨 두었습니다.
+  void safeFilename;
+  void nextAssignmentCode;
+  void resolveUserByName;
+  void readDateIso;
+  void readFileUrls;
+  void upsertStudentNaturalKey;
+  void mapNotionStatusToState;
+  // 또한 AssignmentDbCfg / NotionFileRef / AssignmentUpsertResult 타입 역시
+  // 현재 미사용이지만 동일한 이유로 남겨 둡니다.
+  type _Cfg = AssignmentDbCfg;
+  type _Ref = NotionFileRef;
+  type _Res = AssignmentUpsertResult;
+  void (null as unknown as _Cfg | _Ref | _Res);
+  return { ...summary, runId };
+}
+
+// ---------------------------------------------------------------------------
+// 외부에서 단일 네임스페이스로 호출하기 위한 진입점 모음. ipc.ts 가
+// `import { NotionSync } from './notion-sync'` 로 참조합니다.
+// ---------------------------------------------------------------------------
 export const NotionSync = {
   getSettings: () => getNotionSettings(getDb()),
   saveSettings: (patch: Partial<NotionSettings>) =>
@@ -531,6 +814,6 @@ export const NotionSync = {
   probe: (actorId?: number | null) => probe(getDb(), actorId),
   syncStudents: (actorId?: number | null) => syncStudents(getDb(), actorId),
   syncStaff: (actorId?: number | null) => syncStaff(getDb(), actorId),
-  listRuns: (options: { limit?: number; kind?: RunSummary['kind'] } = {}) =>
-    listRuns(getDb(), options),
+  syncAssignments: (actorId?: number | null) => syncAssignments(getDb(), actorId),
+  listRuns: (opts?: { limit?: number; kind?: RunSummary['kind'] }) => listRuns(getDb(), opts),
 };

@@ -112,6 +112,10 @@ CREATE TABLE IF NOT EXISTS assignments (
   received_at     TEXT    NOT NULL DEFAULT (datetime('now')),
   completed_at    TEXT,
   deleted_at      TEXT,                            -- 소프트 삭제 (NULL 이면 활성)
+  notion_page_id  TEXT,                            -- 노션 "컨설팅 과제 의뢰" 페이지 ID (upsert 키)
+  notion_source   TEXT,                            -- 어느 노션 DB 에서 왔는지 라벨
+  notion_synced_at TEXT,                           -- 마지막 성공 싱크 시각
+  notion_extra    TEXT,                            -- 매핑되지 않은 프로퍼티 + 파일 URL 을 JSON 으로 백업
   created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
 );
@@ -122,6 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_assignments_parser    ON assignments(parser_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_qa1       ON assignments(qa1_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_qa_final  ON assignments(qa_final_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_student   ON assignments(student_code);
+CREATE INDEX IF NOT EXISTS idx_assignments_notion_page ON assignments(notion_page_id);
 
 -- ---------------------------------------------------------------------------
 -- Parsing results (파싱 결과) — 1:1 with assignments but kept separate for history
@@ -349,7 +354,7 @@ CREATE TABLE IF NOT EXISTS admin_settings (
 
 CREATE TABLE IF NOT EXISTS notion_sync_runs (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe')),
+  kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe','assignments')),
   started_at    TEXT    NOT NULL DEFAULT (datetime('now')),
   finished_at   TEXT,
   ok            INTEGER NOT NULL DEFAULT 0,            -- boolean (1 = success)
