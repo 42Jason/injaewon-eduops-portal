@@ -35,6 +35,20 @@ interface EduOpsApi {
       password: string,
     ): Promise<{ ok: boolean; user?: ApiUser; error?: string }>;
     logout(): Promise<{ ok: boolean }>;
+    /** Validate the stored session against main — returns `{ ok: false }` if main has no matching actor. */
+    me(): Promise<
+      | {
+          ok: true;
+          actor: {
+            userId: number;
+            email: string;
+            name: string;
+            role: string;
+            departmentId: number | null;
+          };
+        }
+      | { ok: false }
+    >;
   };
   assignments: {
     list(filter?: {
@@ -714,6 +728,17 @@ interface EduOpsApi {
         contactField?: string;
         guardianField?: string;
       }>;
+      assignmentDatabases: Array<{
+        id: string;
+        label?: string;
+        subjectField?: string;
+        titleField?: string;
+        statusField?: string;
+        parserField?: string;
+        qa1Field?: string;
+        qaFinalField?: string;
+        dueField?: string;
+      }>;
     }>;
     saveSettings(payload: {
       token?: string;
@@ -722,6 +747,17 @@ interface EduOpsApi {
         label?: string;
         contactField?: string;
         guardianField?: string;
+      }>;
+      assignmentDatabases?: Array<{
+        id: string;
+        label?: string;
+        subjectField?: string;
+        titleField?: string;
+        statusField?: string;
+        parserField?: string;
+        qa1Field?: string;
+        qaFinalField?: string;
+        dueField?: string;
       }>;
       actorId?: number | null;
     }): Promise<{
@@ -732,6 +768,17 @@ interface EduOpsApi {
         label?: string;
         contactField?: string;
         guardianField?: string;
+      }>;
+      assignmentDatabases?: Array<{
+        id: string;
+        label?: string;
+        subjectField?: string;
+        titleField?: string;
+        statusField?: string;
+        parserField?: string;
+        qa1Field?: string;
+        qaFinalField?: string;
+        dueField?: string;
       }>;
     }>;
     probe(payload?: { actorId?: number | null }): Promise<
@@ -758,13 +805,23 @@ interface EduOpsApi {
       errors: number;
       message?: string;
     }>;
+    syncAssignments(payload?: { actorId?: number | null }): Promise<{
+      runId: number;
+      kind: 'assignments';
+      ok: boolean;
+      inserted: number;
+      updated: number;
+      skipped: number;
+      errors: number;
+      message?: string;
+    }>;
     listRuns(filter?: {
       limit?: number;
-      kind?: 'students' | 'staff' | 'probe';
+      kind?: 'students' | 'staff' | 'probe' | 'assignments';
     }): Promise<
       Array<{
         id: number;
-        kind: 'students' | 'staff' | 'probe';
+        kind: 'students' | 'staff' | 'probe' | 'assignments';
         started_at: string;
         finished_at: string | null;
         ok: number;
@@ -784,8 +841,57 @@ interface EduOpsApi {
     install(): Promise<{ ok: boolean; error?: string }>;
     onStatus(cb: (s: UpdaterStatus) => void): () => void;
   };
+  release: {
+    getConfig(): Promise<{
+      ok: true;
+      hasPat: boolean;
+      repoOwner: string;
+      repoName: string;
+      workflowFile: string;
+      currentVersion: string;
+      encryptionAvailable: boolean;
+    }>;
+    setConfig(payload: {
+      pat?: string | null;
+      repoOwner?: string;
+      repoName?: string;
+      workflowFile?: string;
+    }): Promise<{ ok: true } | { ok: false; error: string }>;
+    clearConfig(): Promise<{ ok: true }>;
+    trigger(payload: {
+      bumpType: 'patch' | 'minor' | 'major';
+      customVersion?: string | null;
+      notes?: string | null;
+    }): Promise<{ ok: true } | { ok: false; error: string; detail?: string }>;
+    listRuns(payload?: { limit?: number }): Promise<
+      | {
+          ok: true;
+          runs: Array<{
+            id: number;
+            name: string;
+            title: string;
+            branch: string;
+            sha: string;
+            status: string;
+            conclusion: string;
+            event: string;
+            url: string;
+            createdAt: string;
+            updatedAt: string;
+            path: string;
+          }>;
+        }
+      | { ok: false; error: string; detail?: string }
+    >;
+  };
 }
 
+interface Window {
+  /** Available only inside Electron — undefined if running in a plain browser preview. */
+  api?: EduOpsApi;
+}
+
+/** Re-declared globally so modules can reference `ParsingPreviewRow` without importing. */
 interface ParsingPreviewRow {
   rowNumber: number;
   subject: string;
@@ -802,41 +908,18 @@ interface ParsingPreviewRow {
   errors: string[];
 }
 
-declare global {
-  interface Window {
-    /** Available only inside Electron — undefined if running in a plain browser preview. */
-    api?: EduOpsApi;
-  }
-  /** Re-declared globally so modules can reference `ParsingPreviewRow` without importing. */
-  interface ParsingPreviewRow {
-    rowNumber: number;
-    subject: string;
-    publisher: string;
-    studentCode: string;
-    assignmentTitle: string;
-    assignmentScope: string;
-    lengthRequirement: string;
-    outline: string;
-    rubric: string;
-    teacherRequirements: string;
-    studentRequests: string;
-    valid: boolean;
-    errors: string[];
-  }
-  type UpdaterStatus =
-    | { state: 'idle' }
-    | { state: 'checking' }
-    | { state: 'available'; version: string; releaseNotes?: string; releaseDate?: string }
-    | { state: 'not-available'; version: string }
-    | {
-        state: 'downloading';
-        percent: number;
-        transferred: number;
-        total: number;
-        bytesPerSecond: number;
-      }
-    | { state: 'ready'; version: string }
-    | { state: 'error'; message: string };
-}
+type UpdaterStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available'; version: string; releaseNotes?: string; releaseDate?: string }
+  | { state: 'not-available'; version: string }
+  | {
+      state: 'downloading';
+      percent: number;
+      transferred: number;
+      total: number;
+      bytesPerSecond: number;
+    }
+  | { state: 'ready'; version: string }
+  | { state: 'error'; message: string };
 
-export {};

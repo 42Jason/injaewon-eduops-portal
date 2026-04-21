@@ -28,6 +28,7 @@ import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
 import { CorporateCardsPage } from '@/pages/CorporateCardsPage';
 import { StudentArchivePage } from '@/pages/StudentArchivePage';
 import { NotionSyncPage } from '@/pages/NotionSyncPage';
+import { ReleasePage } from '@/pages/ReleasePage';
 import { UpdateGate } from '@/components/UpdateGate';
 import { useSession } from '@/stores/session';
 
@@ -98,6 +99,7 @@ export default function App() {
           <Route path="reports" element={<ReportsPage />} />
           <Route path="automation" element={<AutomationPage />} />
           <Route path="settings/notion" element={<NotionSyncPage />} />
+          <Route path="release" element={<ReleasePage />} />
           <Route path="settings" element={<SettingsPage />} />
         </Route>
 

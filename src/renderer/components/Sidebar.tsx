@@ -27,6 +27,7 @@ import {
   CreditCard,
   Archive,
   RefreshCw,
+  Rocket,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useSession } from '@/stores/session';
@@ -38,6 +39,8 @@ interface MenuItem {
   label: string;
   icon: LucideIcon;
   group?: string;
+  /** If true, only users with perms.isLeadership see this item. */
+  leadershipOnly?: boolean;
 }
 
 const MENU: MenuItem[] = [
@@ -71,13 +74,16 @@ const MENU: MenuItem[] = [
   { to: '/reports', label: '리포트', icon: BarChart3, group: '운영' },
   { to: '/automation', label: 'CTO 자동화', icon: Bot, group: '운영' },
   { to: '/settings/notion', label: '노션 동기화', icon: RefreshCw, group: '운영' },
+  { to: '/release', label: '릴리스', icon: Rocket, group: '운영', leadershipOnly: true },
   { to: '/settings', label: '설정', icon: Settings, group: '운영' },
 ];
 
 export function Sidebar() {
   const { user, logout } = useSession();
 
-  const groups = MENU.reduce<Record<string, MenuItem[]>>((acc, item) => {
+  const isLeadership = !!user?.perms.isLeadership;
+  const visible = MENU.filter((item) => !item.leadershipOnly || isLeadership);
+  const groups = visible.reduce<Record<string, MenuItem[]>>((acc, item) => {
     const g = item.group ?? '';
     (acc[g] ||= []).push(item);
     return acc;

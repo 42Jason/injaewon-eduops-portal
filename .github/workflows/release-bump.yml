@@ -1,0 +1,120 @@
+name: Release — Bump & Tag
+
+# -----------------------------------------------------------------------------
+#  Triggered by the in-app Release page (via GitHub REST workflow_dispatch).
+#
+#  What this does:
+#    1. Checks out main with full history.
+#    2. Runs `npm version <bump_type>` (or sets a custom version), which
+#       updates package.json AND creates a commit + tag in one shot.
+#    3. Pushes the commit and the new tag to origin.
+#    4. The tag push fires the existing `release.yml` workflow (which builds
+#       the Windows installer and publishes the GitHub Release).
+#
+#  So: any computer running the EduOps Portal app (with a leadership login
+#  and a saved GitHub PAT) can cut a release without touching git locally.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type (ignored if custom_version set)'
+        required: false
+        type: choice
+        default: 'patch'
+        options:
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: 'Exact version (e.g. 0.2.0). Overrides bump_type. Leave blank to use bump_type.'
+        required: false
+        type: string
+      notes:
+        description: 'Short release notes (used for the commit + tag message).'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: Bump version and push tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "eduops-release-bot"
+          git config user.email "eduops-release-bot@users.noreply.github.com"
+
+      - name: Determine target version
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.custom_version }}" ]; then
+            echo "mode=custom" >> "$GITHUB_OUTPUT"
+            echo "version=${{ inputs.custom_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=bump" >> "$GITHUB_OUTPUT"
+            echo "bump=${{ inputs.bump_type }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build commit/tag message
+        id: msg
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes='${{ inputs.notes }}'
+          if [ -z "$notes" ]; then
+            notes="release via in-app trigger"
+          fi
+          {
+            echo 'msg<<__EOF__'
+            echo "$notes"
+            echo '__EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: npm version bump
+        id: bump
+        shell: bash
+        env:
+          BUMP_MSG: ${{ steps.msg.outputs.msg }}
+        run: |
+          set -euo pipefail
+          # npm version creates: package.json + package-lock.json commit + matching tag.
+          # -m "…" sets both commit message and tag annotation; %s expands to the new version.
+          if [ "${{ steps.target.outputs.mode }}" = "custom" ]; then
+            new_version=$(npm version "${{ steps.target.outputs.version }}" -m "release: v%s — ${BUMP_MSG}")
+          else
+            new_version=$(npm version "${{ steps.target.outputs.bump }}" -m "release: v%s — ${BUMP_MSG}")
+          fi
+          # new_version starts with "v" (e.g. v0.2.0)
+          echo "tag=${new_version}" >> "$GITHUB_OUTPUT"
+          echo "version=${new_version#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Push commit + tag
+        run: |
+          git push origin HEAD:main
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: Summary
+        run: |
+          echo "### Released ${{ steps.bump.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag push will trigger **Build & Release (Windows)** → see the Actions tab." >> "$GITHUB_STEP_SUMMARY"

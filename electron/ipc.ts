@@ -1,6 +1,15 @@
-import { ipcMain } from 'electron';
+import { ipcMain, BrowserWindow, safeStorage } from 'electron';
 import { getDb, getDbPath } from './db';
-import { login } from './auth';
+import {
+  login,
+  setSession,
+  clearSession,
+  getActor,
+  requireActor,
+  requireRole,
+  ROLE_SETS,
+  AuthError,
+} from './auth';
 import { parseInstructionExcel, type ParsedRow } from './parseExcel';
 import {
   calcRegularPayroll,
@@ -22,9 +31,14 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   }));
 
   // -- auth -------------------------------------------------------------------
-  ipcMain.handle('auth:login', (_e, payload: { email: string; password: string }) => {
+  //  로그인 성공하면 event.sender.id (= webContents.id) 를 키로 세션 맵에 등록.
+  //  이후 모든 민감 IPC 는 renderer 의 actorId 대신 이 세션을 신뢰.
+  ipcMain.handle('auth:login', (event, payload: { email: string; password: string }) => {
     try {
       const result = login(getDb(), payload.email, payload.password);
+      if (result.ok && result.user) {
+        setSession(event.sender.id, result.user);
+      }
       return result;
     } catch (err) {
       console.error('[ipc] auth:login error', err);
@@ -32,7 +46,39 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
     }
   });
 
-  ipcMain.handle('auth:logout', () => ({ ok: true }));
+  ipcMain.handle('auth:logout', (event) => {
+    clearSession(event.sender.id);
+    return { ok: true };
+  });
+
+  // renderer 가 hydrate 직후 "내가 현재 세션이 있나?" 물어보는 핸들러.
+  //  localStorage 위조로 세션 행세하는 걸 막기 위해, main 이 실제로 보유한
+  //  actor 만 돌려줌. null 이면 renderer 는 즉시 로그아웃 처리.
+  ipcMain.handle('auth:me', (event) => {
+    const actor = getActor(event);
+    if (!actor) return { ok: false as const };
+    return {
+      ok: true as const,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        name: actor.name,
+        role: actor.role,
+        departmentId: actor.departmentId,
+      },
+    };
+  });
+
+  // BrowserWindow 가 닫히면 세션을 반드시 정리 — 다음에 같은 webContents.id
+  //  가 재사용될 때 이전 actor 가 남아있지 않도록.
+  const cleanupOnClose = (win: BrowserWindow) => {
+    const id = win.webContents.id;
+    win.on('closed', () => clearSession(id));
+  };
+  BrowserWindow.getAllWindows().forEach(cleanupOnClose);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { app } = require('electron') as typeof import('electron');
+  app.on('browser-window-created', (_e, win) => cleanupOnClose(win));
 
   // -- assignments ------------------------------------------------------------
   ipcMain.handle(
@@ -151,9 +197,9 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'assignments:create',
     (
-      _e,
+      event,
       payload: {
-        actorId: number | null;
+        actorId?: number | null;
         subject: string;
         title: string;
         studentId?: number | null;
@@ -173,6 +219,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         dueAt?: string | null;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.parser);
       try {
         const db = getDb();
         if (!payload?.subject?.trim() || !payload?.title?.trim()) {
@@ -234,7 +281,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           );
 
         const id = Number(info.lastInsertRowid);
-        logActivity(db, payload.actorId, 'assignments.create', `assignment:${id}`, {
+        logActivity(db, actor.userId, 'assignments.create', `assignment:${id}`, {
           code,
           title: payload.title,
           subject: payload.subject,
@@ -251,10 +298,10 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'assignments:update',
     (
-      _e,
+      event,
       payload: {
         id: number;
-        actorId: number | null;
+        actorId?: number | null;
         subject?: string;
         title?: string;
         publisher?: string | null;
@@ -274,6 +321,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         dueAt?: string | null;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.parser);
       try {
         const db = getDb();
         const map: Array<[keyof typeof payload, string]> = [
@@ -310,14 +358,14 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           .prepare(`UPDATE assignments SET ${sets.join(', ')} WHERE id = ?`)
           .run(...params);
         if (info.changes === 0) return { ok: false, error: 'not_found' };
-        logActivity(db, payload.actorId, 'assignments.update', `assignment:${payload.id}`, {
+        logActivity(db, actor.userId, 'assignments.update', `assignment:${payload.id}`, {
           keys: Object.keys(payload).filter(
             (k) => k !== 'id' && k !== 'actorId',
           ),
         });
         // state 변경 시 보관함 동기화
         if (payload.state) {
-          syncAssignmentArchive(db, payload.id, payload.state, payload.actorId);
+          syncAssignmentArchive(db, payload.id, payload.state, actor.userId);
         }
         return { ok: true };
       } catch (err) {
@@ -329,7 +377,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'assignments:softDelete',
-    (_e, payload: { id: number; actorId: number | null }) => {
+    (event, payload: { id: number; actorId?: number | null }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       try {
         const db = getDb();
         const tx = db.transaction(() => {
@@ -343,13 +392,13 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
             .run(payload.id);
           if (info.changes > 0) {
             // 승인완료 상태였다면 자동 보관함 링크도 회수
-            syncAssignmentArchive(db, payload.id, '보류', payload.actorId);
+            syncAssignmentArchive(db, payload.id, '보류', actor.userId);
           }
           return info.changes;
         });
         const changes = tx();
         if (changes === 0) return { ok: false, error: 'not_found_or_already_deleted' };
-        logActivity(db, payload.actorId, 'assignments.softDelete', `assignment:${payload.id}`, {});
+        logActivity(db, actor.userId, 'assignments.softDelete', `assignment:${payload.id}`, {});
         return { ok: true };
       } catch (err) {
         console.error('[ipc] assignments:softDelete failed', err);
@@ -360,7 +409,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'assignments:restore',
-    (_e, payload: { id: number; actorId: number | null }) => {
+    (event, payload: { id: number; actorId?: number | null }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       try {
         const db = getDb();
         const info = db
@@ -372,7 +422,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           )
           .run(payload.id);
         if (info.changes === 0) return { ok: false, error: 'not_found_or_active' };
-        logActivity(db, payload.actorId, 'assignments.restore', `assignment:${payload.id}`, {});
+        logActivity(db, actor.userId, 'assignments.restore', `assignment:${payload.id}`, {});
         return { ok: true };
       } catch (err) {
         console.error('[ipc] assignments:restore failed', err);
@@ -384,9 +434,10 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'assignments:bulkSetState',
     (
-      _e,
-      payload: { ids: number[]; state: string; actorId: number | null },
+      event,
+      payload: { ids: number[]; state: string; actorId?: number | null },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       try {
         if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
           return { ok: false, error: 'empty_ids' };
@@ -410,12 +461,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
             const res = stmt.run(payload.state, now, completedMark ? 1 : 0, now, id);
             if (res.changes > 0) {
               changed += 1;
-              syncAssignmentArchive(db, id, payload.state, payload.actorId);
+              syncAssignmentArchive(db, id, payload.state, actor.userId);
             }
           }
         });
         tx();
-        logActivity(db, payload.actorId, 'assignments.bulkSetState', 'assignment:bulk', {
+        logActivity(db, actor.userId, 'assignments.bulkSetState', 'assignment:bulk', {
           ids: payload.ids,
           state: payload.state,
           changed,
@@ -431,15 +482,16 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'assignments:bulkAssign',
     (
-      _e,
+      event,
       payload: {
         ids: number[];
         parserId?: number | null;
         qa1Id?: number | null;
         qaFinalId?: number | null;
-        actorId: number | null;
+        actorId?: number | null;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       try {
         if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
           return { ok: false, error: 'empty_ids' };
@@ -474,7 +526,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           }
         });
         tx();
-        logActivity(db, payload.actorId, 'assignments.bulkAssign', 'assignment:bulk', {
+        logActivity(db, actor.userId, 'assignments.bulkAssign', 'assignment:bulk', {
           ids: payload.ids,
           parserId: payload.parserId,
           qa1Id: payload.qa1Id,
@@ -491,7 +543,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'assignments:bulkDelete',
-    (_e, payload: { ids: number[]; actorId: number | null }) => {
+    (event, payload: { ids: number[]; actorId?: number | null }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       try {
         if (!Array.isArray(payload?.ids) || payload.ids.length === 0) {
           return { ok: false, error: 'empty_ids' };
@@ -509,12 +562,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
             const res = stmt.run(id);
             if (res.changes > 0) {
               changed += 1;
-              syncAssignmentArchive(db, id, '보류', payload.actorId);
+              syncAssignmentArchive(db, id, '보류', actor.userId);
             }
           }
         });
         tx();
-        logActivity(db, payload.actorId, 'assignments.bulkDelete', 'assignment:bulk', {
+        logActivity(db, actor.userId, 'assignments.bulkDelete', 'assignment:bulk', {
           ids: payload.ids,
           changed,
         });
@@ -533,7 +586,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'assignments:setState',
-    (_e, payload: { id: number; state: string; actorId: number; note?: string }) => {
+    (event, payload: { id: number; state: string; actorId?: number; note?: string }) => {
+      const actor = requireRole(event, ROLE_SETS.parser);
       const db = getDb();
       const now = new Date().toISOString();
       const tx = db.transaction(() => {
@@ -547,7 +601,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           )
           .run(payload.state, now, payload.state, now, payload.id);
         if (res.changes > 0) {
-          syncAssignmentArchive(db, payload.id, payload.state, payload.actorId);
+          syncAssignmentArchive(db, payload.id, payload.state, actor.userId);
         }
         return res.changes > 0;
       });
@@ -763,7 +817,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   /**
    * Return today's attendance row for a user (or null if not checked in yet).
    */
-  ipcMain.handle('attendance:today', (_e, userId: number) => {
+  ipcMain.handle('attendance:today', (event, userId: number) => {
+    // 본인 오늘자 근태만, HR/리더십은 모두 조회 가능.
+    const actor = requireActor(event);
+    if (actor.userId !== userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+      throw new AuthError('forbidden', '본인의 근태 정보만 조회할 수 있습니다.');
+    }
     const db = getDb();
     const row = db
       .prepare(
@@ -778,7 +837,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   /**
    * Check in for today. If already checked in, returns the existing row unchanged.
    */
-  ipcMain.handle('attendance:checkIn', (_e, payload: { userId: number; note?: string }) => {
+  ipcMain.handle('attendance:checkIn', (event, payload: { userId: number; note?: string }) => {
+    // 본인만 출근 체크 — HR 관리자도 대신 체크 가능.
+    const actor = requireActor(event);
+    if (actor.userId !== payload.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+      throw new AuthError('forbidden', '본인만 출근 체크할 수 있습니다.');
+    }
     const db = getDb();
     try {
       const existing = db
@@ -816,7 +880,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'attendance:checkOut',
-    (_e, payload: { userId: number; breakMin?: number; note?: string }) => {
+    (event, payload: { userId: number; breakMin?: number; note?: string }) => {
+      // 본인만 퇴근 체크 — HR 관리자도 대신 체크 가능.
+      const actor = requireActor(event);
+      if (actor.userId !== payload.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인만 퇴근 체크할 수 있습니다.');
+      }
       const db = getDb();
       try {
         const existing = db
@@ -849,7 +918,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'attendance:month',
-    (_e, payload: { userId: number; yyyymm: string }) => {
+    (event, payload: { userId: number; yyyymm: string }) => {
+      // 본인 근태 or HR 관리자 이상만.
+      const actor = requireActor(event);
+      if (actor.userId !== payload.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인의 근태 이력만 조회할 수 있습니다.');
+      }
       const db = getDb();
       const rows = db
         .prepare(
@@ -870,7 +944,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'attendance:stats',
-    (_e, payload: { userId: number; yyyymm: string }) => {
+    (event, payload: { userId: number; yyyymm: string }) => {
+      // 본인 근태 요약 or HR 관리자 이상만.
+      const actor = requireActor(event);
+      if (actor.userId !== payload.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인의 근태 요약만 조회할 수 있습니다.');
+      }
       const db = getDb();
       const rows = db
         .prepare(
@@ -913,7 +992,14 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'leave:list',
-    (_e, filter?: { userId?: number; status?: string }) => {
+    (event, filter?: { userId?: number; status?: string }) => {
+      // 본인 기록만이면 세션 유저 == filter.userId 여야 함.
+      // 그 외(전체 목록, 타인 조회)는 HR 관리자 이상만.
+      const actor = requireActor(event);
+      const isSelfOnly = typeof filter?.userId === 'number' && filter.userId === actor.userId;
+      if (!isSelfOnly && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인의 휴가 기록만 조회할 수 있습니다.');
+      }
       const db = getDb();
       const where: string[] = [];
       const params: unknown[] = [];
@@ -946,7 +1032,12 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   /**
    * Return a user's remaining annual leave balance (days).
    */
-  ipcMain.handle('leave:balance', (_e, userId: number) => {
+  ipcMain.handle('leave:balance', (event, userId: number) => {
+    // 본인 연차 잔여일수 또는 HR 관리자 이상만.
+    const actor = requireActor(event);
+    if (actor.userId !== userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+      throw new AuthError('forbidden', '본인의 연차 잔여일수만 조회할 수 있습니다.');
+    }
     const db = getDb();
     const row = db
       .prepare(`SELECT leave_balance FROM users WHERE id = ?`)
@@ -961,7 +1052,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'leave:create',
     (
-      _e,
+      event,
       payload: {
         userId: number;
         kind: 'annual' | 'half_am' | 'half_pm' | 'sick' | 'special' | 'unpaid';
@@ -970,6 +1061,11 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         reason?: string;
       },
     ) => {
+      // 본인만 휴가 신청 가능. HR 관리자는 대리 신청 가능.
+      const actor = requireActor(event);
+      if (actor.userId !== payload.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인의 휴가만 신청할 수 있습니다.');
+      }
       const db = getDb();
       try {
         const start = new Date(payload.startDate);
@@ -1023,14 +1119,16 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'leave:decide',
     (
-      _e,
+      event,
       payload: {
         id: number;
-        approverId: number;
+        approverId?: number;
         decision: 'approved' | 'rejected';
         comment?: string;
       },
     ) => {
+      // 결재는 HR 관리자 이상만.
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const req = db
@@ -1056,7 +1154,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
               WHERE id = ?`,
           ).run(
             payload.decision,
-            payload.approverId,
+            actor.userId,
             nowIso,
             payload.comment ?? null,
             payload.comment ?? null,
@@ -1082,7 +1180,13 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
    */
   ipcMain.handle(
     'leave:cancel',
-    (_e, payload: { id: number; userId: number }) => {
+    (event, payload: { id: number; userId?: number }) => {
+      // 본인 휴가만 취소 가능. HR 관리자는 대신 취소 가능.
+      const actor = requireActor(event);
+      const targetUserId = payload.userId ?? actor.userId;
+      if (targetUserId !== actor.userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+        throw new AuthError('forbidden', '본인의 휴가만 취소할 수 있습니다.');
+      }
       const db = getDb();
       const res = db
         .prepare(
@@ -1090,7 +1194,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
               SET status = 'cancelled', decided_at = datetime('now')
             WHERE id = ? AND user_id = ? AND status = 'pending'`,
         )
-        .run(payload.id, payload.userId);
+        .run(payload.id, targetUserId);
       return { ok: res.changes > 0 };
     },
   );
@@ -1156,7 +1260,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'cs:create',
     (
-      _e,
+      event,
       payload: {
         channel: 'phone' | 'email' | 'kakao' | 'other';
         studentCode?: string;
@@ -1166,9 +1270,10 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         priority?: 'low' | 'normal' | 'high' | 'urgent';
         assigneeId?: number;
         relatedAssignmentId?: number;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireActor(event);
       const db = getDb();
       try {
         const { code } = db
@@ -1194,7 +1299,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
             payload.assigneeId ?? null,
             payload.relatedAssignmentId ?? null,
           );
-        logActivity(db, payload.actorId, 'cs.create', `cs:${info.lastInsertRowid}`, { code });
+        logActivity(db, actor.userId, 'cs.create', `cs:${info.lastInsertRowid}`, { code });
         return { ok: true, id: Number(info.lastInsertRowid), code };
       } catch (err) {
         console.error('[ipc] cs:create error', err);
@@ -1206,16 +1311,17 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'cs:update',
     (
-      _e,
+      event,
       payload: {
         id: number;
         status?: 'open' | 'in_progress' | 'waiting' | 'resolved' | 'closed';
         priority?: 'low' | 'normal' | 'high' | 'urgent';
         assigneeId?: number | null;
         body?: string;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireActor(event);
       const db = getDb();
       try {
         const sets: string[] = [];
@@ -1244,7 +1350,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         const res = db
           .prepare(`UPDATE cs_tickets SET ${sets.join(', ')} WHERE id = ?`)
           .run(...params);
-        logActivity(db, payload.actorId, 'cs.update', `cs:${payload.id}`, { sets: sets.length });
+        logActivity(db, actor.userId, 'cs.update', `cs:${payload.id}`, { sets: sets.length });
         return { ok: res.changes > 0 };
       } catch (err) {
         console.error('[ipc] cs:update error', err);
@@ -1697,10 +1803,11 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'manuals:delete',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       const res = db.prepare(`DELETE FROM manual_pages WHERE id = ?`).run(payload.id);
-      logActivity(db, payload.actorId, 'manuals.delete', `manual:${payload.id}`, {});
+      logActivity(db, actor.userId, 'manuals.delete', `manual:${payload.id}`, {});
       return { ok: res.changes > 0 };
     },
   );
@@ -1818,7 +1925,8 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'settings:set',
-    (_e, payload: { key: string; valueJson: string; actorId: number }) => {
+    (event, payload: { key: string; valueJson: string; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         // Validate JSON parseability
@@ -1827,7 +1935,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
           `INSERT OR REPLACE INTO admin_settings (key, value_json, updated_at)
            VALUES (?, ?, datetime('now'))`,
         ).run(payload.key, payload.valueJson);
-        logActivity(db, payload.actorId, 'settings.set', `setting:${payload.key}`, {});
+        logActivity(db, actor.userId, 'settings.set', `setting:${payload.key}`, {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'invalid_json' };
@@ -1855,7 +1963,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
   ipcMain.handle(
     'users:update',
     (
-      _e,
+      event,
       payload: {
         id: number;
         role?: string;
@@ -1864,9 +1972,11 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
         phone?: string | null;
         active?: boolean;
         leaveBalance?: number;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      // HR 관리자·임원만 직원 정보 수정 가능. renderer 의 actorId 는 무시.
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       const sets: string[] = [];
       const params: unknown[] = [];
@@ -1900,7 +2010,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
       const res = db
         .prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`)
         .run(...params);
-      logActivity(db, payload.actorId, 'users.update', `user:${payload.id}`, { sets: sets.length });
+      logActivity(db, actor.userId, 'users.update', `user:${payload.id}`, { sets: sets.length });
       return { ok: res.changes > 0 };
     },
   );
@@ -1950,12 +2060,13 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   ipcMain.handle(
     'notices:archive',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       const res = db
         .prepare(`UPDATE notices SET archived_at = datetime('now') WHERE id = ?`)
         .run(payload.id);
-      logActivity(db, payload.actorId, 'notices.archive', `notice:${payload.id}`, {});
+      logActivity(db, actor.userId, 'notices.archive', `notice:${payload.id}`, {});
       return { ok: res.changes > 0 };
     },
   );
@@ -2177,6 +2288,7 @@ export function registerIpc(meta: { version: string; platform: string; isDev: bo
 
   registerAdminIpc();
   registerStudentArchiveIpc();
+  registerReleaseIpc(meta.version);
 }
 
 // ===========================================================================
@@ -2221,15 +2333,16 @@ function registerAdminIpc() {
   ipcMain.handle(
     'tuition:updateStudentBilling',
     (
-      _e,
+      event,
       payload: {
         studentId: number;
         monthlyFee?: number;
         billingDay?: number;
         billingActive?: boolean;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const sets: string[] = [];
@@ -2252,7 +2365,7 @@ function registerAdminIpc() {
         const res = db
           .prepare(`UPDATE students SET ${sets.join(', ')} WHERE id = ?`)
           .run(...params);
-        logActivity(db, payload.actorId, 'tuition.updateStudentBilling', `student:${payload.studentId}`, {
+        logActivity(db, actor.userId, 'tuition.updateStudentBilling', `student:${payload.studentId}`, {
           monthlyFee: payload.monthlyFee,
           billingDay: payload.billingDay,
           billingActive: payload.billingActive,
@@ -2303,9 +2416,10 @@ function registerAdminIpc() {
   ipcMain.handle(
     'tuition:generateMonthly',
     (
-      _e,
-      payload: { period: string; dueDate?: string; actorId: number; overwrite?: boolean },
+      event,
+      payload: { period: string; dueDate?: string; actorId?: number; overwrite?: boolean },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const students = db
@@ -2369,14 +2483,14 @@ function registerAdminIpc() {
               due,
               s.monthly_fee,
               s.monthly_fee,
-              payload.actorId,
+              actor.userId,
             );
             created += 1;
           }
         });
         tx();
 
-        logActivity(db, payload.actorId, 'tuition.generateMonthly', `period:${payload.period}`, {
+        logActivity(db, actor.userId, 'tuition.generateMonthly', `period:${payload.period}`, {
           created,
           skipped,
           overwrite: !!payload.overwrite,
@@ -2391,7 +2505,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'tuition:updateInvoice',
     (
-      _e,
+      event,
       payload: {
         id: number;
         baseAmount?: number;
@@ -2400,9 +2514,10 @@ function registerAdminIpc() {
         dueDate?: string | null;
         memo?: string | null;
         status?: 'unpaid' | 'partial' | 'paid' | 'waived' | 'cancelled';
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const cur = db
@@ -2445,7 +2560,7 @@ function registerAdminIpc() {
             WHERE id = ?`,
         ).run(base, discount, adjustment, total, payload.dueDate ?? null, payload.memo ?? null, status, payload.id);
 
-        logActivity(db, payload.actorId, 'tuition.updateInvoice', `invoice:${payload.id}`, {
+        logActivity(db, actor.userId, 'tuition.updateInvoice', `invoice:${payload.id}`, {
           base,
           discount,
           adjustment,
@@ -2461,7 +2576,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'tuition:recordPayment',
     (
-      _e,
+      event,
       payload: {
         invoiceId: number;
         amount: number;
@@ -2469,9 +2584,10 @@ function registerAdminIpc() {
         paidAt?: string;
         receiptNo?: string;
         note?: string;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const result = db.transaction(() => {
@@ -2495,7 +2611,7 @@ function registerAdminIpc() {
             payload.paidAt ?? null,
             payload.receiptNo ?? null,
             payload.note ?? null,
-            payload.actorId,
+            actor.userId,
           );
 
           const newPaid = inv.paid_amount + amt;
@@ -2513,7 +2629,7 @@ function registerAdminIpc() {
           return { newPaid, newStatus };
         })();
 
-        logActivity(db, payload.actorId, 'tuition.recordPayment', `invoice:${payload.invoiceId}`, {
+        logActivity(db, actor.userId, 'tuition.recordPayment', `invoice:${payload.invoiceId}`, {
           amount: payload.amount,
           method: payload.method,
           newStatus: result.newStatus,
@@ -2525,7 +2641,9 @@ function registerAdminIpc() {
     },
   );
 
-  ipcMain.handle('tuition:listPayments', (_e, invoiceId: number) => {
+  ipcMain.handle('tuition:listPayments', (event, invoiceId: number) => {
+    // 납부 내역 — 운영 관리자 이상만.
+    requireRole(event, ROLE_SETS.opsAdmin);
     const db = getDb();
     const rows = db
       .prepare(
@@ -2540,7 +2658,9 @@ function registerAdminIpc() {
     return rows;
   });
 
-  ipcMain.handle('tuition:periodSummary', (_e, period: string) => {
+  ipcMain.handle('tuition:periodSummary', (event, period: string) => {
+    // 학원비 기간 집계 — 운영 관리자 이상만.
+    requireRole(event, ROLE_SETS.opsAdmin);
     const db = getDb();
     const row = db
       .prepare(
@@ -2564,7 +2684,9 @@ function registerAdminIpc() {
   // Payroll
   // -------------------------------------------------------------------------
 
-  ipcMain.handle('payroll:listProfiles', () => {
+  ipcMain.handle('payroll:listProfiles', (event) => {
+    // 급여 프로필 전수 조회 — 기본급·계좌번호까지 노출되므로 HR 관리자 이상만.
+    requireRole(event, ROLE_SETS.hrAdmin);
     const db = getDb();
     const rows = db
       .prepare(
@@ -2589,7 +2711,12 @@ function registerAdminIpc() {
     return rows;
   });
 
-  ipcMain.handle('payroll:getProfile', (_e, userId: number) => {
+  ipcMain.handle('payroll:getProfile', (event, userId: number) => {
+    // 본인 프로필은 본인 또는 HR 관리자 이상만.
+    const actor = requireActor(event);
+    if (actor.userId !== userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+      throw new AuthError('forbidden', '본인의 급여 프로필만 조회할 수 있습니다.');
+    }
     const db = getDb();
     const row = db
       .prepare(
@@ -2614,7 +2741,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'payroll:upsertProfile',
     (
-      _e,
+      event,
       payload: {
         userId: number;
         employmentType: 'regular' | 'freelancer' | 'parttime';
@@ -2627,9 +2754,11 @@ function registerAdminIpc() {
         kidsUnder20: number;
         bankName?: string | null;
         bankAccount?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      // 급여 프로필 작성은 HR 관리자·임원만.
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         db.prepare(
@@ -2663,7 +2792,7 @@ function registerAdminIpc() {
           payload.bankName ?? null,
           payload.bankAccount ?? null,
         );
-        logActivity(db, payload.actorId, 'payroll.upsertProfile', `user:${payload.userId}`, {
+        logActivity(db, actor.userId, 'payroll.upsertProfile', `user:${payload.userId}`, {
           employmentType: payload.employmentType,
         });
         return { ok: true };
@@ -2673,7 +2802,9 @@ function registerAdminIpc() {
     },
   );
 
-  ipcMain.handle('payroll:listPeriods', () => {
+  ipcMain.handle('payroll:listPeriods', (event) => {
+    // 급여 기간 목록(총지급액 집계 포함) — HR 관리자 이상만.
+    requireRole(event, ROLE_SETS.hrAdmin);
     const db = getDb();
     const rows = db
       .prepare(
@@ -2694,7 +2825,8 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'payroll:ensurePeriod',
-    (_e, payload: { period: string; payDate?: string | null; actorId: number }) => {
+    (event, payload: { period: string; payDate?: string | null; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const existing = db
@@ -2706,8 +2838,8 @@ function registerAdminIpc() {
             `INSERT INTO payroll_periods (period_yyyymm, pay_date, status, created_by)
              VALUES (?, ?, 'draft', ?)`,
           )
-          .run(payload.period, payload.payDate ?? null, payload.actorId);
-        logActivity(db, payload.actorId, 'payroll.ensurePeriod', `period:${payload.period}`, {});
+          .run(payload.period, payload.payDate ?? null, actor.userId);
+        logActivity(db, actor.userId, 'payroll.ensurePeriod', `period:${payload.period}`, {});
         return { ok: true, id: Number(res.lastInsertRowid), created: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'ensure_failed' };
@@ -2717,7 +2849,8 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'payroll:generatePayslips',
-    (_e, payload: { periodId: number; overwriteDraft?: boolean; actorId: number }) => {
+    (event, payload: { periodId: number; overwriteDraft?: boolean; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const period = db
@@ -2851,7 +2984,7 @@ function registerAdminIpc() {
         });
         tx();
 
-        logActivity(db, payload.actorId, 'payroll.generatePayslips', `period:${period.period_yyyymm}`, {
+        logActivity(db, actor.userId, 'payroll.generatePayslips', `period:${period.period_yyyymm}`, {
           created,
           updated,
           skipped,
@@ -2863,7 +2996,9 @@ function registerAdminIpc() {
     },
   );
 
-  ipcMain.handle('payroll:listPayslips', (_e, periodId: number) => {
+  ipcMain.handle('payroll:listPayslips', (event, periodId: number) => {
+    // 전체 급여명세 목록은 HR 관리자 이상만.
+    requireRole(event, ROLE_SETS.hrAdmin);
     const db = getDb();
     const rows = db
       .prepare(
@@ -2884,7 +3019,12 @@ function registerAdminIpc() {
     return rows;
   });
 
-  ipcMain.handle('payroll:getMyPayslips', (_e, userId: number) => {
+  ipcMain.handle('payroll:getMyPayslips', (event, userId: number) => {
+    // 본인 급여명세 또는 HR 관리자 이상만. 타인 userId 위조 차단.
+    const actor = requireActor(event);
+    if (actor.userId !== userId && !ROLE_SETS.hrAdmin.includes(actor.role as never)) {
+      throw new AuthError('forbidden', '본인의 급여명세만 조회할 수 있습니다.');
+    }
     const db = getDb();
     const rows = db
       .prepare(
@@ -2908,7 +3048,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'payroll:updatePayslip',
     (
-      _e,
+      event,
       payload: {
         id: number;
         patch: Partial<{
@@ -2919,9 +3059,10 @@ function registerAdminIpc() {
           otherDeduction: number;
           memo: string | null;
         }>;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const cur = db
@@ -3004,7 +3145,7 @@ function registerAdminIpc() {
           );
         }
 
-        logActivity(db, payload.actorId, 'payroll.updatePayslip', `payslip:${payload.id}`, payload.patch);
+        logActivity(db, actor.userId, 'payroll.updatePayslip', `payslip:${payload.id}`, payload.patch);
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'update_failed' };
@@ -3014,7 +3155,8 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'payroll:closePeriod',
-    (_e, payload: { periodId: number; actorId: number }) => {
+    (event, payload: { periodId: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const res = db
@@ -3023,12 +3165,12 @@ function registerAdminIpc() {
                 SET status = 'closed', closed_by = ?, closed_at = datetime('now'), updated_at = datetime('now')
               WHERE id = ? AND status = 'draft'`,
           )
-          .run(payload.actorId, payload.periodId);
+          .run(actor.userId, payload.periodId);
         if (res.changes === 0) return { ok: false, error: 'not_in_draft' };
         db.prepare(
           `UPDATE payslips SET status = 'closed', updated_at = datetime('now') WHERE period_id = ? AND status = 'draft'`,
         ).run(payload.periodId);
-        logActivity(db, payload.actorId, 'payroll.closePeriod', `period:${payload.periodId}`, {});
+        logActivity(db, actor.userId, 'payroll.closePeriod', `period:${payload.periodId}`, {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'close_failed' };
@@ -3038,7 +3180,8 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'payroll:markPaid',
-    (_e, payload: { periodId: number; paidAt?: string; actorId: number }) => {
+    (event, payload: { periodId: number; paidAt?: string; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       const db = getDb();
       try {
         const res = db
@@ -3052,7 +3195,7 @@ function registerAdminIpc() {
         db.prepare(
           `UPDATE payslips SET status = 'paid', updated_at = datetime('now') WHERE period_id = ?`,
         ).run(payload.periodId);
-        logActivity(db, payload.actorId, 'payroll.markPaid', `period:${payload.periodId}`, {});
+        logActivity(db, actor.userId, 'payroll.markPaid', `period:${payload.periodId}`, {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'mark_paid_failed' };
@@ -3066,7 +3209,9 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'subscriptions:list',
-    (_e, filter?: { status?: string; cardId?: number }) => {
+    (event, filter?: { status?: string; cardId?: number }) => {
+      // 정기결제 목록은 임원(CEO/CTO)만 — 법인카드·금액 노출.
+      requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       const where: string[] = [];
       const params: unknown[] = [];
@@ -3100,7 +3245,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'subscriptions:upsert',
     (
-      _e,
+      event,
       payload: {
         id?: number;
         vendor: string;
@@ -3116,9 +3261,10 @@ function registerAdminIpc() {
         status?: 'active' | 'paused' | 'cancelled';
         startedAt?: string | null;
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         if (!payload.vendor.trim()) return { ok: false, error: 'vendor_required' };
@@ -3145,7 +3291,7 @@ function registerAdminIpc() {
             payload.memo ?? null,
             payload.id,
           );
-          logActivity(db, payload.actorId, 'subscriptions.update', `sub:${payload.id}`, {
+          logActivity(db, actor.userId, 'subscriptions.update', `sub:${payload.id}`, {
             vendor: payload.vendor,
           });
           return { ok: true, id: payload.id };
@@ -3173,7 +3319,7 @@ function registerAdminIpc() {
             payload.memo ?? null,
           );
         const id = Number(res.lastInsertRowid);
-        logActivity(db, payload.actorId, 'subscriptions.create', `sub:${id}`, {
+        logActivity(db, actor.userId, 'subscriptions.create', `sub:${id}`, {
           vendor: payload.vendor,
         });
         return { ok: true, id };
@@ -3186,9 +3332,10 @@ function registerAdminIpc() {
   ipcMain.handle(
     'subscriptions:setStatus',
     (
-      _e,
-      payload: { id: number; status: 'active' | 'paused' | 'cancelled'; actorId: number },
+      event,
+      payload: { id: number; status: 'active' | 'paused' | 'cancelled'; actorId?: number },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         const cancelledAt =
@@ -3200,7 +3347,7 @@ function registerAdminIpc() {
                   updated_at = datetime('now')
             WHERE id = ?`,
         ).run(payload.status, payload.status, payload.id);
-        logActivity(db, payload.actorId, 'subscriptions.setStatus', `sub:${payload.id}`, {
+        logActivity(db, actor.userId, 'subscriptions.setStatus', `sub:${payload.id}`, {
           status: payload.status,
           cancelledAt,
         });
@@ -3211,7 +3358,9 @@ function registerAdminIpc() {
     },
   );
 
-  ipcMain.handle('subscriptions:monthlyForecast', () => {
+  ipcMain.handle('subscriptions:monthlyForecast', (event) => {
+    // 월 정기결제 합계 — 임원만.
+    requireRole(event, ROLE_SETS.leadership);
     const db = getDb();
     const rows = db
       .prepare(
@@ -3242,11 +3391,12 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'subscriptions:delete',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         db.prepare(`DELETE FROM recurring_subscriptions WHERE id = ?`).run(payload.id);
-        logActivity(db, payload.actorId, 'subscriptions.delete', `sub:${payload.id}`, {});
+        logActivity(db, actor.userId, 'subscriptions.delete', `sub:${payload.id}`, {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'delete_failed' };
@@ -3258,7 +3408,9 @@ function registerAdminIpc() {
   // Corporate cards
   // -------------------------------------------------------------------------
 
-  ipcMain.handle('corpCards:list', (_e, filter?: { status?: string }) => {
+  ipcMain.handle('corpCards:list', (event, filter?: { status?: string }) => {
+    // 법인카드 목록 — 임원만.
+    requireRole(event, ROLE_SETS.leadership);
     const db = getDb();
     const where: string[] = [];
     const params: unknown[] = [];
@@ -3290,7 +3442,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'corpCards:upsert',
     (
-      _e,
+      event,
       payload: {
         id?: number;
         alias: string;
@@ -3303,9 +3455,10 @@ function registerAdminIpc() {
         statementDay: number;
         status?: 'active' | 'frozen' | 'retired';
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         if (!/^\d{4}$/.test(payload.last4)) return { ok: false, error: 'last4_format' };
@@ -3332,7 +3485,7 @@ function registerAdminIpc() {
             payload.memo ?? null,
             payload.id,
           );
-          logActivity(db, payload.actorId, 'corpCards.update', `card:${payload.id}`, {});
+          logActivity(db, actor.userId, 'corpCards.update', `card:${payload.id}`, {});
           return { ok: true, id: payload.id };
         }
         const res = db
@@ -3355,7 +3508,7 @@ function registerAdminIpc() {
             payload.memo ?? null,
           );
         const id = Number(res.lastInsertRowid);
-        logActivity(db, payload.actorId, 'corpCards.create', `card:${id}`, {});
+        logActivity(db, actor.userId, 'corpCards.create', `card:${id}`, {});
         return { ok: true, id };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'upsert_failed' };
@@ -3366,15 +3519,16 @@ function registerAdminIpc() {
   ipcMain.handle(
     'corpCards:setStatus',
     (
-      _e,
-      payload: { id: number; status: 'active' | 'frozen' | 'retired'; actorId: number },
+      event,
+      payload: { id: number; status: 'active' | 'frozen' | 'retired'; actorId?: number },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         db.prepare(
           `UPDATE corporate_cards SET status = ?, updated_at = datetime('now') WHERE id = ?`,
         ).run(payload.status, payload.id);
-        logActivity(db, payload.actorId, 'corpCards.setStatus', `card:${payload.id}`, {
+        logActivity(db, actor.userId, 'corpCards.setStatus', `card:${payload.id}`, {
           status: payload.status,
         });
         return { ok: true };
@@ -3387,9 +3541,11 @@ function registerAdminIpc() {
   ipcMain.handle(
     'corpCards:listTransactions',
     (
-      _e,
+      event,
       filter?: { cardId?: number; period?: string; reconciled?: boolean; limit?: number },
     ) => {
+      // 법인카드 트랜잭션 — 임원만.
+      requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       const where: string[] = [];
       const params: unknown[] = [];
@@ -3430,7 +3586,7 @@ function registerAdminIpc() {
   ipcMain.handle(
     'corpCards:addTransaction',
     (
-      _e,
+      event,
       payload: {
         cardId: number;
         spentAt: string;
@@ -3441,9 +3597,10 @@ function registerAdminIpc() {
         note?: string | null;
         subscriptionId?: number | null;
         receiptPath?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         if (!payload.merchant.trim()) return { ok: false, error: 'merchant_required' };
@@ -3464,10 +3621,10 @@ function registerAdminIpc() {
             payload.note ?? null,
             payload.subscriptionId ?? null,
             payload.receiptPath ?? null,
-            payload.actorId,
+            actor.userId,
           );
         const id = Number(res.lastInsertRowid);
-        logActivity(db, payload.actorId, 'corpCards.addTransaction', `tx:${id}`, {
+        logActivity(db, actor.userId, 'corpCards.addTransaction', `tx:${id}`, {
           cardId: payload.cardId,
           amount: payload.amount,
         });
@@ -3480,13 +3637,14 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'corpCards:setReconciled',
-    (_e, payload: { id: number; reconciled: boolean; actorId: number }) => {
+    (event, payload: { id: number; reconciled: boolean; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         db.prepare(
           `UPDATE corporate_card_transactions SET reconciled = ? WHERE id = ?`,
         ).run(payload.reconciled ? 1 : 0, payload.id);
-        logActivity(db, payload.actorId, 'corpCards.setReconciled', `tx:${payload.id}`, {
+        logActivity(db, actor.userId, 'corpCards.setReconciled', `tx:${payload.id}`, {
           reconciled: payload.reconciled,
         });
         return { ok: true };
@@ -3498,11 +3656,12 @@ function registerAdminIpc() {
 
   ipcMain.handle(
     'corpCards:deleteTransaction',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
       const db = getDb();
       try {
         db.prepare(`DELETE FROM corporate_card_transactions WHERE id = ?`).run(payload.id);
-        logActivity(db, payload.actorId, 'corpCards.deleteTransaction', `tx:${payload.id}`, {});
+        logActivity(db, actor.userId, 'corpCards.deleteTransaction', `tx:${payload.id}`, {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'delete_failed' };
@@ -3510,7 +3669,9 @@ function registerAdminIpc() {
     },
   );
 
-  ipcMain.handle('corpCards:monthlySummary', (_e, period: string) => {
+  ipcMain.handle('corpCards:monthlySummary', (event, period: string) => {
+    // 카드별 월 집계 — 임원만.
+    requireRole(event, ROLE_SETS.leadership);
     const db = getDb();
     const rows = db
       .prepare(
@@ -3594,7 +3755,7 @@ function registerStudentArchiveIpc() {
   ipcMain.handle(
     'students:create',
     (
-      _e,
+      event,
       payload: {
         studentCode?: string | null;
         name: string;
@@ -3606,9 +3767,10 @@ function registerStudentArchiveIpc() {
         guardianPhone?: string | null;
         gradeMemo?: string | null;
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const name = payload.name?.trim();
@@ -3649,7 +3811,7 @@ function registerStudentArchiveIpc() {
             payload.gradeMemo ?? null,
             payload.memo ?? null,
           );
-        logActivity(db, payload.actorId, 'students.create', `student:${info.lastInsertRowid}`, {
+        logActivity(db, actor.userId, 'students.create', `student:${info.lastInsertRowid}`, {
           studentCode: code,
           name,
         });
@@ -3664,7 +3826,7 @@ function registerStudentArchiveIpc() {
   ipcMain.handle(
     'students:update',
     (
-      _e,
+      event,
       payload: {
         id: number;
         name?: string;
@@ -3676,9 +3838,10 @@ function registerStudentArchiveIpc() {
         guardianPhone?: string | null;
         gradeMemo?: string | null;
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const fields: string[] = [];
@@ -3706,7 +3869,7 @@ function registerStudentArchiveIpc() {
         const res = db
           .prepare(`UPDATE students SET ${fields.join(', ')} WHERE id = ?`)
           .run(...params);
-        logActivity(db, payload.actorId, 'students.update', `student:${payload.id}`, {
+        logActivity(db, actor.userId, 'students.update', `student:${payload.id}`, {
           changed: fields.length,
         });
         return { ok: res.changes > 0 };
@@ -3719,7 +3882,9 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:softDelete',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      // 학생 삭제는 운영관리자·임원만 가능.
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const res = db
@@ -3728,7 +3893,7 @@ function registerStudentArchiveIpc() {
               WHERE id = ? AND deleted_at IS NULL`,
           )
           .run(payload.id);
-        logActivity(db, payload.actorId, 'students.softDelete', `student:${payload.id}`, {});
+        logActivity(db, actor.userId, 'students.softDelete', `student:${payload.id}`, {});
         return { ok: res.changes > 0 };
       } catch (err) {
         console.error('[ipc] students:softDelete error', err);
@@ -3739,13 +3904,14 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:restore',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const res = db
           .prepare(`UPDATE students SET deleted_at = NULL WHERE id = ?`)
           .run(payload.id);
-        logActivity(db, payload.actorId, 'students.restore', `student:${payload.id}`, {});
+        logActivity(db, actor.userId, 'students.restore', `student:${payload.id}`, {});
         return { ok: res.changes > 0 };
       } catch (err) {
         console.error('[ipc] students:restore error', err);
@@ -3774,7 +3940,7 @@ function registerStudentArchiveIpc() {
   ipcMain.handle(
     'students:upsertGrade',
     (
-      _e,
+      event,
       payload: {
         id?: number;
         studentId: number;
@@ -3784,9 +3950,10 @@ function registerStudentArchiveIpc() {
         score?: string | null;
         rawScore?: number | null;
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         if (!payload.gradeLevel?.trim() || !payload.semester?.trim() || !payload.subject?.trim()) {
@@ -3810,7 +3977,7 @@ function registerStudentArchiveIpc() {
               payload.memo ?? null,
               payload.id,
             );
-          logActivity(db, payload.actorId, 'students.updateGrade', `grade:${payload.id}`, {
+          logActivity(db, actor.userId, 'students.updateGrade', `grade:${payload.id}`, {
             studentId: payload.studentId,
           });
           return { ok: res.changes > 0, id: payload.id };
@@ -3832,9 +3999,9 @@ function registerStudentArchiveIpc() {
               payload.score ?? null,
               payload.rawScore ?? null,
               payload.memo ?? null,
-              payload.actorId,
+              actor.userId,
             );
-          logActivity(db, payload.actorId, 'students.addGrade', `grade:${info.lastInsertRowid}`, {
+          logActivity(db, actor.userId, 'students.addGrade', `grade:${info.lastInsertRowid}`, {
             studentId: payload.studentId,
           });
           return { ok: true, id: Number(info.lastInsertRowid) };
@@ -3872,10 +4039,11 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteGrade',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       const res = db.prepare(`DELETE FROM student_grades WHERE id = ?`).run(payload.id);
-      logActivity(db, payload.actorId, 'students.deleteGrade', `grade:${payload.id}`, {});
+      logActivity(db, actor.userId, 'students.deleteGrade', `grade:${payload.id}`, {});
       return { ok: res.changes > 0 };
     },
   );
@@ -3900,7 +4068,7 @@ function registerStudentArchiveIpc() {
   ipcMain.handle(
     'students:upsertCounseling',
     (
-      _e,
+      event,
       payload: {
         id?: number;
         studentId: number;
@@ -3908,9 +4076,10 @@ function registerStudentArchiveIpc() {
         title: string;
         body?: string | null;
         category?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const title = payload.title?.trim();
@@ -3926,7 +4095,7 @@ function registerStudentArchiveIpc() {
                 WHERE id = ?`,
             )
             .run(logDate, title, payload.body ?? null, payload.category ?? null, payload.id);
-          logActivity(db, payload.actorId, 'students.updateCounseling', `counseling:${payload.id}`, {
+          logActivity(db, actor.userId, 'students.updateCounseling', `counseling:${payload.id}`, {
             studentId: payload.studentId,
           });
           return { ok: res.changes > 0, id: payload.id };
@@ -3943,9 +4112,9 @@ function registerStudentArchiveIpc() {
             title,
             payload.body ?? null,
             payload.category ?? null,
-            payload.actorId,
+            actor.userId,
           );
-        logActivity(db, payload.actorId, 'students.addCounseling', `counseling:${info.lastInsertRowid}`, {
+        logActivity(db, actor.userId, 'students.addCounseling', `counseling:${info.lastInsertRowid}`, {
           studentId: payload.studentId,
         });
         return { ok: true, id: Number(info.lastInsertRowid) };
@@ -3958,12 +4127,13 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteCounseling',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       const res = db
         .prepare(`DELETE FROM student_counseling_logs WHERE id = ?`)
         .run(payload.id);
-      logActivity(db, payload.actorId, 'students.deleteCounseling', `counseling:${payload.id}`, {});
+      logActivity(db, actor.userId, 'students.deleteCounseling', `counseling:${payload.id}`, {});
       return { ok: res.changes > 0 };
     },
   );
@@ -4055,7 +4225,7 @@ function registerStudentArchiveIpc() {
   ipcMain.handle(
     'students:upsertReportTopic',
     (
-      _e,
+      event,
       payload: {
         id?: number;
         studentId: number;
@@ -4068,9 +4238,10 @@ function registerStudentArchiveIpc() {
         submittedAt?: string | null;
         score?: string | null;
         memo?: string | null;
-        actorId: number;
+        actorId?: number;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const title = payload.title?.trim();
@@ -4098,7 +4269,7 @@ function registerStudentArchiveIpc() {
               payload.memo ?? null,
               payload.id,
             );
-          logActivity(db, payload.actorId, 'students.updateReportTopic', `topic:${payload.id}`, {
+          logActivity(db, actor.userId, 'students.updateReportTopic', `topic:${payload.id}`, {
             studentId: payload.studentId,
             title,
           });
@@ -4122,11 +4293,11 @@ function registerStudentArchiveIpc() {
             payload.submittedAt ?? null,
             payload.score ?? null,
             payload.memo ?? null,
-            payload.actorId,
+            actor.userId,
           );
         logActivity(
           db,
-          payload.actorId,
+          actor.userId,
           'students.createReportTopic',
           `topic:${info.lastInsertRowid}`,
           { studentId: payload.studentId, title },
@@ -4140,13 +4311,14 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteReportTopic',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         const res = db
           .prepare(`DELETE FROM student_report_topics WHERE id = ?`)
           .run(payload.id);
-        logActivity(db, payload.actorId, 'students.deleteReportTopic', `topic:${payload.id}`, {});
+        logActivity(db, actor.userId, 'students.deleteReportTopic', `topic:${payload.id}`, {});
         return { ok: res.changes > 0 };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'delete_failed' };
@@ -4246,7 +4418,8 @@ function registerStudentArchiveIpc() {
 
   ipcMain.handle(
     'students:deleteArchiveFile',
-    (_e, payload: { id: number; actorId: number }) => {
+    (event, payload: { id: number; actorId?: number }) => {
+      const actor = requireRole(event, ROLE_SETS.opsAdmin);
       const db = getDb();
       try {
         // Auto-generated rows are managed by syncAssignmentArchive — don't let
@@ -4264,7 +4437,7 @@ function registerStudentArchiveIpc() {
         const res = db
           .prepare(`DELETE FROM student_archive_files WHERE id = ?`)
           .run(payload.id);
-        logActivity(db, payload.actorId, 'students.deleteArchiveFile', `archiveFile:${payload.id}`, {});
+        logActivity(db, actor.userId, 'students.deleteArchiveFile', `archiveFile:${payload.id}`, {});
         return { ok: res.changes > 0 };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'delete_failed' };
@@ -4289,32 +4462,44 @@ function registerStudentArchiveIpc() {
       isConfigured: Boolean(s.token),
       tokenMasked: masked,
       studentDatabases: s.studentDatabases,
+      assignmentDatabases: s.assignmentDatabases,
     };
   });
 
   ipcMain.handle(
     'notion:saveSettings',
     (
-      _e,
+      event,
       payload: {
         token?: string;
         studentDatabases?: NotionSettings['studentDatabases'];
+        assignmentDatabases?: NotionSettings['assignmentDatabases'];
         actorId?: number | null;
       },
     ) => {
+      const actor = requireRole(event, ROLE_SETS.hrAdmin);
       try {
         const patch: Partial<NotionSettings> = {};
         if (payload.token !== undefined) patch.token = payload.token.trim();
         if (payload.studentDatabases !== undefined) {
           patch.studentDatabases = payload.studentDatabases;
         }
+        if (payload.assignmentDatabases !== undefined) {
+          patch.assignmentDatabases = payload.assignmentDatabases;
+        }
         const saved = NotionSync.saveSettings(patch);
-        logActivity(getDb(), payload.actorId ?? null, 'notion.saveSettings', 'notion:settings', {
+        logActivity(getDb(), actor.userId, 'notion.saveSettings', 'notion:settings', {
           tokenChanged: payload.token !== undefined,
           dbsChanged: payload.studentDatabases !== undefined,
+          asgDbsChanged: payload.assignmentDatabases !== undefined,
           dbCount: saved.studentDatabases.length,
+          asgDbCount: saved.assignmentDatabases.length,
         });
-        return { ok: true, studentDatabases: saved.studentDatabases };
+        return {
+          ok: true,
+          studentDatabases: saved.studentDatabases,
+          assignmentDatabases: saved.assignmentDatabases,
+        };
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'save_failed' };
       }
@@ -4340,11 +4525,293 @@ function registerStudentArchiveIpc() {
   );
 
   ipcMain.handle(
+    'notion:syncAssignments',
+    async (_e, payload?: { actorId?: number | null }) => {
+      return NotionSync.syncAssignments(payload?.actorId ?? null);
+    },
+  );
+
+  ipcMain.handle(
     'notion:listRuns',
-    (_e, filter?: { limit?: number; kind?: 'students' | 'staff' | 'probe' }) => {
+    (
+      _e,
+      filter?: {
+        limit?: number;
+        kind?: 'students' | 'staff' | 'probe' | 'assignments';
+      },
+    ) => {
       return NotionSync.listRuns({ limit: filter?.limit, kind: filter?.kind });
     },
   );
+}
+
+// ===========================================================================
+// In-app release trigger (leadership only).
+//
+//   release:getConfig   → whether a PAT is stored + current repo/workflow
+//   release:setConfig   → save PAT (safeStorage-encrypted) + repo overrides
+//   release:clearConfig → wipe PAT
+//   release:trigger     → POST GitHub Actions workflow_dispatch
+//   release:listRuns    → poll recent workflow runs
+//
+// The PAT is stored base64-encrypted via Electron's safeStorage (OS keychain
+// where available) in admin_settings under the key `release.config.v1`. It
+// is NEVER returned to the renderer — only `{ hasPat: true }`.
+// ===========================================================================
+
+type ReleaseConfigStored = {
+  repoOwner: string;
+  repoName: string;
+  workflowFile: string;
+  patCipherBase64?: string;
+};
+
+const RELEASE_SETTING_KEY = 'release.config.v1';
+const RELEASE_DEFAULT: ReleaseConfigStored = {
+  repoOwner: '42Jason',
+  repoName: 'injaewon-eduops-portal',
+  workflowFile: 'release-bump.yml',
+};
+
+function readReleaseConfig(): ReleaseConfigStored {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT value_json FROM admin_settings WHERE key = ?`)
+    .get(RELEASE_SETTING_KEY) as { value_json: string } | undefined;
+  if (!row) return { ...RELEASE_DEFAULT };
+  try {
+    const parsed = JSON.parse(row.value_json) as Partial<ReleaseConfigStored>;
+    return {
+      repoOwner: parsed.repoOwner ?? RELEASE_DEFAULT.repoOwner,
+      repoName: parsed.repoName ?? RELEASE_DEFAULT.repoName,
+      workflowFile: parsed.workflowFile ?? RELEASE_DEFAULT.workflowFile,
+      patCipherBase64: parsed.patCipherBase64,
+    };
+  } catch {
+    return { ...RELEASE_DEFAULT };
+  }
+}
+
+function writeReleaseConfig(cfg: ReleaseConfigStored) {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR REPLACE INTO admin_settings (key, value_json, updated_at)
+     VALUES (?, ?, datetime('now'))`,
+  ).run(RELEASE_SETTING_KEY, JSON.stringify(cfg));
+}
+
+function decryptPat(cfg: ReleaseConfigStored): string | null {
+  if (!cfg.patCipherBase64) return null;
+  if (!safeStorage.isEncryptionAvailable()) return null;
+  try {
+    const buf = Buffer.from(cfg.patCipherBase64, 'base64');
+    return safeStorage.decryptString(buf);
+  } catch (err) {
+    console.warn('[ipc] release PAT decrypt failed', err);
+    return null;
+  }
+}
+
+function registerReleaseIpc(appVersion: string) {
+  ipcMain.handle('release:getConfig', (event) => {
+    requireRole(event, ROLE_SETS.leadership);
+    const cfg = readReleaseConfig();
+    return {
+      ok: true as const,
+      hasPat: Boolean(cfg.patCipherBase64),
+      repoOwner: cfg.repoOwner,
+      repoName: cfg.repoName,
+      workflowFile: cfg.workflowFile,
+      currentVersion: appVersion,
+      encryptionAvailable: safeStorage.isEncryptionAvailable(),
+    };
+  });
+
+  ipcMain.handle(
+    'release:setConfig',
+    (
+      event,
+      payload: {
+        pat?: string | null;
+        repoOwner?: string;
+        repoName?: string;
+        workflowFile?: string;
+      },
+    ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
+      const db = getDb();
+      const current = readReleaseConfig();
+      const next: ReleaseConfigStored = {
+        repoOwner: payload.repoOwner?.trim() || current.repoOwner,
+        repoName: payload.repoName?.trim() || current.repoName,
+        workflowFile: payload.workflowFile?.trim() || current.workflowFile,
+        patCipherBase64: current.patCipherBase64,
+      };
+      if (typeof payload.pat === 'string') {
+        const trimmed = payload.pat.trim();
+        if (trimmed.length === 0) {
+          // empty string → clear PAT
+          next.patCipherBase64 = undefined;
+        } else {
+          if (!safeStorage.isEncryptionAvailable()) {
+            return { ok: false as const, error: 'safe_storage_unavailable' };
+          }
+          const cipher = safeStorage.encryptString(trimmed);
+          next.patCipherBase64 = cipher.toString('base64');
+        }
+      }
+      writeReleaseConfig(next);
+      logActivity(db, actor.userId, 'release.configSet', 'release:config', {
+        patChanged: typeof payload.pat === 'string',
+        repoOwner: next.repoOwner,
+        repoName: next.repoName,
+        workflowFile: next.workflowFile,
+      });
+      return { ok: true as const };
+    },
+  );
+
+  ipcMain.handle('release:clearConfig', (event) => {
+    const actor = requireRole(event, ROLE_SETS.leadership);
+    const db = getDb();
+    const current = readReleaseConfig();
+    writeReleaseConfig({
+      repoOwner: current.repoOwner,
+      repoName: current.repoName,
+      workflowFile: current.workflowFile,
+      patCipherBase64: undefined,
+    });
+    logActivity(db, actor.userId, 'release.configClear', 'release:config', {});
+    return { ok: true as const };
+  });
+
+  ipcMain.handle(
+    'release:trigger',
+    async (
+      event,
+      payload: {
+        bumpType: 'patch' | 'minor' | 'major';
+        customVersion?: string | null;
+        notes?: string | null;
+      },
+    ) => {
+      const actor = requireRole(event, ROLE_SETS.leadership);
+      const db = getDb();
+      const cfg = readReleaseConfig();
+      const pat = decryptPat(cfg);
+      if (!pat) {
+        return { ok: false as const, error: 'pat_missing' };
+      }
+      const url = `https://api.github.com/repos/${encodeURIComponent(cfg.repoOwner)}/${encodeURIComponent(cfg.repoName)}/actions/workflows/${encodeURIComponent(cfg.workflowFile)}/dispatches`;
+      const body = {
+        ref: 'main',
+        inputs: {
+          bump_type: payload.bumpType,
+          custom_version: payload.customVersion?.trim() ?? '',
+          notes: payload.notes?.trim() ?? '',
+        },
+      };
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${pat}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+            'User-Agent': 'EduOps-Portal-Release-Trigger',
+          },
+          body: JSON.stringify(body),
+        });
+        if (res.status === 204) {
+          logActivity(db, actor.userId, 'release.triggered', 'release:bump', {
+            bumpType: payload.bumpType,
+            customVersion: payload.customVersion ?? null,
+            notes: payload.notes ?? null,
+          });
+          return { ok: true as const };
+        }
+        const text = await res.text();
+        return {
+          ok: false as const,
+          error: `github_${res.status}`,
+          detail: text.slice(0, 500),
+        };
+      } catch (err) {
+        return {
+          ok: false as const,
+          error: 'network_error',
+          detail: (err as Error).message ?? String(err),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle('release:listRuns', async (event, payload?: { limit?: number }) => {
+    requireRole(event, ROLE_SETS.leadership);
+    const cfg = readReleaseConfig();
+    const pat = decryptPat(cfg);
+    if (!pat) {
+      return { ok: false as const, error: 'pat_missing' };
+    }
+    const limit = Math.max(1, Math.min(20, payload?.limit ?? 10));
+    const url = `https://api.github.com/repos/${encodeURIComponent(cfg.repoOwner)}/${encodeURIComponent(cfg.repoName)}/actions/runs?per_page=${limit}`;
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${pat}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'EduOps-Portal-Release-Trigger',
+        },
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        return {
+          ok: false as const,
+          error: `github_${res.status}`,
+          detail: text.slice(0, 500),
+        };
+      }
+      const json = (await res.json()) as {
+        workflow_runs?: Array<{
+          id: number;
+          name?: string | null;
+          display_title?: string | null;
+          head_branch?: string | null;
+          head_sha?: string | null;
+          status?: string | null;
+          conclusion?: string | null;
+          event?: string | null;
+          html_url?: string | null;
+          created_at?: string | null;
+          updated_at?: string | null;
+          path?: string | null;
+        }>;
+      };
+      const runs = (json.workflow_runs ?? []).map((r) => ({
+        id: r.id,
+        name: r.name ?? '',
+        title: r.display_title ?? '',
+        branch: r.head_branch ?? '',
+        sha: (r.head_sha ?? '').slice(0, 7),
+        status: r.status ?? '',
+        conclusion: r.conclusion ?? '',
+        event: r.event ?? '',
+        url: r.html_url ?? '',
+        createdAt: r.created_at ?? '',
+        updatedAt: r.updated_at ?? '',
+        path: r.path ?? '',
+      }));
+      return { ok: true as const, runs };
+    } catch (err) {
+      return {
+        ok: false as const,
+        error: 'network_error',
+        detail: (err as Error).message ?? String(err),
+      };
+    }
+  });
 }
 
 /**

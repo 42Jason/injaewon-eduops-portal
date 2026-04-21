@@ -30,6 +30,17 @@ const api = {
         error?: string;
       }>,
     logout: () => ipcRenderer.invoke('auth:logout') as Promise<{ ok: boolean }>,
+    /**
+     * Ask the main process whether this webContents still has a live session.
+     * Renderer calls this on startup to validate any stored user before trusting
+     * localStorage — a forged entry there has no matching session in main and
+     * will get an `{ ok: false }` response.
+     */
+    me: () =>
+      ipcRenderer.invoke('auth:me') as Promise<
+        | { ok: true; actor: { userId: number; email: string; name: string; role: string; departmentId: number | null } }
+        | { ok: false }
+      >,
   },
   assignments: {
     list: (filter?: {
@@ -904,6 +915,17 @@ const api = {
           contactField?: string;
           guardianField?: string;
         }>;
+        assignmentDatabases: Array<{
+          id: string;
+          label?: string;
+          subjectField?: string;
+          titleField?: string;
+          statusField?: string;
+          parserField?: string;
+          qa1Field?: string;
+          qaFinalField?: string;
+          dueField?: string;
+        }>;
       }>,
     saveSettings: (payload: {
       token?: string;
@@ -912,6 +934,17 @@ const api = {
         label?: string;
         contactField?: string;
         guardianField?: string;
+      }>;
+      assignmentDatabases?: Array<{
+        id: string;
+        label?: string;
+        subjectField?: string;
+        titleField?: string;
+        statusField?: string;
+        parserField?: string;
+        qa1Field?: string;
+        qaFinalField?: string;
+        dueField?: string;
       }>;
       actorId?: number | null;
     }) =>
@@ -923,6 +956,17 @@ const api = {
           label?: string;
           contactField?: string;
           guardianField?: string;
+        }>;
+        assignmentDatabases?: Array<{
+          id: string;
+          label?: string;
+          subjectField?: string;
+          titleField?: string;
+          statusField?: string;
+          parserField?: string;
+          qa1Field?: string;
+          qaFinalField?: string;
+          dueField?: string;
         }>;
       }>,
     probe: (payload?: { actorId?: number | null }) =>
@@ -952,14 +996,25 @@ const api = {
         errors: number;
         message?: string;
       }>,
+    syncAssignments: (payload?: { actorId?: number | null }) =>
+      ipcRenderer.invoke('notion:syncAssignments', payload) as Promise<{
+        runId: number;
+        kind: 'assignments';
+        ok: boolean;
+        inserted: number;
+        updated: number;
+        skipped: number;
+        errors: number;
+        message?: string;
+      }>,
     listRuns: (filter?: {
       limit?: number;
-      kind?: 'students' | 'staff' | 'probe';
+      kind?: 'students' | 'staff' | 'probe' | 'assignments';
     }) =>
       ipcRenderer.invoke('notion:listRuns', filter) as Promise<
         Array<{
           id: number;
-          kind: 'students' | 'staff' | 'probe';
+          kind: 'students' | 'staff' | 'probe' | 'assignments';
           started_at: string;
           finished_at: string | null;
           ok: number;
@@ -988,6 +1043,58 @@ const api = {
         ipcRenderer.removeListener('updater:status', handler);
       };
     },
+  },
+  release: {
+    getConfig: () =>
+      ipcRenderer.invoke('release:getConfig') as Promise<{
+        ok: true;
+        hasPat: boolean;
+        repoOwner: string;
+        repoName: string;
+        workflowFile: string;
+        currentVersion: string;
+        encryptionAvailable: boolean;
+      }>,
+    setConfig: (payload: {
+      pat?: string | null;
+      repoOwner?: string;
+      repoName?: string;
+      workflowFile?: string;
+    }) =>
+      ipcRenderer.invoke('release:setConfig', payload) as Promise<
+        { ok: true } | { ok: false; error: string }
+      >,
+    clearConfig: () =>
+      ipcRenderer.invoke('release:clearConfig') as Promise<{ ok: true }>,
+    trigger: (payload: {
+      bumpType: 'patch' | 'minor' | 'major';
+      customVersion?: string | null;
+      notes?: string | null;
+    }) =>
+      ipcRenderer.invoke('release:trigger', payload) as Promise<
+        { ok: true } | { ok: false; error: string; detail?: string }
+      >,
+    listRuns: (payload?: { limit?: number }) =>
+      ipcRenderer.invoke('release:listRuns', payload ?? {}) as Promise<
+        | {
+            ok: true;
+            runs: Array<{
+              id: number;
+              name: string;
+              title: string;
+              branch: string;
+              sha: string;
+              status: string;
+              conclusion: string;
+              event: string;
+              url: string;
+              createdAt: string;
+              updatedAt: string;
+              path: string;
+            }>;
+          }
+        | { ok: false; error: string; detail?: string }
+      >,
   },
 };
 
