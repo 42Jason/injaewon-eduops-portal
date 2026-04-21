@@ -8,6 +8,7 @@ import {
   type RegularPayrollProfile,
   type RegularPayrollInputs,
 } from './payroll-calc';
+import { NotionSync, type NotionSettings } from './notion-sync';
 
 /**
  * Register every IPC handler on the main process.
@@ -3433,6 +3434,80 @@ function registerStudentArchiveIpc() {
       } catch (err) {
         return { ok: false, error: (err as Error).message ?? 'delete_failed' };
       }
+    },
+  );
+
+  // =======================================================================
+  // Notion 연동 (수동 트리거 동기화)
+  // =======================================================================
+
+  ipcMain.handle('notion:getSettings', () => {
+    // 토큰은 민감 정보이므로 전체 노출 대신 isConfigured 플래그 + 마스킹만 반환.
+    const s = NotionSync.getSettings();
+    const masked =
+      s.token && s.token.length > 8
+        ? `${s.token.slice(0, 4)}…${s.token.slice(-4)}`
+        : s.token
+          ? '••••'
+          : '';
+    return {
+      isConfigured: Boolean(s.token),
+      tokenMasked: masked,
+      studentDatabases: s.studentDatabases,
+    };
+  });
+
+  ipcMain.handle(
+    'notion:saveSettings',
+    (
+      _e,
+      payload: {
+        token?: string;
+        studentDatabases?: NotionSettings['studentDatabases'];
+        actorId?: number | null;
+      },
+    ) => {
+      try {
+        const patch: Partial<NotionSettings> = {};
+        if (payload.token !== undefined) patch.token = payload.token.trim();
+        if (payload.studentDatabases !== undefined) {
+          patch.studentDatabases = payload.studentDatabases;
+        }
+        const saved = NotionSync.saveSettings(patch);
+        logActivity(getDb(), payload.actorId ?? null, 'notion.saveSettings', 'notion:settings', {
+          tokenChanged: payload.token !== undefined,
+          dbsChanged: payload.studentDatabases !== undefined,
+          dbCount: saved.studentDatabases.length,
+        });
+        return { ok: true, studentDatabases: saved.studentDatabases };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? 'save_failed' };
+      }
+    },
+  );
+
+  ipcMain.handle('notion:probe', async (_e, payload?: { actorId?: number | null }) => {
+    return NotionSync.probe(payload?.actorId ?? null);
+  });
+
+  ipcMain.handle(
+    'notion:syncStudents',
+    async (_e, payload?: { actorId?: number | null }) => {
+      return NotionSync.syncStudents(payload?.actorId ?? null);
+    },
+  );
+
+  ipcMain.handle(
+    'notion:syncStaff',
+    async (_e, payload?: { actorId?: number | null }) => {
+      return NotionSync.syncStaff(payload?.actorId ?? null);
+    },
+  );
+
+  ipcMain.handle(
+    'notion:listRuns',
+    (_e, filter?: { limit?: number; kind?: 'students' | 'staff' | 'probe' }) => {
+      return NotionSync.listRuns({ limit: filter?.limit, kind: filter?.kind });
     },
   );
 }

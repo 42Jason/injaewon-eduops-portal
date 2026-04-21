@@ -546,6 +546,79 @@ interface EduOpsApi {
       actorId: number;
     }): Promise<{ ok: boolean; error?: string }>;
   };
+  notion: {
+    getSettings(): Promise<{
+      isConfigured: boolean;
+      tokenMasked: string;
+      studentDatabases: Array<{
+        id: string;
+        label?: string;
+        contactField?: string;
+        guardianField?: string;
+      }>;
+    }>;
+    saveSettings(payload: {
+      token?: string;
+      studentDatabases?: Array<{
+        id: string;
+        label?: string;
+        contactField?: string;
+        guardianField?: string;
+      }>;
+      actorId?: number | null;
+    }): Promise<{
+      ok: boolean;
+      error?: string;
+      studentDatabases?: Array<{
+        id: string;
+        label?: string;
+        contactField?: string;
+        guardianField?: string;
+      }>;
+    }>;
+    probe(payload?: { actorId?: number | null }): Promise<
+      | { ok: true; me: { id: string; name?: string | null } }
+      | { ok: false; message: string }
+    >;
+    syncStudents(payload?: { actorId?: number | null }): Promise<{
+      runId: number;
+      kind: 'students';
+      ok: boolean;
+      inserted: number;
+      updated: number;
+      skipped: number;
+      errors: number;
+      message?: string;
+    }>;
+    syncStaff(payload?: { actorId?: number | null }): Promise<{
+      runId: number;
+      kind: 'staff';
+      ok: boolean;
+      inserted: number;
+      updated: number;
+      skipped: number;
+      errors: number;
+      message?: string;
+    }>;
+    listRuns(filter?: {
+      limit?: number;
+      kind?: 'students' | 'staff' | 'probe';
+    }): Promise<
+      Array<{
+        id: number;
+        kind: 'students' | 'staff' | 'probe';
+        started_at: string;
+        finished_at: string | null;
+        ok: number;
+        inserted: number;
+        updated: number;
+        skipped: number;
+        errors: number;
+        message: string | null;
+        triggered_by: number | null;
+      }>
+    >;
+  };
   updater: {
     status(): Promise<UpdaterStatus>;
     check(): Promise<{ ok: boolean; error?: string }>;

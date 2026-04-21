@@ -104,6 +104,78 @@ function runMigrations(db: Db) {
   } catch (err) {
     console.warn('[db] student_archive_files migration skipped:', err);
   }
+
+  // --- students: Notion 연동 컬럼 -----------------------------------------
+  // notion_page_id 는 노션 페이지 고유 ID(대시 포함). notion_source 는
+  // 어느 노션 DB에서 왔는지 라벨(예: "consulting" / "sugang" / "gumiho").
+  // notion_extra 는 매핑되지 않은 전체 프로퍼티를 JSON 문자열로 보관.
+  try {
+    const cols = columns('students');
+    if (cols.size > 0) {
+      if (!cols.has('notion_page_id')) {
+        db.exec(`ALTER TABLE students ADD COLUMN notion_page_id TEXT`);
+      }
+      if (!cols.has('notion_source')) {
+        db.exec(`ALTER TABLE students ADD COLUMN notion_source TEXT`);
+      }
+      if (!cols.has('notion_synced_at')) {
+        db.exec(`ALTER TABLE students ADD COLUMN notion_synced_at TEXT`);
+      }
+      if (!cols.has('notion_extra')) {
+        db.exec(`ALTER TABLE students ADD COLUMN notion_extra TEXT`);
+      }
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_students_notion_page
+           ON students(notion_page_id)`,
+      );
+    }
+  } catch (err) {
+    console.warn('[db] students Notion 컬럼 추가 skipped:', err);
+  }
+
+  // --- users: Notion 연동 컬럼 --------------------------------------------
+  try {
+    const cols = columns('users');
+    if (cols.size > 0) {
+      if (!cols.has('notion_user_id')) {
+        db.exec(`ALTER TABLE users ADD COLUMN notion_user_id TEXT`);
+      }
+      if (!cols.has('notion_synced_at')) {
+        db.exec(`ALTER TABLE users ADD COLUMN notion_synced_at TEXT`);
+      }
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_users_notion_user
+           ON users(notion_user_id)`,
+      );
+    }
+  } catch (err) {
+    console.warn('[db] users Notion 컬럼 추가 skipped:', err);
+  }
+
+  // --- notion_sync_runs: 동기화 이력 (기존 DB에도 생성) --------------------
+  try {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS notion_sync_runs (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe')),
+         started_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+         finished_at   TEXT,
+         ok            INTEGER NOT NULL DEFAULT 0,
+         inserted      INTEGER NOT NULL DEFAULT 0,
+         updated       INTEGER NOT NULL DEFAULT 0,
+         skipped       INTEGER NOT NULL DEFAULT 0,
+         errors        INTEGER NOT NULL DEFAULT 0,
+         message       TEXT,
+         triggered_by  INTEGER REFERENCES users(id) ON DELETE SET NULL
+       )`,
+    );
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_notion_sync_runs_kind
+         ON notion_sync_runs(kind, started_at DESC)`,
+    );
+  } catch (err) {
+    console.warn('[db] notion_sync_runs 생성 skipped:', err);
+  }
 }
 
 /**

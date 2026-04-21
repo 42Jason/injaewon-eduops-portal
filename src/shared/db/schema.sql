@@ -336,6 +336,26 @@ CREATE TABLE IF NOT EXISTS admin_settings (
   updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ---------------------------------------------------------------------------
+-- Notion sync runs (수동 트리거 기반 노션 동기화 이력)
+-- 한 행 = students 또는 staff 한 번 동기화 호출 결과 요약
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS notion_sync_runs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT    NOT NULL CHECK (kind IN ('students','staff','probe')),
+  started_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  finished_at   TEXT,
+  ok            INTEGER NOT NULL DEFAULT 0,            -- boolean (1 = success)
+  inserted      INTEGER NOT NULL DEFAULT 0,
+  updated       INTEGER NOT NULL DEFAULT 0,
+  skipped       INTEGER NOT NULL DEFAULT 0,
+  errors        INTEGER NOT NULL DEFAULT 0,
+  message       TEXT,                                  -- last error or summary
+  triggered_by  INTEGER REFERENCES users(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notion_sync_runs_kind ON notion_sync_runs(kind, started_at DESC);
+
 -- ===========================================================================
 -- Administrative: tuition (학원비 수납) + payroll (급여)
 --                + recurring subscriptions (정기 결제)

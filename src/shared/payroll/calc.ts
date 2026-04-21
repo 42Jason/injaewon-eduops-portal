@@ -8,7 +8,7 @@
  * prepare draft payslips and see expected take-home pay inside the portal. For
  * official filings, cross-reference with NTS 간이세액표 / 4대보험 공식 계산기.
  *
- * Rate sources (as of the 2026 April snapshot bundled with v0.1.4):
+ * Rate sources (as of the 2026 April snapshot bundled with v0.1.5):
  *   - 국민연금    : 4.5% (근로자 부담분, 표준보수월액 상한 617만원 가정)
  *   - 건강보험    : 3.545%
  *   - 장기요양보험 : 건강보험료 × 12.95%

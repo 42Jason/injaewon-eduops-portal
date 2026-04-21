@@ -27,6 +27,7 @@ import { MyPayslipsPage } from '@/pages/MyPayslipsPage';
 import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
 import { CorporateCardsPage } from '@/pages/CorporateCardsPage';
 import { StudentArchivePage } from '@/pages/StudentArchivePage';
+import { NotionSyncPage } from '@/pages/NotionSyncPage';
 import { useSession } from '@/stores/session';
 
 function RequireAuth({ children }: { children: ReactElement }) {
@@ -94,6 +95,7 @@ export default function App() {
 
         <Route path="reports" element={<ReportsPage />} />
         <Route path="automation" element={<AutomationPage />} />
+        <Route path="settings/notion" element={<NotionSyncPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
 

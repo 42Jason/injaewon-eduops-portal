@@ -26,6 +26,7 @@ import {
   Repeat,
   CreditCard,
   Archive,
+  RefreshCw,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useSession } from '@/stores/session';
@@ -69,6 +70,7 @@ const MENU: MenuItem[] = [
 
   { to: '/reports', label: '리포트', icon: BarChart3, group: '운영' },
   { to: '/automation', label: 'CTO 자동화', icon: Bot, group: '운영' },
+  { to: '/settings/notion', label: '노션 동기화', icon: RefreshCw, group: '운영' },
   { to: '/settings', label: '설정', icon: Settings, group: '운영' },
 ];
 

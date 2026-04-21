@@ -700,6 +700,85 @@ const api = {
         error?: string;
       }>,
   },
+  notion: {
+    getSettings: () =>
+      ipcRenderer.invoke('notion:getSettings') as Promise<{
+        isConfigured: boolean;
+        tokenMasked: string;
+        studentDatabases: Array<{
+          id: string;
+          label?: string;
+          contactField?: string;
+          guardianField?: string;
+        }>;
+      }>,
+    saveSettings: (payload: {
+      token?: string;
+      studentDatabases?: Array<{
+        id: string;
+        label?: string;
+        contactField?: string;
+        guardianField?: string;
+      }>;
+      actorId?: number | null;
+    }) =>
+      ipcRenderer.invoke('notion:saveSettings', payload) as Promise<{
+        ok: boolean;
+        error?: string;
+        studentDatabases?: Array<{
+          id: string;
+          label?: string;
+          contactField?: string;
+          guardianField?: string;
+        }>;
+      }>,
+    probe: (payload?: { actorId?: number | null }) =>
+      ipcRenderer.invoke('notion:probe', payload) as Promise<
+        | { ok: true; me: { id: string; name?: string | null } }
+        | { ok: false; message: string }
+      >,
+    syncStudents: (payload?: { actorId?: number | null }) =>
+      ipcRenderer.invoke('notion:syncStudents', payload) as Promise<{
+        runId: number;
+        kind: 'students';
+        ok: boolean;
+        inserted: number;
+        updated: number;
+        skipped: number;
+        errors: number;
+        message?: string;
+      }>,
+    syncStaff: (payload?: { actorId?: number | null }) =>
+      ipcRenderer.invoke('notion:syncStaff', payload) as Promise<{
+        runId: number;
+        kind: 'staff';
+        ok: boolean;
+        inserted: number;
+        updated: number;
+        skipped: number;
+        errors: number;
+        message?: string;
+      }>,
+    listRuns: (filter?: {
+      limit?: number;
+      kind?: 'students' | 'staff' | 'probe';
+    }) =>
+      ipcRenderer.invoke('notion:listRuns', filter) as Promise<
+        Array<{
+          id: number;
+          kind: 'students' | 'staff' | 'probe';
+          started_at: string;
+          finished_at: string | null;
+          ok: number;
+          inserted: number;
+          updated: number;
+          skipped: number;
+          errors: number;
+          message: string | null;
+          triggered_by: number | null;
+        }>
+      >,
+  },
   updater: {
     status: () =>
       ipcRenderer.invoke('updater:status') as Promise<UpdaterStatusPayload>,
