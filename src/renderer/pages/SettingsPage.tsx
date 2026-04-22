@@ -15,6 +15,7 @@ import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
 import { useToast } from '@/stores/toast';
 import { cn } from '@/lib/cn';
+import { hasRole, ROLE_GROUPS } from '@/lib/roleAccess';
 import { ROLE_LABELS } from '@shared/types/user';
 import { UpdateCheckButton } from '@/components/UpdateBanner';
 
@@ -47,6 +48,7 @@ export function SettingsPage() {
   const toast = useToast();
 
   const [theme, setTheme] = useState<Theme>(readTheme());
+  const canManageSystemSettings = hasRole(user?.role, ROLE_GROUPS.executive);
   const [appInfo, setAppInfo] = useState<{
     version: string;
     platform: string;
@@ -71,7 +73,7 @@ export function SettingsPage() {
   const settingsQuery = useQuery({
     queryKey: ['settings.list'],
     queryFn: () => api!.settings.list(),
-    enabled: live && !!user?.perms.isLeadership,
+    enabled: live && canManageSystemSettings,
   });
 
   const parsedSettings = useMemo(() => {
@@ -242,7 +244,7 @@ export function SettingsPage() {
       </section>
 
       {/* Admin settings — leadership only */}
-      {user.perms.isLeadership && (
+      {canManageSystemSettings && (
         <section className="card">
           <div className="flex items-center gap-2 mb-3">
             <Shield size={14} className="text-accent" />

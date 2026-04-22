@@ -24,71 +24,15 @@ import { Modal } from '@/components/ui/Modal';
 import { FormField, SelectInput, TextInput, Textarea } from '@/components/ui/FormField';
 import { fmtDate, thisMonthYm, todayLocalYmd } from '@/lib/date';
 import { firstError, numberRange, required, pattern } from '@/lib/validators';
-
-type CardStatus = 'active' | 'frozen' | 'retired';
-
-interface CardRow {
-  id: number;
-  alias: string;
-  brand: string | null;
-  issuer: string | null;
-  last4: string;
-  holder_user_id: number | null;
-  owner_user_id: number | null;
-  monthly_limit: number;
-  statement_day: number;
-  status: CardStatus;
-  memo: string | null;
-  created_at: string;
-  updated_at: string;
-  holder_name: string | null;
-  owner_name: string | null;
-  active_sub_count: number;
-  mtd_spend: number;
-}
-
-interface TxRow {
-  id: number;
-  card_id: number;
-  spent_at: string;
-  merchant: string;
-  category: string | null;
-  amount: number;
-  currency: string;
-  note: string | null;
-  subscription_id: number | null;
-  receipt_path: string | null;
-  reconciled: number;
-  actor_id: number | null;
-  created_at: string;
-  card_alias: string | null;
-  card_last4: string | null;
-  subscription_vendor: string | null;
-  actor_name: string | null;
-}
-
-interface SummaryRow {
-  card_id: number;
-  alias: string;
-  last4: string;
-  monthly_limit: number;
-  total_spend: number;
-  tx_count: number;
-  unreconciled_count: number;
-}
-
-interface UserLite {
-  id: number;
-  name: string;
-  email: string;
-  active: number;
-}
-
-interface SubLite {
-  id: number;
-  vendor: string;
-  card_id: number | null;
-}
+import {
+  fmtWon,
+  type CardRow,
+  type CardStatus,
+  type SubLite,
+  type SummaryRow,
+  type TxRow,
+  type UserLite,
+} from './corporate-cards/types';
 
 const STATUS_LABEL: Record<CardStatus, { label: string; tone: string; icon: React.ReactNode }> = {
   active:  { label: '활성',     tone: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30', icon: <Power size={10} /> },
@@ -96,17 +40,11 @@ const STATUS_LABEL: Record<CardStatus, { label: string; tone: string; icon: Reac
   retired: { label: '폐기',     tone: 'bg-rose-500/15 text-rose-300 border-rose-500/30',        icon: <Archive size={10} /> },
 };
 
-function fmtWon(n: number | null | undefined): string {
-  if (n === null || n === undefined || Number.isNaN(n)) return '-';
-  return `${n.toLocaleString('ko-KR')}원`;
-}
-
 export function CorporateCardsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const canManage =
-    !!user && (user.role === 'HR_ADMIN' || user.role === 'CEO' || user.role === 'OPS_MANAGER');
+  const canManage = !!user && user.role !== 'TA';
 
   const [period, setPeriod] = useState<string>(() => thisMonthYm());
   const [selectedCard, setSelectedCard] = useState<number | null>(null);

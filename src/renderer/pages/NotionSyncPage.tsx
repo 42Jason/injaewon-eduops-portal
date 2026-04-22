@@ -10,6 +10,7 @@ import {
   Trash2,
   Users,
   GraduationCap,
+  ClipboardList,
   History,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
@@ -30,6 +31,18 @@ interface NotionDbCfg {
   label?: string;
   contactField?: string;
   guardianField?: string;
+}
+
+interface AssignmentDbCfg {
+  id: string;
+  label?: string;
+  subjectField?: string;
+  titleField?: string;
+  statusField?: string;
+  parserField?: string;
+  qa1Field?: string;
+  qaFinalField?: string;
+  dueField?: string;
 }
 
 interface SyncRun {
@@ -101,6 +114,8 @@ function NotionSyncPanel({ currentUserId }: { currentUserId: number }) {
 
   const settings = settingsQuery.data;
   const runs = runsQuery.data ?? [];
+  const hasStudentDbs = (settings?.studentDatabases ?? []).some((db) => db.id?.trim());
+  const hasAssignmentDbs = (settings?.assignmentDatabases ?? []).some((db) => db.id?.trim());
 
   return (
     <div className="p-6 space-y-4">
@@ -110,8 +125,8 @@ function NotionSyncPanel({ currentUserId }: { currentUserId: number }) {
             <RefreshCw size={20} /> 노션 동기화
           </h1>
           <p className="text-sm text-fg-subtle mt-0.5">
-            내부 Integration 토큰으로 워크스페이스 사용자와 학생 데이터베이스를 EduOps 로 끌어옵니다.
-            학생은 페이지 단위로 upsert 되며, 직원은 이메일이 일치하는 기존 계정에만 연결됩니다.
+            내부 Integration 토큰으로 워크스페이스 사용자, 학생 DB, 과제 요청 DB 를 EduOps 로 끌어옵니다.
+            학생과 과제는 페이지 단위로 upsert 되며, 직원은 기존 계정에만 연결됩니다.
           </p>
         </div>
         <button
@@ -139,8 +154,14 @@ function NotionSyncPanel({ currentUserId }: { currentUserId: number }) {
             initial={settings.studentDatabases ?? []}
             currentUserId={currentUserId}
           />
+          <AssignmentDatabasesCard
+            initial={settings.assignmentDatabases ?? []}
+            currentUserId={currentUserId}
+          />
           <ActionsCard
             isConfigured={settings.isConfigured}
+            hasStudentDbs={hasStudentDbs}
+            hasAssignmentDbs={hasAssignmentDbs}
             currentUserId={currentUserId}
           />
         </>
@@ -451,19 +472,261 @@ function DatabasesCard({
 }
 
 // -----------------------------------------------------------------------------
+// Assignment databases card — existing assignment sync mapping
+// -----------------------------------------------------------------------------
+
+function AssignmentDatabasesCard({
+  initial,
+  currentUserId,
+}: {
+  initial: AssignmentDbCfg[];
+  currentUserId: number;
+}) {
+  const api = getApi()!;
+  const [rows, setRows] = useState<AssignmentDbCfg[]>(initial);
+  const [touched, setTouched] = useState(false);
+
+  useEffect(() => {
+    if (!touched) {
+      setRows(initial);
+    }
+  }, [initial, touched]);
+
+  const saveMutation = useMutationWithToast({
+    mutationFn: (next: AssignmentDbCfg[]) =>
+      api.notion.saveSettings({
+        assignmentDatabases: next,
+        actorId: currentUserId,
+      }),
+    successMessage: '과제 데이터베이스 목록을 저장했습니다',
+    errorMessage: '과제 DB 목록 저장에 실패했습니다',
+    invalidates: [['notion.settings']],
+    onSuccess: () => setTouched(false),
+  });
+
+  function patch(index: number, key: keyof AssignmentDbCfg, value: string) {
+    setTouched(true);
+    setRows((prev) =>
+      prev.map((r, i) => (i === index ? { ...r, [key]: value } : r)),
+    );
+  }
+
+  function addRow() {
+    setTouched(true);
+    setRows((prev) => [
+      ...prev,
+      {
+        id: '',
+        label: '',
+        subjectField: '과목명',
+        titleField: '보고서 주제',
+        statusField: '진행 상황',
+        parserField: '작성자',
+        qa1Field: '1차 검토자',
+        qaFinalField: '2차 작성자',
+        dueField: '마감시한 (zap)',
+      },
+    ]);
+  }
+
+  function removeRow(index: number) {
+    setTouched(true);
+    setRows((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function submit() {
+    const cleaned = rows
+      .map((r) => ({
+        id: r.id.trim(),
+        label: r.label?.trim() || undefined,
+        subjectField: r.subjectField?.trim() || undefined,
+        titleField: r.titleField?.trim() || undefined,
+        statusField: r.statusField?.trim() || undefined,
+        parserField: r.parserField?.trim() || undefined,
+        qa1Field: r.qa1Field?.trim() || undefined,
+        qaFinalField: r.qaFinalField?.trim() || undefined,
+        dueField: r.dueField?.trim() || undefined,
+      }))
+      .filter((r) => r.id);
+    saveMutation.mutate(cleaned);
+  }
+
+  return (
+    <section className="card p-4 space-y-3">
+      <header className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <ClipboardList size={14} className="text-fg-subtle" />
+          <h2 className="text-sm font-semibold text-fg">과제 데이터베이스 매핑</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="btn-ghost text-xs flex items-center gap-1"
+            onClick={addRow}
+          >
+            <Plus size={12} /> 행 추가
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-xs flex items-center gap-1"
+            disabled={saveMutation.isPending || !touched}
+            onClick={submit}
+          >
+            {saveMutation.isPending ? '저장 중…' : '저장'}
+          </button>
+        </div>
+      </header>
+      <p className="text-[11px] text-fg-subtle">
+        이미 준비된 과제 동기화 설정입니다. 노션 과제 DB 의 필드명이 다르면 아래 이름만 맞춰 저장하세요.
+        비워 둔 필드는 기본 후보 이름으로 자동 탐색합니다.
+      </p>
+      {rows.length === 0 ? (
+        <EmptyState
+          icon={ClipboardList}
+          title="등록된 과제 DB가 없습니다"
+          hint="'행 추가' 로 과제 요청 DB 를 등록하세요."
+        />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[980px] text-xs">
+            <thead className="bg-bg-soft/50 text-fg-muted">
+              <tr>
+                <th className="px-2 py-2 text-left font-medium w-[240px]">DB ID</th>
+                <th className="px-2 py-2 text-left font-medium w-[110px]">라벨</th>
+                <th className="px-2 py-2 text-left font-medium">과목</th>
+                <th className="px-2 py-2 text-left font-medium">제목</th>
+                <th className="px-2 py-2 text-left font-medium">상태</th>
+                <th className="px-2 py-2 text-left font-medium">작성자</th>
+                <th className="px-2 py-2 text-left font-medium">1차</th>
+                <th className="px-2 py-2 text-left font-medium">최종</th>
+                <th className="px-2 py-2 text-left font-medium">마감</th>
+                <th className="px-2 py-2 text-right font-medium w-[56px]">&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {rows.map((row, i) => (
+                <tr key={i} className="align-top">
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full tabular-nums"
+                      value={row.id}
+                      onChange={(e) => patch(i, 'id', e.target.value)}
+                      placeholder="32자 DB ID"
+                      spellCheck={false}
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.label ?? ''}
+                      onChange={(e) => patch(i, 'label', e.target.value)}
+                      placeholder="예: 과제"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.subjectField ?? ''}
+                      onChange={(e) => patch(i, 'subjectField', e.target.value)}
+                      placeholder="과목명"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.titleField ?? ''}
+                      onChange={(e) => patch(i, 'titleField', e.target.value)}
+                      placeholder="보고서 주제"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.statusField ?? ''}
+                      onChange={(e) => patch(i, 'statusField', e.target.value)}
+                      placeholder="진행 상황"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.parserField ?? ''}
+                      onChange={(e) => patch(i, 'parserField', e.target.value)}
+                      placeholder="작성자"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.qa1Field ?? ''}
+                      onChange={(e) => patch(i, 'qa1Field', e.target.value)}
+                      placeholder="1차 검토자"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.qaFinalField ?? ''}
+                      onChange={(e) => patch(i, 'qaFinalField', e.target.value)}
+                      placeholder="2차 작성자"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="input text-xs py-1 w-full"
+                      value={row.dueField ?? ''}
+                      onChange={(e) => patch(i, 'dueField', e.target.value)}
+                      placeholder="마감시한"
+                    />
+                  </td>
+                  <td className="px-2 py-1.5 text-right">
+                    <button
+                      type="button"
+                      className="btn-ghost text-xs text-rose-300 inline-flex items-center gap-1"
+                      onClick={() => removeRow(i)}
+                      aria-label="행 삭제"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// -----------------------------------------------------------------------------
 // Actions card — sync buttons
 // -----------------------------------------------------------------------------
 
 function ActionsCard({
   isConfigured,
+  hasStudentDbs,
+  hasAssignmentDbs,
   currentUserId,
 }: {
   isConfigured: boolean;
+  hasStudentDbs: boolean;
+  hasAssignmentDbs: boolean;
   currentUserId: number;
 }) {
   const api = getApi()!;
   const [lastStudentMsg, setLastStudentMsg] = useState<string | null>(null);
   const [lastStaffMsg, setLastStaffMsg] = useState<string | null>(null);
+  const [lastAssignmentMsg, setLastAssignmentMsg] = useState<string | null>(null);
 
   const studentsMutation = useMutationWithToast({
     mutationFn: () => api.notion.syncStudents({ actorId: currentUserId }),
@@ -475,6 +738,11 @@ function ActionsCard({
         res.ok
           ? `학생 동기화 완료 — 신규 ${res.inserted}, 갱신 ${res.updated}, 건너뜀 ${res.skipped}`
           : `학생 동기화 실패 — ${res.message ?? '원인 불명'}`,
+      );
+    },
+    onError: (err) => {
+      setLastStudentMsg(
+        `학생 동기화 호출 실패 — ${err instanceof Error ? err.message : String(err)}`,
       );
     },
   });
@@ -491,6 +759,30 @@ function ActionsCard({
           : `직원 연결 실패 — ${res.message ?? '원인 불명'}`,
       );
     },
+    onError: (err) => {
+      setLastStaffMsg(
+        `직원 연결 호출 실패 — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    },
+  });
+
+  const assignmentsMutation = useMutationWithToast({
+    mutationFn: () => api.notion.syncAssignments({ actorId: currentUserId }),
+    successMessage: false,
+    errorMessage: '과제 동기화에 실패했습니다',
+    invalidates: [['notion.runs'], ['assignments.list'], ['topbar.assignments']],
+    onSuccess: (res) => {
+      setLastAssignmentMsg(
+        res.ok
+          ? `과제 동기화 완료 — 신규 ${res.inserted}, 갱신 ${res.updated}, 건너뜀 ${res.skipped}`
+          : `과제 동기화 실패 — ${res.message ?? '원인 불명'}`,
+      );
+    },
+    onError: (err) => {
+      setLastAssignmentMsg(
+        `과제 동기화 호출 실패 — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    },
   });
 
   return (
@@ -502,7 +794,7 @@ function ActionsCard({
       <p className="text-[11px] text-fg-subtle">
         동기화는 사용자가 버튼을 누를 때만 실행됩니다. 결과는 아래 이력 표에 기록되며, 학생 목록은 즉시 반영됩니다.
       </p>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
         <div className="rounded border border-border bg-bg-soft/40 p-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm font-medium text-fg">
@@ -511,7 +803,7 @@ function ActionsCard({
             <button
               type="button"
               className="btn-primary text-xs flex items-center gap-1"
-              disabled={!isConfigured || studentsMutation.isPending}
+              disabled={!isConfigured || !hasStudentDbs || studentsMutation.isPending}
               onClick={() => studentsMutation.mutate()}
             >
               {studentsMutation.isPending ? '동기화 중…' : '지금 실행'}
@@ -522,6 +814,9 @@ function ActionsCard({
           </p>
           {lastStudentMsg && (
             <div className="mt-2 text-[11px] text-fg-muted">{lastStudentMsg}</div>
+          )}
+          {!hasStudentDbs && (
+            <div className="mt-2 text-[11px] text-amber-300">학생 DB를 먼저 등록하세요.</div>
           )}
         </div>
         <div className="rounded border border-border bg-bg-soft/40 p-3">
@@ -544,6 +839,31 @@ function ActionsCard({
           </p>
           {lastStaffMsg && (
             <div className="mt-2 text-[11px] text-fg-muted">{lastStaffMsg}</div>
+          )}
+        </div>
+        <div className="rounded border border-border bg-bg-soft/40 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-fg">
+              <ClipboardList size={14} /> 과제 동기화
+            </div>
+            <button
+              type="button"
+              className="btn-primary text-xs flex items-center gap-1"
+              disabled={!isConfigured || !hasAssignmentDbs || assignmentsMutation.isPending}
+              onClick={() => assignmentsMutation.mutate()}
+            >
+              {assignmentsMutation.isPending ? '동기화 중…' : '지금 실행'}
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] text-fg-subtle">
+            과제 요청 DB 를 조회해 <code className="rounded bg-bg-soft px-1 py-0.5">assignments</code> 에 반영합니다.
+            학생·담당자·마감일은 현재 매핑된 필드 기준으로 연결합니다.
+          </p>
+          {lastAssignmentMsg && (
+            <div className="mt-2 text-[11px] text-fg-muted">{lastAssignmentMsg}</div>
+          )}
+          {!hasAssignmentDbs && (
+            <div className="mt-2 text-[11px] text-amber-300">과제 DB를 먼저 등록하세요.</div>
           )}
         </div>
       </div>
@@ -577,6 +897,9 @@ function HistoryCard({ runs, loading }: { runs: SyncRun[]; loading: boolean }) {
           </span>
           <span>
             직원: {lastSyncs.staff ? fmtDateTime(lastSyncs.staff.started_at) : '—'}
+          </span>
+          <span>
+            과제: {lastSyncs.assignments ? fmtDateTime(lastSyncs.assignments.started_at) : '—'}
           </span>
         </div>
       </header>

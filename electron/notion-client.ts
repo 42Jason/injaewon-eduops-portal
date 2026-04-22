@@ -53,6 +53,20 @@ export interface NotionUsersResult {
   has_more: boolean;
 }
 
+interface NotionBlock {
+  object: 'block';
+  id: string;
+  type: string;
+  has_children?: boolean;
+  child_database?: { title?: string };
+}
+
+interface NotionBlocksResult {
+  results: NotionBlock[];
+  next_cursor: string | null;
+  has_more: boolean;
+}
+
 export class NotionApiError extends Error {
   status: number;
   code?: string;
@@ -65,7 +79,22 @@ export class NotionApiError extends Error {
 }
 
 function stripDashes(id: string): string {
-  return id.replace(/-/g, '').trim();
+  const text = id.trim();
+  const dashed = text.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+  );
+  if (dashed) return dashed[0].replace(/-/g, '');
+  const compactMatches = text.match(/[0-9a-f]{32}/gi);
+  if (compactMatches?.length) return compactMatches[compactMatches.length - 1];
+  return text.replace(/-/g, '');
+}
+
+function isPageNotDatabaseError(err: unknown): boolean {
+  return (
+    err instanceof NotionApiError &&
+    err.status === 400 &&
+    err.message.includes('is a page, not a database')
+  );
 }
 
 export class NotionClient {
@@ -133,8 +162,7 @@ export class NotionClient {
     );
   }
 
-  /** 데이터베이스 페이지를 커서 끝까지 반복해 수집 (최대 `limit` 건). */
-  async queryAllPages(
+  private async queryAllDatabasePages(
     databaseId: string,
     limit: number = 500,
   ): Promise<NotionPage[]> {
@@ -148,6 +176,102 @@ export class NotionClient {
       out.push(...page.results);
       if (!page.has_more || !page.next_cursor) break;
       cursor = page.next_cursor;
+    }
+    return out;
+  }
+
+  async listBlockChildren(
+    blockId: string,
+    options: { page_size?: number; start_cursor?: string | null } = {},
+  ): Promise<NotionBlocksResult> {
+    const id = stripDashes(blockId);
+    const qs = new URLSearchParams();
+    qs.set(
+      'page_size',
+      String(Math.min(Math.max(options.page_size ?? 100, 1), 100)),
+    );
+    if (options.start_cursor) qs.set('start_cursor', options.start_cursor);
+    return this.request<NotionBlocksResult>(
+      'GET',
+      `/blocks/${id}/children?${qs.toString()}`,
+    );
+  }
+
+  private async findChildDatabaseIds(
+    blockId: string,
+    depth: number = 0,
+    seen = new Set<string>(),
+  ): Promise<string[]> {
+    if (depth > 3) return [];
+    const id = stripDashes(blockId);
+    if (seen.has(id)) return [];
+    seen.add(id);
+
+    const found: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await this.listBlockChildren(id, {
+        page_size: 100,
+        start_cursor: cursor ?? undefined,
+      });
+      for (const block of page.results) {
+        if (block.type === 'child_database') {
+          found.push(block.id);
+          continue;
+        }
+        if (block.has_children) {
+          found.push(
+            ...(await this.findChildDatabaseIds(block.id, depth + 1, seen)),
+          );
+        }
+      }
+      cursor = page.has_more ? page.next_cursor : null;
+    } while (cursor);
+
+    return Array.from(new Set(found));
+  }
+
+  /** 데이터베이스 페이지를 커서 끝까지 반복해 수집 (최대 `limit` 건). */
+  async queryAllPages(
+    databaseId: string,
+    limit: number = 500,
+  ): Promise<NotionPage[]> {
+    try {
+      return await this.queryAllDatabasePages(databaseId, limit);
+    } catch (err) {
+      if (!isPageNotDatabaseError(err)) throw err;
+    }
+
+    const childDatabaseIds = await this.findChildDatabaseIds(databaseId);
+    if (childDatabaseIds.length === 0) {
+      throw new NotionApiError(
+        400,
+        '입력한 ID는 데이터베이스가 아니라 페이지입니다. 페이지 안에서 Integration이 접근 가능한 데이터베이스를 찾지 못했습니다.',
+        'page_not_database',
+      );
+    }
+
+    const out: NotionPage[] = [];
+    const childErrors: string[] = [];
+    for (const childId of childDatabaseIds) {
+      if (out.length >= limit) break;
+      try {
+        const pages = await this.queryAllDatabasePages(childId, limit - out.length);
+        out.push(...pages);
+      } catch (childErr) {
+        const message =
+          childErr instanceof Error ? childErr.message : String(childErr);
+        childErrors.push(`${childId}: ${message}`);
+      }
+    }
+    if (out.length === 0 && childErrors.length > 0) {
+      throw new NotionApiError(
+        400,
+        `페이지 안의 데이터베이스를 조회하지 못했습니다. ${childErrors
+          .slice(0, 3)
+          .join(' | ')}`,
+        'child_database_query_failed',
+      );
     }
     return out;
   }
@@ -216,6 +340,28 @@ export function readText(prop: any): string {
   }
   if (prop.type === 'people' && Array.isArray(prop.people)) {
     return prop.people.map((p: any) => p?.name ?? p?.id ?? '').filter(Boolean).join(', ');
+  }
+  if (prop.type === 'formula' && prop.formula) {
+    const f = prop.formula;
+    if (f.type === 'string') return String(f.string ?? '');
+    if (f.type === 'number' && f.number !== null && f.number !== undefined) {
+      return String(f.number);
+    }
+    if (f.type === 'boolean') return f.boolean ? 'Y' : 'N';
+    if (f.type === 'date' && f.date?.start) return String(f.date.start);
+  }
+  if (prop.type === 'relation' && Array.isArray(prop.relation)) {
+    return prop.relation.map((r: any) => r?.id ?? '').filter(Boolean).join(', ');
+  }
+  if (prop.type === 'rollup' && prop.rollup) {
+    const r = prop.rollup;
+    if (r.type === 'number' && r.number !== null && r.number !== undefined) {
+      return String(r.number);
+    }
+    if (r.type === 'date' && r.date?.start) return String(r.date.start);
+    if (r.type === 'array' && Array.isArray(r.array)) {
+      return r.array.map((item: any) => readText(item)).filter(Boolean).join(', ');
+    }
   }
   return '';
 }

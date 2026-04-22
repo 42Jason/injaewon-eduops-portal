@@ -22,6 +22,63 @@ export function resolveDbPath(): string {
   return path.join(dir, 'eduops.db');
 }
 
+const DAILY_BACKUPS_TO_KEEP = 7;
+const MONTHLY_BACKUPS_TO_KEEP = 12;
+
+function backupDateKey(date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function rotateBackups(backupsDir: string) {
+  const files = fs
+    .readdirSync(backupsDir)
+    .filter((name) => /^\d{4}-\d{2}-\d{2}\.sqlite$/.test(name))
+    .sort()
+    .reverse();
+
+  const keep = new Set<string>();
+  for (const name of files.slice(0, DAILY_BACKUPS_TO_KEEP)) keep.add(name);
+
+  const monthly = new Set<string>();
+  for (const name of files) {
+    const monthKey = name.slice(0, 7);
+    if (monthly.has(monthKey)) continue;
+    monthly.add(monthKey);
+    keep.add(name);
+    if (monthly.size >= MONTHLY_BACKUPS_TO_KEEP) break;
+  }
+
+  for (const name of files) {
+    if (keep.has(name)) continue;
+    try {
+      fs.unlinkSync(path.join(backupsDir, name));
+    } catch (err) {
+      console.warn(`[db] backup cleanup skipped for ${name}:`, err);
+    }
+  }
+}
+
+function backupExistingDb(db: Db, currentPath: string, isFresh: boolean) {
+  if (isFresh || process.env.EDUOPS_SKIP_DB_BACKUP === '1') return;
+  const backupsDir = path.join(path.dirname(currentPath), 'backups');
+  if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
+
+  const target = path.join(backupsDir, `${backupDateKey()}.sqlite`);
+  if (fs.existsSync(target)) return;
+
+  try {
+    db.pragma('wal_checkpoint(FULL)');
+    fs.copyFileSync(currentPath, target);
+    rotateBackups(backupsDir);
+    console.log(`[db] backup created: ${target}`);
+  } catch (err) {
+    console.warn('[db] startup backup failed:', err);
+  }
+}
+
 /**
  * Resolve the bundled schema.sql — works both in dev (running from source)
  * and in a packaged app (where it lives alongside dist-electron).
@@ -36,6 +93,20 @@ function resolveSchemaPath(): string {
     if (p && fs.existsSync(p)) return p;
   }
   throw new Error('[db] schema.sql not found in any known location');
+}
+
+function resolveMigrationsDir(): string | null {
+  const schemaDir = path.dirname(resolveSchemaPath());
+  const candidates = [
+    path.join(schemaDir, 'migrations'),
+    path.join(__dirname, '..', 'src', 'shared', 'db', 'migrations'),
+    path.join(process.resourcesPath || '', 'app', 'src', 'shared', 'db', 'migrations'),
+    path.join(__dirname, 'migrations'),
+  ];
+  for (const p of candidates) {
+    if (p && fs.existsSync(p) && fs.statSync(p).isDirectory()) return p;
+  }
+  return null;
 }
 
 function applySchema(db: Db) {
@@ -90,6 +161,8 @@ function applySchema(db: Db) {
 
   // v0.1.16 부터는 버전 로그 기반 마이그레이션을 여기 순서대로 등록한다.
   runMigration(db, '002_notifications_v2', migration_002_notifications_v2);
+  runMigration(db, '003_restore_student_real_names', migration_003_restore_student_real_names);
+  runNumberedSqlMigrations(db);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +229,35 @@ export function listAppliedMigrations(db: Db): MigrationRow[] {
   return db
     .prepare(`SELECT version, applied_at FROM schema_migrations ORDER BY version`)
     .all() as MigrationRow[];
+}
+
+function runNumberedSqlMigrations(db: Db) {
+  ensureMigrationsTable(db);
+  const dir = resolveMigrationsDir();
+  if (!dir) return;
+
+  const files = fs
+    .readdirSync(dir)
+    .filter((name) => /^\d{3}_.+\.sql$/i.test(name))
+    .sort((a, b) => a.localeCompare(b));
+
+  for (const name of files) {
+    const version = path.basename(name, '.sql');
+    if (isApplied(db, version)) continue;
+    const filePath = path.join(dir, name);
+    const sql = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '').trim();
+    const tx = db.transaction(() => {
+      if (sql) db.exec(sql);
+      markApplied(db, version);
+    });
+    try {
+      tx();
+      console.log(`[db] SQL migration applied: ${version}`);
+    } catch (err) {
+      console.error(`[db] SQL migration failed: ${version}`, err);
+      throw err;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +328,51 @@ function migration_002_notifications_v2(db: Db) {
        ON notifications(user_id, dedupe_key)
        WHERE dedupe_key IS NOT NULL AND dismissed_at IS NULL`,
   );
+}
+
+function readStudentRealNameFromNotionExtra(extraJson: string | null): string {
+  if (!extraJson) return '';
+  try {
+    const parsed = JSON.parse(extraJson) as { properties?: Record<string, unknown> } | null;
+    const props = parsed?.properties;
+    if (!props || typeof props !== 'object') return '';
+    for (const key of ['ㅤ', '실명', '학생명', '학생 이름', '학생이름', '성명', '이름']) {
+      const raw = props[key];
+      if (raw === null || raw === undefined) continue;
+      const value = String(raw).trim();
+      if (!value || value.includes('*')) continue;
+      return value;
+    }
+  } catch {
+    return '';
+  }
+  return '';
+}
+
+function migration_003_restore_student_real_names(db: Db) {
+  const rows = db
+    .prepare(
+      `SELECT id, name, notion_extra
+         FROM students
+        WHERE notion_extra IS NOT NULL
+          AND (name LIKE '%*%' OR IFNULL(name, '') = '')`,
+    )
+    .all() as Array<{ id: number; name: string | null; notion_extra: string | null }>;
+
+  const update = db.prepare(`UPDATE students SET name = ? WHERE id = ?`);
+  let restored = 0;
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      const realName = readStudentRealNameFromNotionExtra(row.notion_extra);
+      if (!realName) continue;
+      update.run(realName, row.id);
+      restored += 1;
+    }
+  });
+  tx();
+  if (restored > 0) {
+    console.log(`[db] restored ${restored} student real names from Notion raw properties`);
+  }
 }
 
 /**
@@ -725,6 +872,7 @@ export function openDb(): Db {
   dbInstance = new Database(dbPath);
   dbInstance.pragma('journal_mode = WAL');
   dbInstance.pragma('foreign_keys = ON');
+  backupExistingDb(dbInstance, dbPath, isFresh);
 
   if (isFresh) {
     console.log(`[db] bootstrapping new DB at ${dbPath}`);

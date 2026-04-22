@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   FileSpreadsheet, UploadCloud, CheckCircle2, AlertTriangle, X,
-  Sparkles, RotateCcw, Download, Info, Inbox,
+  Sparkles, RotateCcw, Download, Info, Inbox, ArrowRight, Trash2,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
@@ -50,10 +51,28 @@ const FIELDS: Array<{ key: RowKey; label: string; short: string; min?: number }>
   { key: 'studentRequests',     label: '학생요구',   short: '학생요구', min: 120 },
 ];
 
-export function ParsingCenterPage() {
+/**
+ * Routing dispatcher — TA 계정과 정규직 계정은 완전히 다른 화면을 본다.
+ *
+ * 왜 컴포넌트 내부에서 분기하지 않는가?
+ *   React Rules of Hooks. 한 컴포넌트 안에서 조건부 early-return 을 한 뒤
+ *   아래쪽에 더 많은 훅을 호출하면, 세션 hydrate 과정에서 `user` 가 바뀔 때
+ *   훅 호출 횟수가 달라져 "Rendered fewer hooks than expected" 런타임
+ *   에러가 나고 렌더러가 통째로 흰 화면이 된다. v0.1.12 에서 이 패턴이
+ *   실제로 박혔었고, 이번 hotfix 에서 라우팅 단계로 분기를 올려 근본 해결.
+ */
+export function ParsingCenterRouter() {
   const { user } = useSession();
+  if (user?.perms.isParsingAssistantOnly) {
+    return <TAUploadView />;
+  }
+  return <ParsingCenterPage />;
+}
+
+function ParsingCenterPage() {
   const api = getApi();
   const live = !!api;
+  const { user } = useSession();
   const toast = useToast();
   const confirm = useConfirm();
 
@@ -180,17 +199,30 @@ export function ParsingCenterPage() {
             Excel 업로드 → 10필드 자동 추출 → 과제 일괄 등록
           </span>
         </div>
-        <div
-          className={cn(
-            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs',
-            live
-              ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-              : 'bg-amber-500/15 text-amber-300 border border-amber-500/30',
+        <div className="flex items-center gap-2">
+          {user?.perms.canReviewParsedExcel && (
+            <Link
+              to="/parsing/outputs"
+              className="inline-flex items-center gap-1 rounded-md border border-border bg-bg-soft px-2 py-1 text-xs text-fg-muted hover:bg-bg-card hover:text-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+              title="조교가 업로드한 파싱 엑셀 소비 대기열"
+            >
+              <Inbox size={12} aria-hidden="true" />
+              파싱 결과함
+              <ArrowRight size={11} aria-hidden="true" />
+            </Link>
           )}
-          role="status"
-        >
-          <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
-          {live ? '실시간 DB' : 'Electron 실행 필요'}
+          <div
+            className={cn(
+              'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs',
+              live
+                ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                : 'bg-amber-500/15 text-amber-300 border border-amber-500/30',
+            )}
+            role="status"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
+            {live ? '실시간 DB' : 'Electron 실행 필요'}
+          </div>
         </div>
       </div>
 
@@ -496,5 +528,403 @@ export function ParsingCenterPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+/* ===================================================================== */
+/*  TA (조교) 전용 간이 업로드 화면                                       */
+/*                                                                        */
+/*  Workflow:                                                             */
+/*    1. 학생 첨부파일/교사 희망사항/수행평가명 등을 읽고                */
+/*    2. 엑셀에 파싱 정리                                                 */
+/*    3. 이 화면에서 업로드 → "작업 대기" 큐에 적재                       */
+/*    4. 정규직이 파싱 결과함에서 열어 전용 프로그램으로 수행평가 생성    */
+/* ===================================================================== */
+
+function TAUploadView() {
+  const { user } = useSession();
+  const api = getApi();
+  const live = !!api && !!user;
+  const toast = useToast();
+  const confirm = useConfirm();
+  const qc = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [file, setFile]               = useState<File | null>(null);
+  const [studentCode, setStudentCode] = useState('');
+  const [subject, setSubject]         = useState('');
+  const [title, setTitle]             = useState('');
+  const [note, setNote]               = useState('');
+
+  const myUploadsQuery = useQuery({
+    queryKey: ['parsing.uploads.mine'],
+    queryFn: () =>
+      api!.parsing.listUploads({ status: 'all', mineOnly: true }),
+    enabled: live,
+    refetchInterval: 30_000,
+  });
+
+  const statsQuery = useQuery({
+    queryKey: ['parsing.uploads.stats'],
+    queryFn: () => api!.parsing.uploadsStats(),
+    enabled: live,
+    refetchInterval: 30_000,
+  });
+
+  const uploadMut = useMutationWithToast({
+    mutationFn: async () => {
+      if (!api) throw new Error('Electron 환경에서만 업로드할 수 있습니다.');
+      if (!file) throw new Error('엑셀 파일을 선택해 주세요.');
+      const buffer = await file.arrayBuffer();
+      const res = await api.parsing.uploadExcel({
+        filename:    file.name,
+        buffer,
+        mimeType:    file.type || null,
+        note:        note.trim()        || null,
+        studentCode: studentCode.trim() || null,
+        subject:     subject.trim()     || null,
+        title:       title.trim()       || null,
+      });
+      if (!res.ok) throw new Error(res.error ?? '업로드 실패');
+      return res;
+    },
+    successMessage: '업로드 완료 — 정규직이 확인할 수 있도록 대기열에 올렸습니다',
+    errorMessage:   '업로드에 실패했습니다',
+    invalidates: [
+      ['parsing.uploads.mine'],
+      ['parsing.uploads.list'],
+      ['parsing.uploads.stats'],
+    ],
+    onSuccess: () => {
+      setFile(null);
+      setStudentCode('');
+      setSubject('');
+      setTitle('');
+      setNote('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    },
+  });
+
+  const removeMut = useMutationWithToast({
+    mutationFn: (payload: { id: number }) => api!.parsing.deleteUpload(payload),
+    successMessage: '업로드를 삭제했습니다',
+    errorMessage:   '삭제에 실패했습니다',
+    invalidates: [
+      ['parsing.uploads.mine'],
+      ['parsing.uploads.stats'],
+    ],
+  });
+
+  function onPick(files: FileList | null) {
+    const f = files?.[0];
+    if (!f) return;
+    if (!/\.xlsx?$/i.test(f.name)) {
+      toast.err('엑셀 파일(.xlsx / .xls) 만 업로드할 수 있습니다.');
+      return;
+    }
+    if (f.size > 30 * 1024 * 1024) {
+      toast.err('파일은 30MB 이하여야 합니다.');
+      return;
+    }
+    setFile(f);
+    if (!title) setTitle(f.name.replace(/\.xlsx?$/i, ''));
+  }
+
+  async function handleDelete(row: { id: number; original_name: string; status: string }) {
+    const ok = await confirm({
+      title: `${row.original_name} 삭제?`,
+      description:
+        row.status === 'consumed'
+          ? '이미 소비 완료된 업로드입니다. 본인 업로드여도 리더십만 삭제할 수 있습니다.'
+          : '업로드와 원본 파일이 완전히 삭제됩니다. 복구할 수 없습니다.',
+      confirmLabel: '삭제',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    removeMut.mutate({ id: row.id });
+  }
+
+  const pending = statsQuery.data?.pending ?? 0;
+  const myUploads = myUploadsQuery.data ?? [];
+  const formDisabled = !live || uploadMut.isPending;
+
+  return (
+    <div className="p-6 space-y-4 max-w-3xl mx-auto">
+      <div>
+        <h1 className="text-xl font-semibold text-fg flex items-center gap-2">
+          <UploadCloud size={20} /> 안내문 파싱 업로드
+        </h1>
+        <p className="text-sm text-fg-subtle mt-0.5">
+          학생 첨부파일·교사 희망사항·수행평가명 등을 엑셀에 정리한 뒤 이 화면에서
+          업로드하세요. 정규직이 파일을 확인하고 전용 프로그램에 입력해 수행평가를
+          생성합니다.
+        </p>
+      </div>
+
+      {/* Pending-queue strip */}
+      <div className="rounded-lg border border-border bg-bg-soft/40 px-3 py-2 flex items-center gap-2 text-xs">
+        <Inbox size={13} className="text-fg-subtle" aria-hidden="true" />
+        <span className="text-fg-muted">
+          현재 대기 중인 업로드(전사): <b className="text-fg">{pending}</b> 건
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            myUploadsQuery.refetch();
+            statsQuery.refetch();
+            qc.invalidateQueries({ queryKey: ['parsing.uploads.list'] });
+          }}
+          className="ml-auto btn-ghost text-[11px] h-6 flex items-center gap-1"
+        >
+          <RotateCcw size={11} /> 새로고침
+        </button>
+      </div>
+
+      {/* Upload form */}
+      <div className="card space-y-3">
+        <div className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
+          1. 엑셀 파일 선택
+        </div>
+        <label
+          className={cn(
+            'flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-4 py-8 text-center transition-colors',
+            'focus-within:ring-2 focus-within:ring-accent/40',
+            uploadMut.isPending
+              ? 'border-accent/50 bg-accent/5 opacity-70 cursor-wait'
+              : 'border-border hover:border-accent/50 hover:bg-bg-soft/40',
+          )}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls"
+            className="sr-only"
+            onChange={(e) => onPick(e.target.files)}
+            disabled={formDisabled}
+            aria-label="엑셀 파일 선택"
+          />
+          {uploadMut.isPending ? (
+            <Spinner size={28} className="mb-2 text-accent" label="업로드 중" />
+          ) : (
+            <UploadCloud size={28} className="mb-2 text-fg-subtle" aria-hidden="true" />
+          )}
+          <div className="text-sm font-medium text-fg">
+            {file
+              ? file.name
+              : uploadMut.isPending
+                ? '업로드 중…'
+                : '클릭하여 파일 선택'}
+          </div>
+          <div className="mt-1 text-[11px] text-fg-subtle">
+            .xlsx / .xls · 최대 30MB
+            {file && ` · ${(file.size / 1024).toFixed(1)} KB`}
+          </div>
+        </label>
+
+        <div className="text-xs font-semibold uppercase tracking-wider text-fg-subtle pt-2">
+          2. 메타 정보 (선택)
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <label className="block">
+            <div className="text-[11px] text-fg-subtle mb-0.5">학생 코드</div>
+            <input
+              type="text"
+              value={studentCode}
+              onChange={(e) => setStudentCode(e.target.value)}
+              disabled={formDisabled}
+              placeholder="예: S2025-017"
+              className="input text-xs py-1 w-full font-mono"
+              maxLength={40}
+            />
+          </label>
+          <label className="block">
+            <div className="text-[11px] text-fg-subtle mb-0.5">과목</div>
+            <input
+              type="text"
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              disabled={formDisabled}
+              placeholder="예: 국어"
+              className="input text-xs py-1 w-full"
+              maxLength={60}
+            />
+          </label>
+          <label className="block">
+            <div className="text-[11px] text-fg-subtle mb-0.5">수행평가명</div>
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              disabled={formDisabled}
+              placeholder="예: 봉산탈춤 감상문"
+              className="input text-xs py-1 w-full"
+              maxLength={120}
+            />
+          </label>
+        </div>
+        <label className="block">
+          <div className="text-[11px] text-fg-subtle mb-0.5">메모</div>
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={formDisabled}
+            rows={2}
+            placeholder="정규직에게 전달할 특이사항 (예: 7번 행은 학생이 재요청한 항목 등)"
+            className="input text-xs py-1.5 w-full resize-none"
+            maxLength={500}
+          />
+        </label>
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={() => {
+              setFile(null);
+              setStudentCode('');
+              setSubject('');
+              setTitle('');
+              setNote('');
+              if (fileInputRef.current) fileInputRef.current.value = '';
+            }}
+            disabled={formDisabled || (!file && !studentCode && !subject && !title && !note)}
+            className="btn-ghost text-xs h-8 flex items-center gap-1"
+          >
+            <RotateCcw size={12} /> 초기화
+          </button>
+          <button
+            type="button"
+            onClick={() => uploadMut.mutate()}
+            disabled={formDisabled || !file}
+            className={cn(
+              'inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
+              'border-accent bg-accent text-white hover:bg-accent-strong disabled:opacity-50',
+            )}
+          >
+            {uploadMut.isPending ? <Spinner size={12} /> : <UploadCloud size={12} />}
+            {uploadMut.isPending ? '업로드 중…' : '업로드'}
+          </button>
+        </div>
+      </div>
+
+      {/* My uploads */}
+      <div className="card p-0 overflow-hidden">
+        <div className="flex items-center gap-2 border-b border-border px-3 py-2 bg-bg-soft/40">
+          <FileSpreadsheet size={13} className="text-fg-subtle" aria-hidden="true" />
+          <span className="text-sm font-medium text-fg">내 업로드 내역</span>
+          <span className="text-[11px] text-fg-subtle ml-auto">
+            {myUploads.length}건
+          </span>
+        </div>
+        {!live ? (
+          <div className="px-3 py-4 text-xs text-fg-subtle">
+            Electron 환경에서 실행 시 조회됩니다.
+          </div>
+        ) : myUploadsQuery.isLoading ? (
+          <LoadingPanel label="업로드 내역을 불러오는 중…" className="py-6" />
+        ) : myUploadsQuery.isError ? (
+          <EmptyState
+            tone="error"
+            icon={AlertTriangle}
+            title="내역을 불러오지 못했습니다"
+            className="border-0"
+            action={
+              <button className="btn-outline" onClick={() => myUploadsQuery.refetch()}>
+                다시 시도
+              </button>
+            }
+          />
+        ) : myUploads.length === 0 ? (
+          <div className="px-3 py-6 text-center text-xs text-fg-subtle">
+            아직 업로드한 파일이 없습니다.
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {myUploads.slice(0, 20).map((row) => (
+              <li key={row.id} className="px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <div className="grid h-7 w-7 place-items-center rounded bg-emerald-500/10 text-emerald-300 shrink-0">
+                    <FileSpreadsheet size={13} aria-hidden="true" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm text-fg truncate">{row.original_name}</span>
+                      <TAStatusBadge status={row.status} />
+                      <span className="text-[10px] text-fg-subtle">
+                        {relative(row.uploaded_at)}
+                      </span>
+                    </div>
+                    {(row.subject || row.title || row.student_code) && (
+                      <div className="text-[11px] text-fg-subtle mt-0.5">
+                        {row.student_code && (
+                          <span className="font-mono mr-2">학생 {row.student_code}</span>
+                        )}
+                        {row.subject && <span className="mr-2">과목 {row.subject}</span>}
+                        {row.title && (
+                          <span className="line-clamp-1 inline-block max-w-md align-bottom">
+                            평가명: {row.title}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {row.status === 'consumed' && row.consumer_name && (
+                      <div className="text-[10px] text-emerald-300/80 mt-0.5">
+                        {row.consumer_name} 이(가) 소비
+                        {row.consumed_at ? ` · ${relative(row.consumed_at)}` : ''}
+                        {row.consumed_note ? ` — ${row.consumed_note}` : ''}
+                      </div>
+                    )}
+                  </div>
+                  {row.status !== 'consumed' && (
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(row)}
+                      disabled={removeMut.isPending}
+                      title="삭제"
+                      className="btn-ghost text-[11px] h-7 flex items-center gap-1 text-rose-300 hover:bg-rose-500/10"
+                    >
+                      <Trash2 size={11} /> 삭제
+                    </button>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="rounded border border-border bg-bg-soft/30 px-3 py-2 text-[11px] leading-relaxed text-fg-muted">
+        <div className="flex items-center gap-1 font-semibold text-fg-subtle">
+          <Info size={11} aria-hidden="true" /> 안내
+        </div>
+        <ul className="list-disc pl-4 mt-0.5 space-y-0.5">
+          <li>엑셀 파일 1개씩 업로드합니다. 동일 내용이면 여러 번 올려도 괜찮지만, 이전 항목은 필요 시 직접 삭제해 주세요.</li>
+          <li>업로드 후에는 정규직이 파일을 확인하고 전용 프로그램에서 수행평가를 생성합니다.</li>
+          <li>소비 완료 처리되면 상태 배지가 녹색으로 바뀌고, 해당 업로드는 일반 계정에서 삭제할 수 없습니다.</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function TAStatusBadge({ status }: { status: 'pending' | 'consumed' | 'archived' }) {
+  if (status === 'pending') {
+    return (
+      <span className="inline-flex items-center rounded border border-amber-500/30 bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
+        대기
+      </span>
+    );
+  }
+  if (status === 'consumed') {
+    return (
+      <span className="inline-flex items-center gap-0.5 rounded border border-emerald-500/30 bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
+        <CheckCircle2 size={10} aria-hidden="true" /> 소비 완료
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center rounded border border-slate-500/30 bg-slate-500/15 px-1.5 py-0.5 text-[10px] text-slate-300">
+      보관
+    </span>
   );
 }

@@ -40,7 +40,7 @@ interface DepartmentRow {
 
 const ROLES: Role[] = [
   'CEO', 'CTO', 'OPS_MANAGER', 'HR_ADMIN',
-  'PARSER', 'QA1', 'QA_FINAL', 'CS', 'STAFF',
+  'PARSER', 'QA1', 'QA_FINAL', 'CS', 'STAFF', 'TA',
 ];
 
 export function EmployeesPage() {

@@ -32,6 +32,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { hasRole, rolesForPath } from '@/lib/roleAccess';
 import { useSession } from '@/stores/session';
 import { ROLE_LABELS } from '@shared/types/user';
 import { UpdateBanner } from './UpdateBanner';
@@ -43,6 +44,8 @@ interface MenuItem {
   group?: string;
   /** If true, only users with perms.isLeadership see this item. */
   leadershipOnly?: boolean;
+  /** Restrict menu item to a specific QA stage permission. */
+  qaStage?: 'QA1' | 'QA_FINAL';
   /**
    * 조교(TA) 계정이 볼 수 있는 항목인가?
    *   - true  : TA 에게도 노출 (홈/내업무/내급여명세서/파싱 업로드)
@@ -67,8 +70,8 @@ const MENU: MenuItem[] = [
   },
   { to: '/parsing/outputs', label: '파싱 결과함', icon: Inbox, group: '업무' },
   { to: '/operations-board', label: '운영 보드', icon: Kanban, group: '업무' },
-  { to: '/qa/first', label: '1차 QA', icon: ShieldCheck, group: '업무' },
-  { to: '/qa/final', label: '최종 QA', icon: Shield, group: '업무' },
+  { to: '/qa/first', label: '1차 QA', icon: ShieldCheck, group: '업무', qaStage: 'QA1' },
+  { to: '/qa/final', label: '최종 QA', icon: Shield, group: '업무', qaStage: 'QA_FINAL' },
   { to: '/cs', label: 'CS 관리', icon: Headphones, group: '업무' },
 
   { to: '/attendance', label: '근태 관리', icon: Clock, group: '조직' },
@@ -102,6 +105,9 @@ export function Sidebar() {
   const isTA = !!user?.perms.isParsingAssistantOnly;
   const visible = MENU.filter((item) => {
     if (item.leadershipOnly && !isLeadership) return false;
+    if (!hasRole(user?.role, rolesForPath(item.to))) return false;
+    if (item.qaStage === 'QA1' && !user?.perms.canReviewQA1) return false;
+    if (item.qaStage === 'QA_FINAL' && !user?.perms.canReviewQAFinal) return false;
     // 조교는 taVisible 로 명시된 항목만.
     if (isTA && !item.taVisible) return false;
     return true;

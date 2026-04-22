@@ -59,7 +59,7 @@ export function login(db: Db, email: string, password: string): LoginResult {
       id: row.id,
       email: row.email,
       name: row.name,
-      role: row.role,
+      role: normalizeRole(row.role),
       departmentId: row.department_id,
       departmentName: row.department_name ?? undefined,
       title: row.title,
@@ -86,6 +86,10 @@ export function login(db: Db, email: string, password: string): LoginResult {
 
 export type ActorRole = string;
 
+export function normalizeRole(role: ActorRole | null | undefined): ActorRole {
+  return String(role ?? '').trim().toUpperCase();
+}
+
 export interface SessionActor {
   userId: number;
   email: string;
@@ -103,7 +107,7 @@ export function setSession(webContentsId: number, user: AuthenticatedUser): Sess
     userId: user.id,
     email: user.email,
     name: user.name,
-    role: user.role,
+    role: normalizeRole(user.role),
     departmentId: user.departmentId,
     loggedInAt: Date.now(),
   };
@@ -159,7 +163,8 @@ export function requireRole(
   allowedRoles: readonly ActorRole[],
 ): SessionActor {
   const actor = requireActor(event);
-  if (!allowedRoles.includes(actor.role)) {
+  const actorRole = normalizeRole(actor.role);
+  if (!(allowedRoles as readonly ActorRole[]).includes(actorRole)) {
     throw new AuthError(
       'forbidden',
       `이 작업을 수행할 권한이 없습니다. (필요 권한: ${allowedRoles.join(', ')})`,
@@ -180,31 +185,196 @@ export const ROLES = {
   QA1: 'QA1',
   QA_FINAL: 'QA_FINAL',
   PARSER: 'PARSER',
+  CS: 'CS',
+  STAFF: 'STAFF',
   TA: 'TA',
 } as const;
 
 export const ROLE_SETS = {
   /** 리더십 — CEO/CTO. 모든 기밀 조회 가능. */
   leadership: [ROLES.CEO, ROLES.CTO] as const,
+  regularStaff: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
   /** 인사/급여 관리 — HR_ADMIN 포함. */
   hrAdmin: [ROLES.CEO, ROLES.CTO, ROLES.HR_ADMIN] as const,
   /** 학생/과제 운영 — OPS_MANAGER 포함. */
   opsAdmin: [ROLES.CEO, ROLES.CTO, ROLES.OPS_MANAGER] as const,
+  /** 운영 문서/매뉴얼/공지 편집. */
+  knowledgeEditor: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
   /** QA 1차 심사 가능. */
-  qaReviewer: [ROLES.CEO, ROLES.CTO, ROLES.QA1, ROLES.QA_FINAL] as const,
+  qaReviewer: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
   /** QA 최종 심사 가능. */
-  qaFinalReviewer: [ROLES.CEO, ROLES.CTO, ROLES.QA_FINAL] as const,
+  qaFinalReviewer: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
   /** 과제 파싱 작업자 (정규직). assignments 생성/수정 권한 있음. */
-  parser: [ROLES.CEO, ROLES.CTO, ROLES.OPS_MANAGER, ROLES.PARSER] as const,
+  parser: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
   /** 파싱 엑셀 업로더 — 정규직 + 조교(TA). 업로드/자신 파일 조회만 가능. */
   parsingUploader: [
     ROLES.CEO,
     ROLES.CTO,
     ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
     ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
     ROLES.TA,
   ] as const,
   /** 업로드 큐 소비자 (정규직 한정). downloadUpload / markConsumed 용. */
-  parsingConsumer: [ROLES.CEO, ROLES.CTO, ROLES.OPS_MANAGER, ROLES.PARSER] as const,
+  parsingConsumer: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 학생 실명 조회 가능. 조교(TA)는 제외한다. */
+  studentIdentityViewer: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 과제/QA/CS 운영 조회. 로그인한 정규 운영 인원만 허용하고 TA는 제외한다. */
+  assignmentReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 학생 상세 이력/파싱 JSON/보고서 파일 조회. 실명 조회 정책과 동일하게 TA는 제외한다. */
+  studentDataReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 직원 목록 조회. 드롭다운/담당자 배정에 필요하지만 세션 없는 접근은 막는다. */
+  peopleReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 감사 로그 조회. 운영/인사 관리자급만 허용한다. */
+  auditReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 매출/수납/청구 조회. 운영/인사 관리자급만 허용한다. */
+  financeReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 정기 구독/법인카드 운영. CEO/CTO와 HR_ADMIN만 허용한다. */
+  subscriptionCardAdmin: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
+  /** 개인 홈 통계의 타인 조회 권한. */
+  userStatsReader: [
+    ROLES.CEO,
+    ROLES.CTO,
+    ROLES.OPS_MANAGER,
+    ROLES.HR_ADMIN,
+    ROLES.PARSER,
+    ROLES.QA1,
+    ROLES.QA_FINAL,
+    ROLES.CS,
+    ROLES.STAFF,
+  ] as const,
 } as const;
-

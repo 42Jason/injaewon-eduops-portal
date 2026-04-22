@@ -14,6 +14,7 @@ import {
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { cn } from '@/lib/cn';
+import { hasRole, ROLE_GROUPS } from '@/lib/roleAccess';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
 
@@ -153,6 +154,8 @@ export function HomePage() {
   const api = getApi();
   const live = !!api && !!user;
   const navigate = useNavigate();
+  const canReadAssignments = hasRole(user?.role, ROLE_GROUPS.assignmentReader);
+  const canReadAuditLogs = hasRole(user?.role, ROLE_GROUPS.auditReader);
 
   const statsQuery = useQuery({
     queryKey: ['home.stats', user?.id],
@@ -164,7 +167,7 @@ export function HomePage() {
     queryKey: ['home.assignments', user?.id],
     queryFn: () =>
       api!.assignments.list({ assignee: user!.id }) as unknown as Promise<AssignmentRow[]>,
-    enabled: live,
+    enabled: live && canReadAssignments,
   });
 
   const noticesQuery = useQuery({
@@ -185,7 +188,7 @@ export function HomePage() {
     queryKey: ['home.logs'],
     queryFn: () =>
       api!.logs.list({ limit: 6 }) as unknown as Promise<ActivityLogRow[]>,
-    enabled: live,
+    enabled: live && canReadAuditLogs,
     refetchInterval: 60_000,
   });
 

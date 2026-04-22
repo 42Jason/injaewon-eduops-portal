@@ -1,8 +1,9 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   CheckSquare, Square, Check, X, RotateCcw, User as UserIcon, Clock,
   ShieldCheck, AlertTriangle, MessageSquare, ClipboardCheck, Inbox,
+  FileDown,
 } from 'lucide-react';
 import { useSession } from '@/stores/session';
 import { getApi } from '@/hooks/useApi';
@@ -28,6 +29,8 @@ interface QAAssignmentRow {
   title?: string;
   state: AssignmentState;
   risk: Risk;
+  qa1_id?: number | null;
+  qa_final_id?: number | null;
   parser_name?: string | null;
   qa1_name?: string | null;
   qa_final_name?: string | null;
@@ -59,16 +62,45 @@ interface ChecklistTemplate {
 }
 
 interface ChecklistItem {
+  id?: string;
   key: string;
   label: string;
   required?: boolean;
 }
 
+interface ReviewFileRow {
+  id: string;
+  name: string;
+  url?: string | null;
+  jsonContent?: string | null;
+  kind?: string | null;
+  source?: string | null;
+  description?: string | null;
+}
+
 const INBOX_STATES_QA1: AssignmentState[] = ['1차QA대기', '1차QA진행중', '1차QA반려'];
 const INBOX_STATES_QAFINAL: AssignmentState[] = ['최종QA대기', '최종QA진행중', '최종QA반려'];
+const EDITABLE_STATES_QA1: AssignmentState[] = ['1차QA대기', '1차QA진행중'];
+const EDITABLE_STATES_QAFINAL: AssignmentState[] = ['최종QA대기', '최종QA진행중'];
 
 const commentRules = firstError<string>([maxLength(1000)]);
 const noteRules = firstError<string>([maxLength(200)]);
+
+function safeDownloadName(name: string) {
+  return name.replace(/[\\/:*?"<>|]+/g, '_') || 'download.json';
+}
+
+function downloadTextFile(name: string, content: string, mimeType = 'application/json') {
+  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = safeDownloadName(name);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 const RESULT_LABEL: Record<'approved' | 'rejected' | 'revision_requested', string> = {
   approved: '승인',
@@ -92,9 +124,15 @@ export function QAChecklistPage({ stage }: Props) {
   const [comment, setComment] = useState('');
   const [commentTouched, setCommentTouched] = useState(false);
   const [showReview, setShowReview] = useState(false);
+  const [loadedDraftKey, setLoadedDraftKey] = useState<string | null>(null);
+  const lastSavedDraftRef = useRef<string>('');
 
   const stageLabel = stage === 'QA1' ? '1차 QA' : '최종 QA';
   const inboxStates = stage === 'QA1' ? INBOX_STATES_QA1 : INBOX_STATES_QAFINAL;
+  const editableStates = stage === 'QA1' ? EDITABLE_STATES_QA1 : EDITABLE_STATES_QAFINAL;
+  const canUseThisStage = stage === 'QA1'
+    ? !!user?.perms.canReviewQA1
+    : !!user?.perms.canReviewQAFinal;
 
   // Fetch the ENTIRE list then filter to inbox states client-side.
   const listQuery = useQuery({
@@ -103,7 +141,7 @@ export function QAChecklistPage({ stage }: Props) {
       const rows = (await api!.assignments.list()) as unknown as QAAssignmentRow[];
       return rows.filter((r) => inboxStates.includes(r.state));
     },
-    enabled: live,
+    enabled: live && canUseThisStage,
   });
 
   const rows = listQuery.data ?? [];
@@ -114,14 +152,31 @@ export function QAChecklistPage({ stage }: Props) {
       const list = (await api!.qa.templates(stage)) as unknown as ChecklistTemplate[];
       return list[0] ?? null;
     },
-    enabled: live,
+    enabled: live && canUseThisStage,
   });
 
   const items: ChecklistItem[] = useMemo(() => {
     const tpl = templateQuery.data;
     if (!tpl) return [];
     try {
-      return JSON.parse(tpl.items_json);
+      const parsed = JSON.parse(tpl.items_json) as Array<Partial<ChecklistItem>>;
+      if (!Array.isArray(parsed)) return [];
+      const usedKeys = new Set<string>();
+      return parsed.map((item, index) => {
+        const baseKey = String(item.key || item.id || `item-${index + 1}`).trim();
+        let key = baseKey || `item-${index + 1}`;
+        let duplicateIndex = 2;
+        while (usedKeys.has(key)) {
+          key = `${baseKey || `item-${index + 1}`}-${duplicateIndex}`;
+          duplicateIndex += 1;
+        }
+        usedKeys.add(key);
+        return {
+          ...item,
+          key,
+          label: item.label || `체크 항목 ${index + 1}`,
+        };
+      });
     } catch {
       return [];
     }
@@ -133,23 +188,96 @@ export function QAChecklistPage({ stage }: Props) {
     return found ?? rows[0];
   }, [rows, selectedId]);
 
+  const draftKey = selected ? `eduops.qaDraft.${stage}.${selected.id}` : null;
+
   const reviewsQuery = useQuery({
     queryKey: ['qa.reviews', selected?.id],
     queryFn: () =>
       api!.assignments.qaReviews(selected!.id) as unknown as Promise<QAReviewRow[]>,
-    enabled: live && !!selected,
+    enabled: live && canUseThisStage && !!selected,
   });
+
+  const filesQuery = useQuery({
+    queryKey: ['qa.reviewFiles', selected?.id],
+    queryFn: () =>
+      api!.assignments.reviewFiles(selected!.id) as unknown as Promise<ReviewFileRow[]>,
+    enabled: live && canUseThisStage && !!selected,
+  });
+
+  const selectedReviewerId = selected
+    ? (stage === 'QA1' ? selected.qa1_id : selected.qa_final_id)
+    : null;
+  const canEditSelected = Boolean(
+    canUseThisStage &&
+    selected &&
+    editableStates.includes(selected.state) &&
+    (selectedReviewerId == null ||
+      selectedReviewerId === user?.id ||
+      user?.perms.isLeadership),
+  );
+
+  const editBlockedReason = !canUseThisStage
+    ? `${stageLabel} 권한이 없습니다.`
+    : selected && !editableStates.includes(selected.state)
+      ? '현재 상태에서는 QA 제출을 할 수 없습니다.'
+      : selectedReviewerId != null && selectedReviewerId !== user?.id && !user?.perms.isLeadership
+        ? '이 과제의 담당 QA만 체크리스트를 제출할 수 있습니다.'
+        : null;
 
   // Reset checklist state when selection changes.
   useEffect(() => {
-    if (!items.length) return;
+    if (!items.length || !selected || !draftKey) {
+      setLoadedDraftKey(null);
+      return;
+    }
     const init: Record<string, { checked: boolean; note?: string }> = {};
     for (const it of items) init[it.key] = { checked: false };
-    setChecks(init);
-    setComment('');
+    let nextChecks = init;
+    let nextComment = '';
+    let nextShowReview = false;
+    try {
+      const saved = window.localStorage.getItem(draftKey);
+      if (saved) {
+        const parsed = JSON.parse(saved) as {
+          checks?: Record<string, { checked?: boolean; note?: string }>;
+          comment?: string;
+          showReview?: boolean;
+        };
+        nextChecks = { ...init };
+        for (const it of items) {
+          const savedItem = parsed.checks?.[it.key];
+          if (!savedItem) continue;
+          nextChecks[it.key] = {
+            checked: !!savedItem.checked,
+            note: savedItem.note ?? '',
+          };
+        }
+        nextComment = parsed.comment ?? '';
+        nextShowReview = !!parsed.showReview;
+      }
+    } catch {
+      window.localStorage.removeItem(draftKey);
+    }
+    setChecks(nextChecks);
+    setComment(nextComment);
     setCommentTouched(false);
-    setShowReview(false);
-  }, [selected?.id, items]);
+    setShowReview(nextShowReview);
+    setLoadedDraftKey(draftKey);
+    lastSavedDraftRef.current = '';
+  }, [selected, draftKey, items]);
+
+  useEffect(() => {
+    if (!draftKey || loadedDraftKey !== draftKey || !items.length || !canEditSelected) return;
+    const payload = JSON.stringify({
+      checks,
+      comment,
+      showReview,
+      savedAt: new Date().toISOString(),
+    });
+    if (lastSavedDraftRef.current === payload) return;
+    window.localStorage.setItem(draftKey, payload);
+    lastSavedDraftRef.current = payload;
+  }, [canEditSelected, checks, comment, draftKey, items.length, loadedDraftKey, showReview]);
 
   const submitMut = useMutationWithToast<
     { ok: boolean; error?: string; nextState?: string },
@@ -157,11 +285,12 @@ export function QAChecklistPage({ stage }: Props) {
     { result: 'approved' | 'rejected' | 'revision_requested' }
   >({
     mutationFn: (payload) => {
-      if (!live || !selected || !user) return Promise.resolve({ ok: false });
+      if (!live || !selected || !user || !canEditSelected) {
+        return Promise.resolve({ ok: false, error: 'forbidden' });
+      }
       return api!.qa.submit({
         assignmentId: selected.id,
         stage,
-        reviewerId: user.id,
         result: payload.result,
         checklist: checks,
         comment: comment || undefined,
@@ -178,6 +307,9 @@ export function QAChecklistPage({ stage }: Props) {
     onSuccess: (res, vars) => {
       if (res.ok) {
         toast.ok(`${stageLabel} ${RESULT_LABEL[vars.result]} 처리되었습니다`);
+        if (draftKey) window.localStorage.removeItem(draftKey);
+        setLoadedDraftKey(null);
+        lastSavedDraftRef.current = '';
         setShowReview(false);
         setComment('');
         setCommentTouched(false);
@@ -194,7 +326,7 @@ export function QAChecklistPage({ stage }: Props) {
   const commentError = commentTouched ? commentRules(comment) : null;
 
   async function submitReview(result: 'approved' | 'rejected' | 'revision_requested') {
-    if (submitMut.isPending) return;
+    if (submitMut.isPending || !canEditSelected) return;
     if (commentRules(comment)) {
       setCommentTouched(true);
       return;
@@ -216,6 +348,21 @@ export function QAChecklistPage({ stage }: Props) {
       <div className="p-6">
         <div className="card max-w-xl text-sm text-fg-muted">
           Electron 환경에서 실행 시 {stageLabel} 큐를 확인할 수 있습니다.
+        </div>
+      </div>
+    );
+  }
+
+  if (!canUseThisStage) {
+    return (
+      <div className="p-6">
+        <div className="card max-w-xl">
+          <EmptyState
+            icon={ShieldCheck}
+            tone="error"
+            title={`${stageLabel} 접근 권한이 없습니다`}
+            hint="계정 역할과 담당 단계가 맞는지 직원 관리에서 확인해 주세요."
+          />
         </div>
       </div>
     );
@@ -397,6 +544,61 @@ export function QAChecklistPage({ stage }: Props) {
                     )}
                   </div>
                 )}
+                <div className="rounded border border-border bg-bg-soft/40 p-2">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div className="text-xs font-medium text-fg flex items-center gap-1.5">
+                      <FileDown size={13} aria-hidden="true" /> 검토 파일
+                    </div>
+                    <div className="text-[11px] text-fg-subtle">
+                      {filesQuery.data?.length ?? 0}개
+                    </div>
+                  </div>
+                  {filesQuery.isLoading ? (
+                    <div className="text-[11px] text-fg-subtle">파일 목록을 불러오는 중...</div>
+                  ) : !filesQuery.data?.length ? (
+                    <div className="text-[11px] text-fg-subtle">
+                      연결된 파서 파일 또는 보고서 파일이 없습니다.
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap gap-1.5">
+                      {filesQuery.data.map((file) =>
+                        file.jsonContent ? (
+                          <button
+                            key={file.id}
+                            type="button"
+                            onClick={() => downloadTextFile(file.name, file.jsonContent ?? '')}
+                            className="btn-outline text-xs inline-flex items-center gap-1"
+                            title={file.description ?? undefined}
+                          >
+                            <FileDown size={12} aria-hidden="true" />
+                            {file.name}
+                          </button>
+                        ) : file.url ? (
+                          <a
+                            key={file.id}
+                            href={file.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            download={file.name}
+                            className="btn-outline text-xs inline-flex items-center gap-1"
+                            title={file.description ?? undefined}
+                          >
+                            <FileDown size={12} aria-hidden="true" />
+                            {file.name}
+                          </a>
+                        ) : (
+                          <span
+                            key={file.id}
+                            className="rounded border border-border px-2 py-1 text-xs text-fg-subtle"
+                            title={file.description ?? undefined}
+                          >
+                            {file.name}
+                          </span>
+                        ),
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Checklist */}
@@ -415,6 +617,11 @@ export function QAChecklistPage({ stage }: Props) {
                     </span>
                   )}
                 </div>
+                {editBlockedReason && (
+                  <div className="mb-3 rounded border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+                    {editBlockedReason}
+                  </div>
+                )}
 
                 {templateQuery.isLoading ? (
                   <LoadingPanel label="체크리스트 템플릿을 불러오는 중…" />
@@ -457,6 +664,7 @@ export function QAChecklistPage({ stage }: Props) {
                         >
                           <button
                             type="button"
+                            disabled={!canEditSelected || submitMut.isPending}
                             onClick={() =>
                               setChecks((p) => ({
                                 ...p,
@@ -465,7 +673,10 @@ export function QAChecklistPage({ stage }: Props) {
                             }
                             aria-pressed={v.checked}
                             aria-label={`${it.label}${it.required ? ' (필수)' : ''} ${v.checked ? '체크 해제' : '체크'}`}
-                            className="pt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 rounded"
+                            className={cn(
+                              'pt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 rounded',
+                              (!canEditSelected || submitMut.isPending) && 'cursor-not-allowed opacity-50',
+                            )}
                           >
                             {v.checked ? (
                               <CheckSquare size={16} className="text-emerald-300" aria-hidden="true" />
@@ -487,6 +698,7 @@ export function QAChecklistPage({ stage }: Props) {
                               value={v.note ?? ''}
                               placeholder="메모 (선택)"
                               maxLength={200}
+                              disabled={!canEditSelected || submitMut.isPending}
                               aria-label={`${it.label} 메모`}
                               aria-invalid={noteErr ? true : undefined}
                               onChange={(e) =>
@@ -501,6 +713,7 @@ export function QAChecklistPage({ stage }: Props) {
                               className={cn(
                                 'input text-xs py-1 mt-1 w-full',
                                 noteErr && 'border-danger focus-visible:ring-danger/40',
+                                (!canEditSelected || submitMut.isPending) && 'cursor-not-allowed opacity-60',
                               )}
                             />
                             {noteErr && (
@@ -520,7 +733,7 @@ export function QAChecklistPage({ stage }: Props) {
                   <div className="mt-4 flex items-center gap-2 flex-wrap">
                     <button
                       type="button"
-                      disabled={!allRequiredOk || !hasCheck}
+                      disabled={!canEditSelected || !allRequiredOk || !hasCheck}
                       onClick={() => setShowReview(true)}
                       className="btn-primary text-sm flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent/40"
                       aria-label="리뷰 제출 단계로 이동"
@@ -550,6 +763,7 @@ export function QAChecklistPage({ stage }: Props) {
                           value={comment}
                           rows={3}
                           maxLength={1000}
+                          disabled={!canEditSelected || submitMut.isPending}
                           onChange={(e) => setComment(e.target.value)}
                           onBlur={() => setCommentTouched(true)}
                           placeholder={
@@ -565,7 +779,7 @@ export function QAChecklistPage({ stage }: Props) {
                     <div className="flex items-center gap-2 flex-wrap">
                       <button
                         type="button"
-                        disabled={submitMut.isPending}
+                        disabled={!canEditSelected || submitMut.isPending}
                         onClick={() => submitReview('approved')}
                         className="btn-primary text-sm bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-emerald-500/40"
                       >
@@ -574,7 +788,7 @@ export function QAChecklistPage({ stage }: Props) {
                       </button>
                       <button
                         type="button"
-                        disabled={submitMut.isPending}
+                        disabled={!canEditSelected || submitMut.isPending}
                         onClick={() => submitReview('revision_requested')}
                         className="btn-outline text-sm flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent/40"
                       >
@@ -583,7 +797,7 @@ export function QAChecklistPage({ stage }: Props) {
                       </button>
                       <button
                         type="button"
-                        disabled={submitMut.isPending}
+                        disabled={!canEditSelected || submitMut.isPending}
                         onClick={() => submitReview('rejected')}
                         className="btn-outline text-sm border-rose-500/40 text-rose-300 flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-rose-500/40"
                       >

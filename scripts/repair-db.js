@@ -115,7 +115,7 @@ function main() {
     'idx_users_notion_user',
   );
 
-  console.log('\n[4/4] deleted_records (휴지통) 테이블');
+  console.log('\n[4/5] deleted_records (휴지통) 테이블');
   // v0.1.15 신규 — 모든 hard-DELETE 레코드를 보관하는 tombstone 로그.
   try {
     db.exec(`
@@ -151,6 +151,63 @@ function main() {
     'CREATE INDEX IF NOT EXISTS idx_deleted_records_active ON deleted_records(purged_at)',
     'idx_deleted_records_active',
   );
+
+  console.log('\n[5/5] v0.1.16 — schema_migrations + notifications v2');
+  // v0.1.16 신규 — 마이그레이션 로그 테이블.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version    TEXT    PRIMARY KEY,
+        applied_at TEXT    NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    console.log('  ✓ schema_migrations 테이블');
+  } catch (err) {
+    console.warn(`  ⚠ schema_migrations 테이블 실패: ${err.message}`);
+  }
+  // v0.1.16 신규 — notifications 테이블 확장 (dedup/snooze/entity/priority).
+  addColumnIfMissing(db, 'notifications', 'category', "category TEXT NOT NULL DEFAULT 'notice'");
+  addColumnIfMissing(db, 'notifications', 'entity_table', 'entity_table TEXT');
+  addColumnIfMissing(db, 'notifications', 'entity_id', 'entity_id INTEGER');
+  addColumnIfMissing(db, 'notifications', 'dedupe_key', 'dedupe_key TEXT');
+  addColumnIfMissing(db, 'notifications', 'priority', 'priority INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'notifications', 'snooze_until', 'snooze_until TEXT');
+  addColumnIfMissing(db, 'notifications', 'dismissed_at', 'dismissed_at TEXT');
+  addColumnIfMissing(db, 'notifications', 'payload_json', 'payload_json TEXT');
+  ensureIndex(
+    db,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_user_active
+       ON notifications(user_id, dismissed_at, read_at, created_at DESC)`,
+    'idx_notifications_user_active',
+  );
+  ensureIndex(
+    db,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_user_category
+       ON notifications(user_id, category, created_at DESC)`,
+    'idx_notifications_user_category',
+  );
+  ensureIndex(
+    db,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_entity
+       ON notifications(entity_table, entity_id)`,
+    'idx_notifications_entity',
+  );
+  ensureIndex(
+    db,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedupe_active
+       ON notifications(user_id, dedupe_key)
+       WHERE dedupe_key IS NOT NULL AND dismissed_at IS NULL`,
+    'uq_notifications_dedupe_active',
+  );
+  // 마이그레이션 로그에 수동 패치본임을 기록.
+  try {
+    db.prepare(
+      `INSERT OR IGNORE INTO schema_migrations (version) VALUES ('001_baseline'),('002_notifications_v2')`,
+    ).run();
+    console.log('  ✓ schema_migrations 로그 백필');
+  } catch (err) {
+    console.warn(`  ⚠ schema_migrations 백필 실패: ${err.message}`);
+  }
 
   db.close();
   console.log('\n완료. 앱을 다시 실행하면 정상 동작해야 합니다.');

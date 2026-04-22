@@ -8,8 +8,6 @@ import {
   ExternalLink,
   LogIn,
   LogOut,
-  Search,
-  X,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -18,6 +16,7 @@ import { getApi } from '@/hooks/useApi';
 import { useSession } from '@/stores/session';
 import { useToast } from '@/stores/toast';
 import { fmtTime, relative } from '@/lib/date';
+import { GlobalSearch } from './GlobalSearch';
 
 type LocalState = 'off' | 'working' | 'break';
 
@@ -26,14 +25,6 @@ interface AttendanceTodayRow {
   check_in?: string | null;
   check_out?: string | null;
   break_min?: number;
-}
-
-interface AssignmentSearchRow {
-  id: number;
-  code: string;
-  title: string;
-  subject: string;
-  state: string;
 }
 
 type NotificationCategory =
@@ -97,6 +88,8 @@ export function TopBar() {
   // Local-only break indicator (no break column on attendance_records yet)
   const [breakOn, setBreakOn] = useState(false);
   const [breakSince, setBreakSince] = useState<string | null>(null);
+  const [breakStartedAt, setBreakStartedAt] = useState<number | null>(null);
+  const [breakAccumulatedMin, setBreakAccumulatedMin] = useState(0);
 
   // ---------------- Attendance (real DB) ----------------
 
@@ -129,6 +122,8 @@ export function TopBar() {
         else toast.ok('출근 기록됨');
         setBreakOn(false);
         setBreakSince(null);
+        setBreakStartedAt(null);
+        setBreakAccumulatedMin(0);
         qc.invalidateQueries({ queryKey: ['attendance.today'] });
         qc.invalidateQueries({ queryKey: ['attendance.month'] });
       } else {
@@ -139,12 +134,15 @@ export function TopBar() {
   });
 
   const checkOutMut = useMutation({
-    mutationFn: () => api!.attendance.checkOut({ userId: user!.id, breakMin: 60 }),
+    mutationFn: (breakMin: number) =>
+      api!.attendance.checkOut({ userId: user!.id, breakMin }),
     onSuccess: (r) => {
       if (r.ok) {
         toast.ok('퇴근 기록됨');
         setBreakOn(false);
         setBreakSince(null);
+        setBreakStartedAt(null);
+        setBreakAccumulatedMin(0);
         qc.invalidateQueries({ queryKey: ['attendance.today'] });
         qc.invalidateQueries({ queryKey: ['attendance.month'] });
       } else {
@@ -159,10 +157,22 @@ export function TopBar() {
     if (attState !== 'off') return;
     checkInMut.mutate();
   }
+
+  function elapsedBreakMinutes(startedAt: number | null) {
+    if (!startedAt) return 0;
+    return Math.max(0, Math.round((Date.now() - startedAt) / 60_000));
+  }
+
   function onBreak() {
     if (attState === 'off') return;
     setBreakOn((v) => {
       const next = !v;
+      if (next) {
+        setBreakStartedAt(Date.now());
+      } else {
+        setBreakAccumulatedMin((prev) => prev + elapsedBreakMinutes(breakStartedAt));
+        setBreakStartedAt(null);
+      }
       setBreakSince(
         next
           ? new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })
@@ -174,51 +184,8 @@ export function TopBar() {
   function onCheckOut() {
     if (!live) return;
     if (attState === 'off') return;
-    checkOutMut.mutate();
-  }
-
-  // ---------------- Search ----------------
-
-  const [query, setQuery] = useState('');
-  const [open, setOpen] = useState(false);
-  const searchBoxRef = useRef<HTMLFormElement>(null);
-
-  const assignmentsQuery = useQuery({
-    queryKey: ['topbar.assignments'],
-    queryFn: () =>
-      api!.assignments.list() as unknown as Promise<AssignmentSearchRow[]>,
-    enabled: live && open,
-    staleTime: 30_000,
-  });
-
-  const matches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return [] as AssignmentSearchRow[];
-    return (assignmentsQuery.data ?? [])
-      .filter((a) =>
-        `${a.code} ${a.title} ${a.subject}`.toLowerCase().includes(q),
-      )
-      .slice(0, 8);
-  }, [assignmentsQuery.data, query]);
-
-  useEffect(() => {
-    function onClickOutside(e: MouseEvent) {
-      if (!searchBoxRef.current) return;
-      if (!searchBoxRef.current.contains(e.target as Node)) setOpen(false);
-    }
-    window.addEventListener('mousedown', onClickOutside);
-    return () => window.removeEventListener('mousedown', onClickOutside);
-  }, []);
-
-  function submitSearch(e: React.FormEvent) {
-    e.preventDefault();
-    if (!query.trim()) return;
-    if (matches.length > 0) {
-      navigate('/assignments');
-    } else {
-      toast.info(`"${query}" 에 대한 결과가 없습니다.`);
-    }
-    setOpen(false);
+    const elapsed = breakOn ? elapsedBreakMinutes(breakStartedAt) : 0;
+    checkOutMut.mutate(breakAccumulatedMin + elapsed);
   }
 
   // ---------------- Notifications ----------------
@@ -324,6 +291,8 @@ export function TopBar() {
 
   return (
     <header className="flex h-14 items-center justify-between border-b border-border bg-bg-card px-4">
+      <GlobalSearch />
+      {/*
       <form
         onSubmit={submitSearch}
         className="flex items-center gap-2 max-w-md flex-1 relative"
@@ -392,6 +361,7 @@ export function TopBar() {
           )}
         </div>
       </form>
+      */}
 
       <div className="flex items-center gap-2">
         <div className="hidden md:flex items-center gap-1 text-xs text-fg-muted mr-2">
@@ -438,7 +408,7 @@ export function TopBar() {
         <button
           onClick={onCheckOut}
           disabled={!live || attState === 'off' || checkOutMut.isPending}
-          title="퇴근 기록 (기본 휴게 60분 차감)"
+          title="퇴근 기록"
           className="btn-outline h-9"
         >
           <LogOut size={14} /> 퇴근

@@ -105,8 +105,7 @@ export function SubscriptionsPage() {
   const { user } = useSession();
   const api = getApi();
   const live = !!api && !!user;
-  const canManage =
-    !!user && (user.role === 'HR_ADMIN' || user.role === 'CEO' || user.role === 'OPS_MANAGER');
+  const canManage = !!user && user.role !== 'TA';
 
   const [statusFilter, setStatusFilter] = useState<'' | Status>('');
   const [q, setQ] = useState('');

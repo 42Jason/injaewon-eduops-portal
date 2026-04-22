@@ -577,6 +577,7 @@ export function OperationsBoardPage() {
             mode="create"
             initial={null}
             currentUserId={user.id}
+            currentUserRole={user.role}
             onClose={() => setCreating(false)}
           />
           <AssignmentEditModal
@@ -584,6 +585,7 @@ export function OperationsBoardPage() {
             mode="edit"
             initial={editingRow as unknown as AssignmentEditInitial}
             currentUserId={user.id}
+            currentUserRole={user.role}
             onClose={() => setEditingRow(null)}
           />
         </>
